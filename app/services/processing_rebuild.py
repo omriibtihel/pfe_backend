@@ -63,6 +63,58 @@ def _fill_missing(
     return df
 
 
+def _knn_impute(
+    df: pd.DataFrame,
+    cols: list[str],
+    *,
+    n_neighbors: int = 5,
+    weights: str = "uniform",
+    add_indicator: bool = False,
+) -> pd.DataFrame:
+    """
+    Imputation KNN sur des colonnes numériques uniquement.
+    """
+    _ensure_cols_exist(df, cols)
+
+    non_numeric = [c for c in cols if not _is_numeric(df, c)]
+    if non_numeric:
+        raise ValueError(f"KNNImputer: colonnes non numériques non supportées: {non_numeric}")
+
+    try:
+        from sklearn.impute import KNNImputer
+    except Exception as e:
+        raise RuntimeError(
+            "KNNImputer nécessite scikit-learn. Installe-le (pip install scikit-learn)."
+        ) from e
+
+    imputer = KNNImputer(
+        n_neighbors=int(n_neighbors),
+        weights=weights,
+        add_indicator=bool(add_indicator),
+    )
+
+    X = df[cols].astype(float)
+    Xt = imputer.fit_transform(X)
+
+    if bool(add_indicator):
+        missing_cols = [c for c in cols if df[c].isna().any()]
+        indicator_names = [f"{c}__missing" for c in missing_cols]
+        out_cols = cols + indicator_names
+    else:
+        out_cols = cols
+
+    out = pd.DataFrame(Xt, columns=out_cols, index=df.index)
+
+    df = df.copy()
+    df[cols] = out[cols]
+
+    if bool(add_indicator):
+        for name in out_cols[len(cols) :]:
+            df[name] = out[name].round().astype("uint8")
+
+    return df
+
+
 def _drop_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     _ensure_cols_exist(df, cols)
     return df.drop(columns=cols)
@@ -75,34 +127,65 @@ def _drop_duplicates(df: pd.DataFrame, cols: list[str] | None) -> pd.DataFrame:
     return df.drop_duplicates()
 
 
-def _normalize(df: pd.DataFrame, cols: list[str], method: str) -> pd.DataFrame:
+def _normalize(
+    df: pd.DataFrame,
+    cols: list[str],
+    method: str,
+    params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Normalisation via scikit-learn (uniquement) :
+    - StandardScaler
+    - RobustScaler
+    - MinMaxScaler
+    """
     _ensure_cols_exist(df, cols)
+    params = params or {}
 
-    for c in cols:
-        if not _is_numeric(df, c):
-            raise ValueError(f"'{c}' n'est pas numérique (normalization impossible).")
+    non_numeric = [c for c in cols if not _is_numeric(df, c)]
+    if non_numeric:
+        raise ValueError(f"Colonnes non numériques (normalization impossible): {non_numeric}")
 
-        x = df[c].astype(float)
+    try:
+        from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+    except Exception as e:
+        raise RuntimeError(
+            "La normalisation (Standard/Robust/MinMax) nécessite scikit-learn. "
+            "Installe-le (pip install scikit-learn)."
+        ) from e
 
-        if method == "minmax":
-            mn, mx = np.nanmin(x), np.nanmax(x)
-            denom = (mx - mn) if (mx - mn) != 0 else 1.0
-            df[c] = (x - mn) / denom
+    # Normaliser le texte pour accepter "Standard Scaler", "standard_scaler", etc.
+    m = (method or "").strip()
+    m_norm = m.lower().replace(" ", "").replace("_", "").replace("-", "")
 
-        elif method == "zscore":
-            mu, sd = np.nanmean(x), np.nanstd(x)
-            denom = sd if sd != 0 else 1.0
-            df[c] = (x - mu) / denom
+    if m_norm in {"standardscaler", "standard"}:
+        scaler = StandardScaler(
+            with_mean=bool(params.get("with_mean", True)),
+            with_std=bool(params.get("with_std", True)),
+        )
+    elif m_norm in {"robustscaler", "robust"}:
+        scaler = RobustScaler(
+            with_centering=bool(params.get("with_centering", True)),
+            with_scaling=bool(params.get("with_scaling", True)),
+            quantile_range=tuple(params.get("quantile_range", (25.0, 75.0))),
+            unit_variance=bool(params.get("unit_variance", False)),
+        )
+    elif m_norm in {"minmaxscaler", "minmax"}:
+        scaler = MinMaxScaler(
+            feature_range=tuple(params.get("feature_range", (0.0, 1.0))),
+            clip=bool(params.get("clip", False)),
+        )
+    else:
+        raise ValueError(
+            f"Méthode de normalisation inconnue: {method}. "
+            "Méthodes supportées: StandardScaler, RobustScaler, MinMaxScaler."
+        )
 
-        elif method == "robust":
-            q1 = np.nanpercentile(x, 25)
-            q3 = np.nanpercentile(x, 75)
-            iqr = (q3 - q1) if (q3 - q1) != 0 else 1.0
-            df[c] = (x - q1) / iqr
+    X = df[cols].astype(float)
+    Xt = scaler.fit_transform(X)
 
-        else:
-            raise ValueError(f"Méthode de normalisation inconnue: {method}")
-
+    df = df.copy()
+    df[cols] = Xt
     return df
 
 
@@ -118,7 +201,18 @@ def _encode(df: pd.DataFrame, cols: list[str], method: str) -> pd.DataFrame:
         return df
 
     if method == "onehot":
-        dummies = pd.get_dummies(df[cols].astype("string"), prefix=cols, dummy_na=True)
+        sub = df[cols]
+        has_missing = sub.isna().to_numpy().any()
+
+        dummies = pd.get_dummies(
+            sub.astype("string"),
+            prefix=cols,
+            dummy_na=has_missing,
+        )
+
+        # ✅ 0/1 entiers
+        dummies = dummies.astype("uint8")
+
         df = df.drop(columns=cols)
         df = pd.concat([df, dummies], axis=1)
         return df
@@ -132,11 +226,6 @@ def _legacy_infer_action(
     description: str | None,
     params: dict,
 ) -> tuple[str | None, dict]:
-    """
-    Compat rétro:
-    - Certains anciens ops avaient params={} (donc pas d'action)
-    - On essaye d'inférer l'action au lieu de lever une erreur.
-    """
     desc = (description or "").lower()
     p = dict(params or {})
 
@@ -148,7 +237,6 @@ def _legacy_infer_action(
         else:
             action = "fill_missing"
 
-        # compat ancienne clé fill_value => constant
         if "fill_value" in p and "strategy" not in p and "constant" not in p:
             p["strategy"] = "constant"
             p["constant"] = p.get("fill_value")
@@ -188,14 +276,33 @@ def _apply_one(
 
     if op_type == "imputation":
         method = (params or {}).get("method") or (params or {}).get("strategy") or "mode"
+        method = str(method).lower()
+
+        if method in {"knn", "knnimputer"}:
+            n_neighbors = (params or {}).get("n_neighbors", 5)
+            weights = (params or {}).get("weights", "uniform")
+            add_indicator = (params or {}).get("add_indicator", False)
+            return _knn_impute(
+                df,
+                cols,
+                n_neighbors=int(n_neighbors),
+                weights=str(weights),
+                add_indicator=bool(add_indicator),
+            )
+
         constant = (params or {}).get("constant", None)
         if constant is None and "fill_value" in (params or {}):
             constant = (params or {}).get("fill_value")
+
+        if method == "constant" and constant is None:
+            raise ValueError("Imputation 'constant' nécessite 'constant' (ou 'fill_value').")
+
         return _fill_missing(df, cols, strategy=method, constant=constant)
 
     if op_type == "normalization":
-        method = (params or {}).get("method", "zscore")
-        return _normalize(df, cols, method=method)
+        # ✅ Default => StandardScaler, et plus de zscore/robust/minmax legacy
+        method = (params or {}).get("method", "StandardScaler")
+        return _normalize(df, cols, method=method, params=params or {})
 
     if op_type == "encoding":
         method = (params or {}).get("method", "onehot")
@@ -216,7 +323,6 @@ def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
     """
     ds = get_dataset_or_404(db, project_id, dataset_id)
 
-    # ✅ Toujours repartir du brut (déterministe)
     df = read_df(ds.file_path)
 
     ops = crud_processing.list_operations(db, project_id, dataset_id)

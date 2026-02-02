@@ -46,7 +46,6 @@ class Project(Base):
     active_dataset_id = Column(
         Integer,
         ForeignKey("datasets.id", ondelete="SET NULL"),
-        post_update=True,
         nullable=True,
     )
 

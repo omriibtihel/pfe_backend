@@ -19,7 +19,7 @@ class ProcessingOperationCreate(BaseModel):
 class ProcessingOperationOut(BaseModel):
     id: int
     description: str
-    timestamp: datetime  # front utilise op.timestamp
+    timestamp: datetime  
 
     class Config:
         from_attributes = True

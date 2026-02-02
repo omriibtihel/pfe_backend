@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 import pandas as pd
 import numpy as np
+import json
+
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
 from app.api.utils.datasets import get_dataset_or_404
@@ -9,6 +11,19 @@ from app.api.utils.processing_df import load_current_df
 from app.schemas.processing import OperationIn, OperationOut
 from app.crud import processing as crud_processing
 from app.services.processing_rebuild import rebuild_processed
+from app.models.dataset_version import DatasetVersion
+
+
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import BackgroundTasks
+from fastapi.responses import FileResponse
+
+from app.core.config import PROJECTS_PATH
+from app.models.dataset import Dataset
+from app.models.project import Project
+
 
 router = APIRouter()
 
@@ -125,3 +140,122 @@ def processing_preview(
 
     df = load_current_df(dataset.file_path, dataset_id)
     return df_preview_payload(df, page, page_size)
+
+
+@router.get("/datasets/{dataset_id}/processing/export")
+def export_processed_dataset(
+    project_id: int,
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # Sécurité
+    ensure_project_owner(db, project_id, current_user.id)
+
+    # Dataset + DF courant (traité)
+    ds = get_dataset_or_404(db, project_id, dataset_id)
+    df = load_current_df(ds.file_path, dataset_id)
+
+    # Écriture fichier export (csv)
+    export_dir = PROJECTS_PATH / str(project_id) / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_stem = Path(ds.original_name).stem or f"dataset_{dataset_id}"
+    download_name = f"{safe_stem}_processed.csv"
+
+    tmp_path = export_dir / f"{uuid4().hex}.csv"
+    df.to_csv(tmp_path, index=False)
+
+    return FileResponse(
+        path=str(tmp_path),
+        filename=download_name,
+        media_type="text/csv",
+    )
+
+
+@router.post("/datasets/{dataset_id}/processing/save")
+def save_processed_as_version(
+    project_id: int,
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # Sécurité
+    ensure_project_owner(db, project_id, current_user.id)
+
+    # Dataset source + DF courant (traité)
+    src = get_dataset_or_404(db, project_id, dataset_id)
+    df = load_current_df(src.file_path, dataset_id)
+
+    # Récupérer la liste des opérations (pour l'historique)
+    ops = crud_processing.list_operations(db, project_id, dataset_id)
+    ops_payload = []
+    for o in ops:
+        if hasattr(o, "model_dump"):         # Pydantic v2
+            ops_payload.append(o.model_dump())
+        elif hasattr(o, "dict"):             # Pydantic v1
+            ops_payload.append(o.dict())
+        else:                                # fallback (ORM)
+            ops_payload.append(
+                {
+                    "id": getattr(o, "id", None),
+                    "type": getattr(o, "type", None),
+                    "description": getattr(o, "description", None),
+                    "columns": getattr(o, "columns", None),
+                    "params": getattr(o, "params", None),
+                    "created_at": getattr(o, "created_at", None).isoformat()
+                    if getattr(o, "created_at", None)
+                    else None,
+                }
+            )
+
+    # Dossier versions
+    versions_dir = PROJECTS_PATH / str(project_id) / "dataset_versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_stem = Path(src.original_name).stem or f"dataset_{dataset_id}"
+    version_name = f"{safe_stem}_processed"
+
+    stored_name = f"{uuid4().hex}.csv"   
+    dst_path = versions_dir / stored_name
+
+    # Écrire snapshot
+    df.to_csv(dst_path, index=False)
+    size_bytes = dst_path.stat().st_size
+
+    # target_column / can_predict (utile pour la prédiction)
+    target_value = getattr(src, "target_column", None)
+    if target_value and target_value not in df.columns.astype(str).tolist():
+        target_value = None
+    can_predict = bool(target_value)
+
+    # ✅ ton modèle attend operations_json (Text)
+    operations_json = json.dumps(ops_payload, ensure_ascii=False, default=str)
+
+    new_version = DatasetVersion(
+        project_id=project_id,
+        source_dataset_id=src.id,
+        name=version_name,
+        stored_name=stored_name,
+        file_path=str(dst_path),
+        content_type="text/csv",
+        size_bytes=size_bytes,
+        target_column=target_value,
+        can_predict=can_predict,
+        operations_json=operations_json,   # ✅ bon champ
+    )
+
+    db.add(new_version)
+    db.commit()
+    db.refresh(new_version)
+
+    return {
+        "version_id": new_version.id,
+        "project_id": new_version.project_id,
+        "source_dataset_id": new_version.source_dataset_id,
+        "name": new_version.name,
+        "file_path": new_version.file_path,
+        "can_predict": new_version.can_predict,
+        "created_at": new_version.created_at.isoformat() if new_version.created_at else None,
+    }
+
