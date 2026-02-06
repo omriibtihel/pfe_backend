@@ -18,7 +18,6 @@ def _ensure_cols_exist(df: pd.DataFrame, cols: list[str]) -> None:
 
 
 def _target_cols(df: pd.DataFrame, cols: list[str] | None) -> list[str]:
-    # Si cols vide -> toutes les colonnes (Dataiku-like)
     if not cols:
         return [str(c) for c in df.columns]
     return [str(c) for c in cols]
@@ -247,6 +246,81 @@ def _legacy_infer_action(
     return action, p
 
 
+
+def _count_changed(before_s: pd.Series, after_s: pd.Series) -> int:
+    # compare en traitant NaN == NaN
+    b = before_s.astype("object").where(pd.notnull(before_s), "__NA__")
+    a = after_s.astype("object").where(pd.notnull(after_s), "__NA__")
+    return int((b != a).sum())
+
+
+def _fill_value_for_strategy(before: pd.DataFrame, col: str, strategy: str, constant=None):
+    s = before[col]
+    strategy = (strategy or "").lower()
+
+    if strategy == "mean":
+        return float(s.mean())
+    if strategy == "median":
+        return float(s.median())
+    if strategy == "mode":
+        m = s.mode(dropna=True)
+        return None if len(m) == 0 else m.iloc[0]
+    if strategy == "constant":
+        return constant
+    return None
+
+
+def compute_operation_effect(
+    before: pd.DataFrame,
+    after: pd.DataFrame,
+    cols: list[str],
+    params: dict,
+) -> dict:
+    before_cols = list(map(str, before.columns))
+    after_cols = list(map(str, after.columns))
+
+    added = [c for c in after_cols if c not in set(before_cols)]
+    removed = [c for c in before_cols if c not in set(after_cols)]
+
+    eff: dict = {
+        "before_shape": {"rows": int(before.shape[0]), "cols": int(before.shape[1])},
+        "after_shape": {"rows": int(after.shape[0]), "cols": int(after.shape[1])},
+        "columns_added": added,
+        "columns_removed": removed,
+    }
+
+    if after.shape[0] != before.shape[0]:
+        eff["rows_removed"] = int(before.shape[0] - after.shape[0])
+
+    common = [c for c in cols if c in before.columns and c in after.columns]
+    per_col = {}
+    for c in common:
+        mb = int(before[c].isna().sum())
+        ma = int(after[c].isna().sum())
+        per_col[c] = {
+            "missing_before": mb,
+            "missing_after": ma,
+            "filled": int(max(0, mb - ma)),
+            "changed_count": _count_changed(before[c], after[c]),
+        }
+    if per_col:
+        eff["per_column"] = per_col
+
+    # imputation-like (si params le contient)
+    strategy = (params or {}).get("strategy") or (params or {}).get("method")
+    if strategy:
+        strategy = str(strategy).lower()
+        eff["fill_strategy"] = strategy
+        constant = (params or {}).get("constant", None)
+        eff["fill_value_by_column"] = {
+            c: _fill_value_for_strategy(before, c, strategy, constant=constant)
+            for c in common
+        }
+
+    return eff
+
+
+
 def _apply_one(
     df: pd.DataFrame,
     op_type: str,
@@ -317,10 +391,7 @@ def _apply_one(
 
 
 def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
-    """
-    Recalcule le dataset traité à partir du fichier original,
-    en rejouant toutes les opérations dans l’ordre.
-    """
+    
     ds = get_dataset_or_404(db, project_id, dataset_id)
 
     df = read_df(ds.file_path)
@@ -331,6 +402,8 @@ def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
         cols = _target_cols(df, op.columns)
         _ensure_cols_exist(df, cols)
 
+        before = df.copy()
+
         df = _apply_one(
             df,
             op.op_type,
@@ -338,5 +411,11 @@ def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
             op.params or {},
             description=getattr(op, "description", None),
         )
+
+        try:
+            effect = compute_operation_effect(before, df, cols, op.params or {})
+            crud_processing.set_operation_result(db, op.id, effect)
+        except Exception:
+            pass
 
     save_processed_df(df, ds.file_path, dataset_id)

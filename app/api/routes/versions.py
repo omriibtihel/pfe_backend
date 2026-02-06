@@ -1,12 +1,51 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import json
+import base64
+from pathlib import Path
+
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from starlette.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
+from app.api.routes.processing import df_preview_payload
 from app.models.dataset_version import DatasetVersion
 
 router = APIRouter()
+
+
+def _ops_to_tags(operations_json: str | None) -> list[str]:
+    """Convertit operations_json (Text) en liste de tags (type/description)."""
+    if not operations_json:
+        return []
+    try:
+        data = json.loads(operations_json)
+        if not isinstance(data, list):
+            return []
+        tags: list[str] = []
+        for o in data:
+            if isinstance(o, dict):
+                t = o.get("type") or o.get("op_type") or o.get("opType")
+                if t:
+                    tags.append(str(t))
+                else:
+                    d = o.get("description")
+                    if d:
+                        tags.append(str(d))
+            else:
+                tags.append(str(o))
+        return tags
+    except Exception:
+        return []
+
+
+class OverwriteVersionPayload(BaseModel):
+    content_base64: str
+    content_type: str | None = None
+    operations: list[dict] | None = None
 
 
 @router.get("", response_model=list[dict])
@@ -15,7 +54,6 @@ def list_versions(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    # sécurité: seul owner
     ensure_project_owner(db, project_id, current_user.id)
 
     versions = (
@@ -25,19 +63,129 @@ def list_versions(
         .all()
     )
 
-    # dict simple (pas besoin de schemas pydantic pour l’instant)
     return [
         {
             "id": v.id,
             "project_id": v.project_id,
             "source_dataset_id": v.source_dataset_id,
             "name": v.name,
-            "file_path": v.file_path,
-            "operations": v.operations_json or [],
+            "stored_name": v.stored_name,
+            "content_type": v.content_type,
+            "size_bytes": v.size_bytes,
+            "target_column": v.target_column,
+            "can_predict": v.can_predict,
+            "operations": _ops_to_tags(v.operations_json),
             "created_at": v.created_at.isoformat() if v.created_at else None,
         }
         for v in versions
     ]
+
+
+@router.get("/{version_id}/preview")
+def version_preview(
+    project_id: int,
+    version_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+
+    v = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
+        .first()
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    df = pd.read_csv(v.file_path)
+    return df_preview_payload(df, page, page_size)
+
+
+@router.get("/{version_id}/columns")
+def version_columns(
+    project_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+
+    v = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
+        .first()
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    p = Path(v.file_path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"Dataset file not found: {p}")
+
+    df = pd.read_csv(p, nrows=1)
+    cols = [str(c).strip() for c in df.columns]
+    return {"columns": cols}
+
+
+@router.get("/{version_id}/download")
+def download_version(
+    project_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+
+    v = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
+        .first()
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    filename = f"{v.name}.csv"
+    return FileResponse(path=v.file_path, filename=filename, media_type=v.content_type or "text/csv")
+
+
+@router.post("/{version_id}/overwrite")
+def overwrite_version(
+    project_id: int,
+    version_id: int,
+    payload: OverwriteVersionPayload,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+
+    v = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
+        .first()
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    try:
+        content = base64.b64decode(payload.content_base64.encode("utf-8"))
+        Path(v.file_path).write_bytes(content)
+        v.size_bytes = len(content)
+        if payload.content_type:
+            v.content_type = payload.content_type
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid content: {e}")
+
+    if payload.operations is not None:
+        v.operations_json = json.dumps(payload.operations)
+
+    db.add(v)
+    db.commit()
+    db.refresh(v)
+
+    return {"ok": True, "version_id": v.id}
 
 
 @router.delete("/{version_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -56,6 +204,11 @@ def delete_version(
     )
     if not v:
         raise HTTPException(status_code=404, detail="Version not found")
+
+    try:
+        Path(v.file_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
     db.delete(v)
     db.commit()

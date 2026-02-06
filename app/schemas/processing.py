@@ -1,6 +1,7 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 from typing import Any, Dict, List, Literal
+
 
 OperationType = Literal["cleaning", "imputation", "normalization", "encoding", "other"]
 
@@ -23,3 +24,9 @@ class OperationOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+    @computed_field
+    @property
+    def result(self) -> dict | None:
+        return (self.params or {}).get("__result")
+

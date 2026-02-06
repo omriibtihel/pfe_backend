@@ -1,6 +1,8 @@
 # app/crud/processing.py
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from fastapi.encoders import jsonable_encoder
+
 
 from app.models.processing_operation import ProcessingOperation
 
@@ -58,3 +60,18 @@ def delete_last_operation(db: Session, project_id: int, dataset_id: int) -> bool
     db.delete(last)
     db.commit()
     return True
+
+def set_operation_result(db: Session, op_id: int, result: dict) -> None:
+    op = db.query(ProcessingOperation).filter(ProcessingOperation.id == op_id).first()
+    if not op:
+        return
+
+    p = dict(op.params or {})
+    
+    # convert numpy/pandas types -> types JSON-safe
+    p["__result"] = jsonable_encoder(result)
+    
+    op.params = p
+
+    db.add(op)
+    db.commit()

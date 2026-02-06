@@ -54,17 +54,18 @@ def sanitize_filename(name: str) -> str:
 @router.get("", response_model=list[DatasetOut])
 def list_datasets(
     project_id: int,
+    include_workspaces: bool = Query(False, description="Si true, inclut les workspaces"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
 
-    return (
-        db.query(Dataset)
-        .filter(Dataset.project_id == project_id)
-        .order_by(Dataset.created_at.desc())
-        .all()
-    )
+    q = db.query(Dataset).filter(Dataset.project_id == project_id)
+
+    if not include_workspaces:
+        q = q.filter(Dataset.kind == "source")
+
+    return q.order_by(Dataset.created_at.desc()).all()
 
 
 # -------------------------

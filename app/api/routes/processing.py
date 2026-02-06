@@ -102,10 +102,11 @@ def apply_operation(
     try:
         rebuild_processed(db, project_id, dataset_id)
     except Exception as e:
-        # rollback opération si rebuild échoue
+        db.rollback()  
         crud_processing.delete_last_operation(db, project_id, dataset_id)
         raise HTTPException(status_code=400, detail=str(e))
-
+    
+    db.refresh(op)
     return op
 
 

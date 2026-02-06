@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-
 from sqlalchemy import ForeignKey, String, Text, DateTime, Column, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -34,13 +33,13 @@ class Project(Base):
 
     owner = relationship("User", back_populates="projects")
 
+    # ⚠️ IMPORTANT : préciser foreign_keys car Project a aussi active_dataset_id -> datasets.id
     datasets = relationship(
         "Dataset",
         back_populates="project",
         cascade="all, delete-orphan",
         foreign_keys="Dataset.project_id",
         passive_deletes=True,
-
     )
 
     active_dataset_id = Column(
@@ -49,5 +48,5 @@ class Project(Base):
         nullable=True,
     )
 
-
+    # IMPORTANT : préciser foreign_keys ici aussi
     active_dataset = relationship("Dataset", foreign_keys=[active_dataset_id])

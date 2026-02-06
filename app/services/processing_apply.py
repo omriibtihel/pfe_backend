@@ -18,9 +18,11 @@ def _save_processed_df_compat(
 ) -> None:
 
     try:
+        # ancienne signature (ou ta signature actuelle)
         save_processed_df(df, dataset_id)
         return
     except TypeError:
+        # nouvelle signature probable
         if dataset_file_path is None:
             raise TypeError(
                 "save_processed_df attend (df, dataset_file_path, dataset_id) "
