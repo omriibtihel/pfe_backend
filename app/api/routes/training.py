@@ -31,13 +31,8 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
     metrics_all = m.metrics_json or {}
     artifacts = m.artifacts_json or {}
 
-    # ✅ metrics peuvent être: {"test": {...}, "train": {...}, ...}
     test_metrics = metrics_all.get("test")
-    if isinstance(test_metrics, dict):
-        metrics = test_metrics
-    else:
-        # fallback ancien format
-        metrics = metrics_all
+    metrics = test_metrics if isinstance(test_metrics, dict) else metrics_all
 
     def mget(k: str) -> float:
         v = metrics.get(k)
@@ -46,9 +41,9 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
         except Exception:
             return 0.0
 
-    # train score/test score (1 valeur)
     primary = metrics_all.get("primary_score") or {}
     primary_metric = primary.get("metric")
+
     try:
         test_score = float(primary.get("value", 0.0))
     except Exception:
@@ -62,11 +57,20 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
         except Exception:
             train_score = 0.0
 
-    # ✅ training time vient de metrics_all["training_time_sec"]
     try:
         training_time = float(metrics_all.get("training_time_sec", 0.0))
     except Exception:
         training_time = 0.0
+
+    split_info = metrics_all.get("split_info") if isinstance(metrics_all.get("split_info"), dict) else None
+
+    gs = artifacts.get("grid_search") if isinstance(artifacts.get("grid_search"), dict) else {}
+    best_params = gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None
+    cv_best_score = gs.get("best_score")
+    cv_scoring = gs.get("scoring")
+
+    thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else None
+    balancing = artifacts.get("balancing") if isinstance(artifacts.get("balancing"), dict) else None
 
     return {
         "id": str(m.id),
@@ -78,6 +82,17 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
             "recall": mget("recall"),
             "f1": mget("f1"),
             "roc_auc": mget("roc_auc"),
+
+            # imbalance-friendly
+            "pr_auc": mget("pr_auc"),
+            "precision_pos": mget("precision_pos"),
+            "recall_pos": mget("recall_pos"),
+            "f1_pos": mget("f1_pos"),
+
+            # macro (useful even for binary imbalance)
+            "f1_macro": mget("f1_macro"),
+
+            # regression (only meaningful when taskType=regression)
             "mse": mget("mse"),
             "rmse": mget("rmse"),
             "mae": mget("mae"),
@@ -85,8 +100,29 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
         },
         "trainScore": train_score,
         "testScore": test_score,
+        "primaryMetric": primary_metric,
+        "splitInfo": split_info,
+
+        "gridSearch": {
+            "enabled": bool(gs.get("enabled", False)),
+            "cvBestScore": float(cv_best_score) if cv_best_score is not None else None,
+            "cvScoring": str(cv_scoring) if cv_scoring else None,
+            "bestParams": best_params,
+            "cvSplits": int(gs.get("cv_splits", 0)) if gs.get("cv_splits") else None,
+        },
+
         "featureImportance": artifacts.get("feature_importance", []),
         "confusionMatrix": artifacts.get("confusion_matrix", []),
+
+        # Step 1 visibility
+        "classDistribution": artifacts.get("class_distribution", None),
+        "baselineMajority": artifacts.get("baseline_majority", None),
+        "splitDebug": artifacts.get("split_debug", None),
+
+        # NEW: robust behavior visibility
+        "balancing": balancing,          # auto balance info (class_weight/spw decision)
+        "thresholding": thresholding,    # tuned threshold + applied_on_test flag (holdout)
+
         "trainingTime": training_time,
     }
 

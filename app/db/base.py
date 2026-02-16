@@ -6,5 +6,6 @@ from app.models.dataset import Dataset
 from app.models.processing_operation import ProcessingOperation 
 from app.models.dataset_version import DatasetVersion
 from app.models.training import TrainingSession, TrainedModel
+from app.models.version_column_schema import VersionColumnSchema
 
 

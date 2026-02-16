@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import json
 import base64
+import json
 from pathlib import Path
 
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from starlette.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from starlette.responses import FileResponse
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.api.routes.processing import df_preview_payload
 from app.models.dataset_version import DatasetVersion
 
 router = APIRouter()
@@ -81,31 +79,8 @@ def list_versions(
     ]
 
 
-@router.get("/{version_id}/preview")
-def version_preview(
-    project_id: int,
-    version_id: int,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=200),
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    ensure_project_owner(db, project_id, current_user.id)
-
-    v = (
-        db.query(DatasetVersion)
-        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
-        .first()
-    )
-    if not v:
-        raise HTTPException(status_code=404, detail="Version not found")
-
-    df = pd.read_csv(v.file_path)
-    return df_preview_payload(df, page, page_size)
-
-
-@router.get("/{version_id}/columns")
-def version_columns(
+@router.get("/{version_id}/download")
+def download_version(
     project_id: int,
     version_id: int,
     db: Session = Depends(get_db),
@@ -125,30 +100,8 @@ def version_columns(
     if not p.exists():
         raise HTTPException(status_code=404, detail=f"Dataset file not found: {p}")
 
-    df = pd.read_csv(p, nrows=1)
-    cols = [str(c).strip() for c in df.columns]
-    return {"columns": cols}
-
-
-@router.get("/{version_id}/download")
-def download_version(
-    project_id: int,
-    version_id: int,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    ensure_project_owner(db, project_id, current_user.id)
-
-    v = (
-        db.query(DatasetVersion)
-        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
-        .first()
-    )
-    if not v:
-        raise HTTPException(status_code=404, detail="Version not found")
-
     filename = f"{v.name}.csv"
-    return FileResponse(path=v.file_path, filename=filename, media_type=v.content_type or "text/csv")
+    return FileResponse(path=str(p), filename=filename, media_type=v.content_type or "text/csv")
 
 
 @router.post("/{version_id}/overwrite")
@@ -171,7 +124,10 @@ def overwrite_version(
 
     try:
         content = base64.b64decode(payload.content_base64.encode("utf-8"))
-        Path(v.file_path).write_bytes(content)
+        p = Path(v.file_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+
         v.size_bytes = len(content)
         if payload.content_type:
             v.content_type = payload.content_type

@@ -3,7 +3,7 @@ from pydantic import BaseModel, computed_field
 from typing import Any, Dict, List, Literal
 
 
-OperationType = Literal["cleaning", "imputation", "normalization", "encoding", "other"]
+OperationType = Literal["cleaning", "other"]
 
 class OperationIn(BaseModel):
     type: OperationType

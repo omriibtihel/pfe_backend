@@ -1,3 +1,4 @@
+# app/services/processing_rebuild.py
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
@@ -9,276 +10,274 @@ from app.api.utils.datasets import get_dataset_or_404
 from app.api.utils.df import read_df
 from app.api.utils.processing_df import save_processed_df
 
+# ---------------------------------------------------------------------
+# LIMITED to "safe cleaning" operations.
+# NO stat-based imputation / encoding / scaling here (avoid leakage).
+# Those belong to the training pipeline (fit on TRAIN only).
+# ---------------------------------------------------------------------
 
-def _ensure_cols_exist(df: pd.DataFrame, cols: list[str]) -> None:
+ALLOWED_CLEANING_ACTIONS = {
+    "drop_columns",
+    "drop_duplicates",
+    "drop_empty_rows",
+    "rename_columns",
+    "strip_whitespace",
+    "substitute_values",  # ✅ added
+}
+
+STRICT_REBUILD = False
+
+
+def _split_existing_missing(df: pd.DataFrame, cols: list[str]) -> tuple[list[str], list[str]]:
     existing = set(map(str, df.columns))
+    cols = [str(c) for c in (cols or [])]
+    present = [c for c in cols if c in existing]
     missing = [c for c in cols if c not in existing]
-    if missing:
+    return present, missing
+
+
+def _drop_columns(df: pd.DataFrame, cols: list[str], *, strict: bool = STRICT_REBUILD) -> pd.DataFrame:
+    if not cols:
+        raise ValueError("drop_columns: sélectionne au moins une colonne.")
+    present, missing = _split_existing_missing(df, cols)
+    if missing and strict:
+        raise ValueError(f"Colonnes introuvables: {missing}")
+    if not present:
+        return df
+    return df.drop(columns=present)
+
+
+def _drop_duplicates(
+    df: pd.DataFrame,
+    subset: list[str] | None = None,
+    keep: str = "first",
+    *,
+    strict: bool = STRICT_REBUILD,
+) -> pd.DataFrame:
+    if subset:
+        present, missing = _split_existing_missing(df, subset)
+        if missing and strict:
+            raise ValueError(f"Colonnes introuvables: {missing}")
+        return df.drop_duplicates(subset=present if present else None, keep=keep)
+    return df.drop_duplicates(keep=keep)
+
+
+def _drop_empty_rows(
+    df: pd.DataFrame,
+    cols: list[str] | None = None,
+    *,
+    strict: bool = STRICT_REBUILD,
+) -> pd.DataFrame:
+    if cols:
+        present, missing = _split_existing_missing(df, cols)
+        if missing and strict:
+            raise ValueError(f"Colonnes introuvables: {missing}")
+        work = df[present].copy() if present else df.copy()
+    else:
+        work = df.copy()
+
+    for c in work.columns:
+        s = work[c]
+        if pd.api.types.is_string_dtype(s) or pd.api.types.is_object_dtype(s):
+            work[c] = s.astype("string").str.strip().replace("", pd.NA)
+
+    mask_empty = work.isna().all(axis=1)
+    return df.loc[~mask_empty].copy()
+
+
+def _rename_columns(
+    df: pd.DataFrame,
+    mapping: dict,
+    *,
+    strict: bool = STRICT_REBUILD,
+) -> tuple[pd.DataFrame, dict]:
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("rename_columns nécessite 'mapping' (dict) non vide.")
+
+    old_keys = [str(k) for k in mapping.keys()]
+    present, missing = _split_existing_missing(df, old_keys)
+    if missing and strict:
         raise ValueError(f"Colonnes introuvables: {missing}")
 
+    applied = {str(k): str(mapping[k]) for k in present}
+    if not applied:
+        return df, {}
 
-def _target_cols(df: pd.DataFrame, cols: list[str] | None) -> list[str]:
-    if not cols:
-        return [str(c) for c in df.columns]
-    return [str(c) for c in cols]
+    new_names = list(applied.values())
+    if len(set(new_names)) != len(new_names):
+        raise ValueError("rename_columns: deux colonnes ne peuvent pas avoir le même nouveau nom.")
+
+    existing_cols = set(map(str, df.columns))
+    old_set = set(applied.keys())
+    for old, new in applied.items():
+        if new in existing_cols and new not in old_set:
+            raise ValueError(f"rename_columns: collision: '{new}' existe déjà (renommage '{old}' -> '{new}').")
+
+    df2 = df.rename(columns=applied)
+    if len(set(map(str, df2.columns))) != len(df2.columns):
+        raise ValueError("rename_columns: collision de noms de colonnes après renommage.")
+
+    return df2, applied
 
 
-def _is_numeric(df: pd.DataFrame, col: str) -> bool:
-    return pd.api.types.is_numeric_dtype(df[col])
-
-
-def _fill_missing(
+def _strip_whitespace(
     df: pd.DataFrame,
-    cols: list[str],
-    strategy: str,
-    constant: object | None = None,
-) -> pd.DataFrame:
-    _ensure_cols_exist(df, cols)
-
-    for c in cols:
-        if strategy == "mean":
-            if not _is_numeric(df, c):
-                raise ValueError(f"'{c}' n'est pas numérique (mean impossible).")
-            v = df[c].mean()
-            df[c] = df[c].fillna(v)
-
-        elif strategy == "median":
-            if not _is_numeric(df, c):
-                raise ValueError(f"'{c}' n'est pas numérique (median impossible).")
-            v = df[c].median()
-            df[c] = df[c].fillna(v)
-
-        elif strategy == "mode":
-            m = df[c].mode(dropna=True)
-            v = m.iloc[0] if len(m) else None
-            df[c] = df[c].fillna(v)
-
-        elif strategy == "constant":
-            df[c] = df[c].fillna(constant)
-
-        else:
-            raise ValueError(f"Stratégie inconnue: {strategy}")
-
-    return df
-
-
-def _knn_impute(
-    df: pd.DataFrame,
-    cols: list[str],
+    cols: list[str] | None,
     *,
-    n_neighbors: int = 5,
-    weights: str = "uniform",
-    add_indicator: bool = False,
+    strict: bool = STRICT_REBUILD,
 ) -> pd.DataFrame:
-    """
-    Imputation KNN sur des colonnes numériques uniquement.
-    """
-    _ensure_cols_exist(df, cols)
+    df2 = df.copy()
 
-    non_numeric = [c for c in cols if not _is_numeric(df, c)]
-    if non_numeric:
-        raise ValueError(f"KNNImputer: colonnes non numériques non supportées: {non_numeric}")
+    if not cols:
+        cols = []
+        for c in df2.columns:
+            s = df2[c]
+            if pd.api.types.is_string_dtype(s) or pd.api.types.is_object_dtype(s):
+                cols.append(str(c))
 
-    try:
-        from sklearn.impute import KNNImputer
-    except Exception as e:
-        raise RuntimeError(
-            "KNNImputer nécessite scikit-learn. Installe-le (pip install scikit-learn)."
-        ) from e
+    if not cols:
+        return df2
 
-    imputer = KNNImputer(
-        n_neighbors=int(n_neighbors),
-        weights=weights,
-        add_indicator=bool(add_indicator),
-    )
+    present, missing = _split_existing_missing(df2, cols)
+    if missing and strict:
+        raise ValueError(f"Colonnes introuvables: {missing}")
+    if not present:
+        return df2
 
-    X = df[cols].astype(float)
-    Xt = imputer.fit_transform(X)
-
-    if bool(add_indicator):
-        missing_cols = [c for c in cols if df[c].isna().any()]
-        indicator_names = [f"{c}__missing" for c in missing_cols]
-        out_cols = cols + indicator_names
-    else:
-        out_cols = cols
-
-    out = pd.DataFrame(Xt, columns=out_cols, index=df.index)
-
-    df = df.copy()
-    df[cols] = out[cols]
-
-    if bool(add_indicator):
-        for name in out_cols[len(cols) :]:
-            df[name] = out[name].round().astype("uint8")
-
-    return df
+    for c in present:
+        s = df2[c]
+        if pd.api.types.is_string_dtype(s) or pd.api.types.is_object_dtype(s):
+            df2[c] = s.astype("string").str.strip()
+    return df2
 
 
-def _drop_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    _ensure_cols_exist(df, cols)
-    return df.drop(columns=cols)
+# -----------------------------
+# ✅ SUBSTITUTE VALUES (exact)
+# -----------------------------
+def _coerce_scalar_for_series(s: pd.Series, value):
+    """Try to coerce 'value' to the series dtype when possible."""
+    if value is None:
+        return None
+
+    # numeric column -> try numeric
+    if pd.api.types.is_numeric_dtype(s):
+        if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+            return float(value) if pd.api.types.is_float_dtype(s) else int(value)
+        if isinstance(value, str):
+            v = value.strip()
+            if v == "":
+                return value
+            num = pd.to_numeric([v], errors="coerce")[0]
+            if pd.notna(num):
+                # keep int if series is int-like
+                if pd.api.types.is_integer_dtype(s):
+                    try:
+                        return int(num)
+                    except Exception:
+                        return num
+                return float(num)
+        return value
+
+    # datetime column -> try parse
+    if pd.api.types.is_datetime64_any_dtype(s):
+        try:
+            dt = pd.to_datetime([value], errors="coerce")[0]
+            return dt if pd.notna(dt) else value
+        except Exception:
+            return value
+
+    # bool column
+    if pd.api.types.is_bool_dtype(s):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("true", "1", "yes", "y"):
+                return True
+            if v in ("false", "0", "no", "n"):
+                return False
+        return value
+
+    return value
 
 
-def _drop_duplicates(df: pd.DataFrame, cols: list[str] | None) -> pd.DataFrame:
-    if cols:
-        _ensure_cols_exist(df, cols)
-        return df.drop_duplicates(subset=cols)
-    return df.drop_duplicates()
-
-
-def _normalize(
+def _substitute_values(
     df: pd.DataFrame,
-    cols: list[str],
-    method: str,
-    params: dict | None = None,
-) -> pd.DataFrame:
-    """
-    Normalisation via scikit-learn (uniquement) :
-    - StandardScaler
-    - RobustScaler
-    - MinMaxScaler
-    """
-    _ensure_cols_exist(df, cols)
-    params = params or {}
+    col: str,
+    *,
+    from_value=None,
+    to_value=None,
+    case_sensitive: bool = True,
+    treat_from_as_null: bool = False,
+    treat_to_as_null: bool = False,
+) -> tuple[pd.DataFrame, dict]:
+    if col not in df.columns:
+        raise ValueError(f"substitute_values: colonne introuvable: {col}")
 
-    non_numeric = [c for c in cols if not _is_numeric(df, c)]
-    if non_numeric:
-        raise ValueError(f"Colonnes non numériques (normalization impossible): {non_numeric}")
+    before_s = df[col]
+    df2 = df.copy()
 
-    try:
-        from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
-    except Exception as e:
-        raise RuntimeError(
-            "La normalisation (Standard/Robust/MinMax) nécessite scikit-learn. "
-            "Installe-le (pip install scikit-learn)."
-        ) from e
-
-    # Normaliser le texte pour accepter "Standard Scaler", "standard_scaler", etc.
-    m = (method or "").strip()
-    m_norm = m.lower().replace(" ", "").replace("_", "").replace("-", "")
-
-    if m_norm in {"standardscaler", "standard"}:
-        scaler = StandardScaler(
-            with_mean=bool(params.get("with_mean", True)),
-            with_std=bool(params.get("with_std", True)),
-        )
-    elif m_norm in {"robustscaler", "robust"}:
-        scaler = RobustScaler(
-            with_centering=bool(params.get("with_centering", True)),
-            with_scaling=bool(params.get("with_scaling", True)),
-            quantile_range=tuple(params.get("quantile_range", (25.0, 75.0))),
-            unit_variance=bool(params.get("unit_variance", False)),
-        )
-    elif m_norm in {"minmaxscaler", "minmax"}:
-        scaler = MinMaxScaler(
-            feature_range=tuple(params.get("feature_range", (0.0, 1.0))),
-            clip=bool(params.get("clip", False)),
-        )
+    # build mask
+    if treat_from_as_null or from_value is None:
+        mask = before_s.isna()
     else:
-        raise ValueError(
-            f"Méthode de normalisation inconnue: {method}. "
-            "Méthodes supportées: StandardScaler, RobustScaler, MinMaxScaler."
-        )
+        fv = _coerce_scalar_for_series(before_s, from_value)
 
-    X = df[cols].astype(float)
-    Xt = scaler.fit_transform(X)
-
-    df = df.copy()
-    df[cols] = Xt
-    return df
-
-
-def _encode(df: pd.DataFrame, cols: list[str], method: str) -> pd.DataFrame:
-    _ensure_cols_exist(df, cols)
-
-    if method == "label":
-        for c in cols:
-            s = df[c].astype("string")
-            uniq = sorted(set([v for v in s.dropna().unique()]))
-            mapping = {v: i for i, v in enumerate(uniq)}
-            df[c] = s.map(mapping).astype("Int64")
-        return df
-
-    if method == "onehot":
-        sub = df[cols]
-        has_missing = sub.isna().to_numpy().any()
-
-        dummies = pd.get_dummies(
-            sub.astype("string"),
-            prefix=cols,
-            dummy_na=has_missing,
-        )
-
-        # ✅ 0/1 entiers
-        dummies = dummies.astype("uint8")
-
-        df = df.drop(columns=cols)
-        df = pd.concat([df, dummies], axis=1)
-        return df
-
-    raise ValueError(f"Méthode d'encodage inconnue: {method}")
-
-
-def _legacy_infer_action(
-    op_type: str,
-    action: str | None,
-    description: str | None,
-    params: dict,
-) -> tuple[str | None, dict]:
-    desc = (description or "").lower()
-    p = dict(params or {})
-
-    if op_type == "cleaning" and not action:
-        if any(k in desc for k in ["supprim", "drop"]):
-            action = "drop_columns"
-        elif "doubl" in desc or "duplicate" in desc:
-            action = "drop_duplicates"
+        # string/object compare
+        if pd.api.types.is_object_dtype(before_s) or pd.api.types.is_string_dtype(before_s):
+            s_str = before_s.astype("string")
+            fv_str = str(from_value)
+            if case_sensitive:
+                mask = s_str == fv_str
+            else:
+                mask = s_str.str.lower() == fv_str.lower()
         else:
-            action = "fill_missing"
+            mask = before_s == fv
 
-        if "fill_value" in p and "strategy" not in p and "constant" not in p:
-            p["strategy"] = "constant"
-            p["constant"] = p.get("fill_value")
+    changed = int(mask.sum())
 
-    if op_type == "other" and not action:
-        action = "drop_duplicates"
+    # replacement value
+    if treat_to_as_null or to_value is None:
+        rep = pd.NA
+    else:
+        rep = _coerce_scalar_for_series(before_s, to_value)
 
-    return action, p
+        # if numeric column but replacement isn't numeric -> make column object
+        if pd.api.types.is_numeric_dtype(before_s):
+            if isinstance(rep, str):
+                v = rep.strip()
+                num = pd.to_numeric([v], errors="coerce")[0]
+                if pd.isna(num):  # not numeric string
+                    df2[col] = df2[col].astype("object")
+            elif rep is not None and not isinstance(rep, (int, float, np.integer, np.floating)):
+                df2[col] = df2[col].astype("object")
+
+    missing_before = int(before_s.isna().sum())
+
+    # apply
+    df2.loc[mask, col] = rep
+
+    missing_after = int(df2[col].isna().sum())
+
+    effect = {
+        "per_column": {
+            col: {
+                "changed_count": changed,
+                "missing_before": missing_before,
+                "missing_after": missing_after,
+                "filled": max(0, missing_before - missing_after),
+            }
+        }
+    }
+    return df2, effect
 
 
-
-def _count_changed(before_s: pd.Series, after_s: pd.Series) -> int:
-    # compare en traitant NaN == NaN
-    b = before_s.astype("object").where(pd.notnull(before_s), "__NA__")
-    a = after_s.astype("object").where(pd.notnull(after_s), "__NA__")
-    return int((b != a).sum())
-
-
-def _fill_value_for_strategy(before: pd.DataFrame, col: str, strategy: str, constant=None):
-    s = before[col]
-    strategy = (strategy or "").lower()
-
-    if strategy == "mean":
-        return float(s.mean())
-    if strategy == "median":
-        return float(s.median())
-    if strategy == "mode":
-        m = s.mode(dropna=True)
-        return None if len(m) == 0 else m.iloc[0]
-    if strategy == "constant":
-        return constant
-    return None
-
-
-def compute_operation_effect(
-    before: pd.DataFrame,
-    after: pd.DataFrame,
-    cols: list[str],
-    params: dict,
-) -> dict:
+# -----------------------------
+# Effects
+# -----------------------------
+def compute_operation_effect(before: pd.DataFrame, after: pd.DataFrame, params: dict) -> dict:
     before_cols = list(map(str, before.columns))
     after_cols = list(map(str, after.columns))
-
     added = [c for c in after_cols if c not in set(before_cols)]
     removed = [c for c in before_cols if c not in set(after_cols)]
 
@@ -290,35 +289,55 @@ def compute_operation_effect(
     }
 
     if after.shape[0] != before.shape[0]:
-        eff["rows_removed"] = int(before.shape[0] - after.shape[0])
+        delta = int(after.shape[0] - before.shape[0])
+        eff["rows_delta"] = delta
+        if delta < 0:
+            eff["rows_removed"] = int(-delta)
 
-    common = [c for c in cols if c in before.columns and c in after.columns]
-    per_col = {}
-    for c in common:
-        mb = int(before[c].isna().sum())
-        ma = int(after[c].isna().sum())
-        per_col[c] = {
-            "missing_before": mb,
-            "missing_after": ma,
-            "filled": int(max(0, mb - ma)),
-            "changed_count": _count_changed(before[c], after[c]),
-        }
-    if per_col:
-        eff["per_column"] = per_col
-
-    # imputation-like (si params le contient)
-    strategy = (params or {}).get("strategy") or (params or {}).get("method")
-    if strategy:
-        strategy = str(strategy).lower()
-        eff["fill_strategy"] = strategy
-        constant = (params or {}).get("constant", None)
-        eff["fill_value_by_column"] = {
-            c: _fill_value_for_strategy(before, c, strategy, constant=constant)
-            for c in common
-        }
+    if (params or {}).get("action") == "rename_columns":
+        eff["rename_mapping"] = (params or {}).get("mapping", {})
 
     return eff
 
+
+def _legacy_infer_action(description: str | None) -> str | None:
+    desc = (description or "").lower()
+    if any(k in desc for k in ["rename", "renomm"]):
+        return "rename_columns"
+    if any(k in desc for k in ["doubl", "duplicate"]):
+        return "drop_duplicates"
+    if any(k in desc for k in ["vide", "empty", "blank"]):
+        return "drop_empty_rows"
+    if any(k in desc for k in ["strip", "trim", "espaces"]):
+        return "strip_whitespace"
+    if any(k in desc for k in ["substitut", "replace"]):
+        return "substitute_values"
+    if any(k in desc for k in ["supprim", "drop"]):
+        return "drop_columns"
+    return None
+
+
+def _update_alias_map(alias: dict[str, str], applied_rename: dict[str, str]) -> None:
+    if not applied_rename:
+        return
+
+    for old, new in applied_rename.items():
+        old = str(old)
+        new = str(new)
+
+        for k, v in list(alias.items()):
+            if v == old:
+                alias[k] = new
+
+        alias[old] = new
+
+
+def _remap_cols(cols: list[str], alias: dict[str, str]) -> list[str]:
+    out: list[str] = []
+    for c in (cols or []):
+        cc = str(c)
+        out.append(alias.get(cc, cc))
+    return out
 
 
 def _apply_one(
@@ -326,94 +345,118 @@ def _apply_one(
     op_type: str,
     cols: list[str],
     params: dict,
+    alias_map: dict[str, str],
     *,
     description: str | None = None,
-) -> pd.DataFrame:
-    action = (params or {}).get("action")
-    action, params = _legacy_infer_action(op_type, action, description, params)
+) -> tuple[pd.DataFrame, dict]:
+    if op_type != "cleaning":
+        raise ValueError(
+            f"Opération '{op_type}' non supportée. "
+            "Ce module est limité au nettoyage (no leakage)."
+        )
 
-    if op_type == "cleaning":
-        if action == "drop_columns":
-            return _drop_columns(df, cols)
+    params = params or {}
+    action = params.get("action") or _legacy_infer_action(description)
+    if action not in ALLOWED_CLEANING_ACTIONS:
+        raise ValueError(f"Cleaning: action inconnue: {action}. Allowed={sorted(ALLOWED_CLEANING_ACTIONS)}")
 
-        if action == "fill_missing":
-            strategy = (params or {}).get("strategy") or (params or {}).get("method") or "mode"
-            constant = (params or {}).get("constant", None)
-            if constant is None and "fill_value" in (params or {}):
-                constant = (params or {}).get("fill_value")
-            return _fill_missing(df, cols, strategy=strategy, constant=constant)
+    cols = _remap_cols([str(c) for c in (cols or [])], alias_map)
+    extra: dict = {}
 
-        if action == "drop_duplicates":
-            return _drop_duplicates(df, cols if cols else None)
+    if action == "drop_columns":
+        present, missing = _split_existing_missing(df, cols)
+        if missing:
+            extra["ignored_missing_cols"] = missing
+        return _drop_columns(df, cols, strict=STRICT_REBUILD), extra
 
-        raise ValueError("Cleaning: action manquante ou inconnue.")
+    if action == "drop_duplicates":
+        keep = str(params.get("keep", "first"))
+        subset = cols if cols else None
+        present, missing = _split_existing_missing(df, subset or [])
+        if subset and missing:
+            extra["ignored_missing_cols"] = missing
+        return _drop_duplicates(df, subset=subset, keep=keep, strict=STRICT_REBUILD), extra
 
-    if op_type == "imputation":
-        method = (params or {}).get("method") or (params or {}).get("strategy") or "mode"
-        method = str(method).lower()
+    if action == "drop_empty_rows":
+        subset = cols if cols else None
+        if subset:
+            present, missing = _split_existing_missing(df, subset)
+            if missing:
+                extra["ignored_missing_cols"] = missing
+        return _drop_empty_rows(df, cols=subset, strict=STRICT_REBUILD), extra
 
-        if method in {"knn", "knnimputer"}:
-            n_neighbors = (params or {}).get("n_neighbors", 5)
-            weights = (params or {}).get("weights", "uniform")
-            add_indicator = (params or {}).get("add_indicator", False)
-            return _knn_impute(
-                df,
-                cols,
-                n_neighbors=int(n_neighbors),
-                weights=str(weights),
-                add_indicator=bool(add_indicator),
-            )
+    if action == "rename_columns":
+        mapping = params.get("mapping") or {}
+        if isinstance(mapping, dict) and mapping:
+            remapped_mapping: dict[str, str] = {}
+            for k, v in mapping.items():
+                kk = alias_map.get(str(k), str(k))
+                remapped_mapping[kk] = str(v)
+            df2, applied = _rename_columns(df, mapping=remapped_mapping, strict=STRICT_REBUILD)
+        else:
+            df2, applied = _rename_columns(df, mapping=mapping, strict=STRICT_REBUILD)
 
-        constant = (params or {}).get("constant", None)
-        if constant is None and "fill_value" in (params or {}):
-            constant = (params or {}).get("fill_value")
+        if applied:
+            _update_alias_map(alias_map, applied)
+            extra["applied_rename"] = applied
+        else:
+            extra["applied_rename"] = {}
+        return df2, extra
 
-        if method == "constant" and constant is None:
-            raise ValueError("Imputation 'constant' nécessite 'constant' (ou 'fill_value').")
+    if action == "strip_whitespace":
+        subset = cols if cols else None
+        if subset:
+            present, missing = _split_existing_missing(df, subset)
+            if missing:
+                extra["ignored_missing_cols"] = missing
+        return _strip_whitespace(df, cols=subset, strict=STRICT_REBUILD), extra
 
-        return _fill_missing(df, cols, strategy=method, constant=constant)
+    # ✅ substitute_values
+    if action == "substitute_values":
+        if len(cols) != 1:
+            raise ValueError("substitute_values: l'opération doit cibler exactement 1 colonne (payload.columns).")
+        col = cols[0]
 
-    if op_type == "normalization":
-        # ✅ Default => StandardScaler, et plus de zscore/robust/minmax legacy
-        method = (params or {}).get("method", "StandardScaler")
-        return _normalize(df, cols, method=method, params=params or {})
+        df2, sub_eff = _substitute_values(
+            df,
+            col,
+            from_value=params.get("from_value", None),
+            to_value=params.get("to_value", None),
+            case_sensitive=bool(params.get("case_sensitive", True)),
+            treat_from_as_null=bool(params.get("treat_from_as_null", False)),
+            treat_to_as_null=bool(params.get("treat_to_as_null", False)),
+        )
+        extra.update(sub_eff)
+        return df2, extra
 
-    if op_type == "encoding":
-        method = (params or {}).get("method", "onehot")
-        return _encode(df, cols, method=method)
-
-    if op_type == "other":
-        if action == "drop_duplicates":
-            return _drop_duplicates(df, cols if cols else None)
-        raise ValueError("Other: action manquante ou inconnue.")
-
-    raise ValueError(f"Type d'opération inconnu: {op_type}")
+    raise ValueError(f"Cleaning: action inconnue: {action}")
 
 
 def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
-    
     ds = get_dataset_or_404(db, project_id, dataset_id)
+    df = read_df(ds.file_path)  # start from SOURCE file
 
-    df = read_df(ds.file_path)
+    ops = crud_processing.list_operations_by_type(db, project_id, dataset_id, op_type="cleaning")
 
-    ops = crud_processing.list_operations(db, project_id, dataset_id)
+    alias_map: dict[str, str] = {}
 
     for op in ops:
-        cols = _target_cols(df, op.columns)
-        _ensure_cols_exist(df, cols)
-
+        raw_cols = [str(c) for c in (getattr(op, "columns", []) or [])]
         before = df.copy()
 
-        df = _apply_one(
-            df,
-            op.op_type,
-            cols,
-            op.params or {},
+        df, extra = _apply_one(
+            df=df,
+            op_type=op.op_type,
+            cols=raw_cols,
+            params=op.params or {},
+            alias_map=alias_map,
             description=getattr(op, "description", None),
         )
 
         try:
-            effect = compute_operation_effect(before, df, cols, op.params or {})
+            effect = compute_operation_effect(before, df, op.params or {})
+            if extra:
+                effect.update(extra)
             crud_processing.set_operation_result(db, op.id, effect)
         except Exception:
             pass

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal
 from pydantic import BaseModel
 
 
-OperationType = Literal["cleaning", "imputation", "normalization", "encoding", "other"]
+OperationType = Literal["cleaning", "other"]
 
 
 class ProcessingOperationCreate(BaseModel):
