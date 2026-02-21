@@ -411,7 +411,6 @@ def _apply_one(
                 extra["ignored_missing_cols"] = missing
         return _strip_whitespace(df, cols=subset, strict=STRICT_REBUILD), extra
 
-    # ✅ substitute_values
     if action == "substitute_values":
         if len(cols) != 1:
             raise ValueError("substitute_values: l'opération doit cibler exactement 1 colonne (payload.columns).")

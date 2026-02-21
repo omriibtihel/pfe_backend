@@ -3,16 +3,21 @@ from __future__ import annotations
 
 import io
 import json
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user
 from app.models.project import Project
 from app.models.training import TrainingSession, TrainedModel
-from app.schemas.training import TrainingConfigIn
+from app.schemas.training import TrainingConfigIn, TrainingValidateOut
+from app.services.training.config import get_training_capabilities
+from app.services.training.dataset_loader import load_dataframe, resolve_dataset_path
+from app.services.training.predictor import predict_with_trained_model, read_uploaded_dataframe
+from app.services.training.preview import PreviewValidationError, build_validation_preview
+from app.services.training.validation import validate_training_config_payload
 from app.services.training_service import run_training_session
 
 router = APIRouter()
@@ -33,21 +38,54 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
 
     test_metrics = metrics_all.get("test")
     metrics = test_metrics if isinstance(test_metrics, dict) else metrics_all
+    metrics_legacy = metrics.get("legacy_flat") if isinstance(metrics.get("legacy_flat"), dict) else {}
+    metrics_global = metrics.get("global") if isinstance(metrics.get("global"), dict) else {}
+    metrics_binary = metrics.get("binary") if isinstance(metrics.get("binary"), dict) else {}
 
-    def mget(k: str) -> float:
+    def mget(k: str) -> Optional[float]:
         v = metrics.get(k)
+        if v is None:
+            v = metrics_legacy.get(k)
+        if v is None:
+            v = metrics_global.get(k)
+        if v is None:
+            v = metrics_binary.get(k)
+        if v is None:
+            return None
         try:
-            return float(v) if v is not None else 0.0
+            return float(v)
         except Exception:
-            return 0.0
+            return None
 
-    primary = metrics_all.get("primary_score") or {}
+    task_type = str(m.task_type or "").lower()
+    primary = metrics_all.get("primary_score") if isinstance(metrics_all.get("primary_score"), dict) else {}
     primary_metric = primary.get("metric")
 
-    try:
-        test_score = float(primary.get("value", 0.0))
-    except Exception:
-        test_score = 0.0
+    # Legacy format contains primary_score. Refactor format may not, so infer robustly.
+    if not primary_metric:
+        candidates = (
+            ["f1", "accuracy", "roc_auc", "pr_auc"]
+            if task_type == "classification"
+            else ["r2", "rmse", "mae", "mse"]
+        )
+        for key in candidates:
+            if key in metrics:
+                primary_metric = key
+                break
+        if not primary_metric and isinstance(metrics, dict) and metrics:
+            primary_metric = next(iter(metrics.keys()))
+
+    test_score = 0.0
+    if isinstance(primary, dict) and primary.get("value") is not None:
+        try:
+            test_score = float(primary.get("value"))
+        except Exception:
+            test_score = 0.0
+    elif primary_metric and isinstance(metrics, dict):
+        try:
+            test_score = float(metrics.get(primary_metric, 0.0))
+        except Exception:
+            test_score = 0.0
 
     train_score = 0.0
     train_block = metrics_all.get("train")
@@ -63,6 +101,8 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
         training_time = 0.0
 
     split_info = metrics_all.get("split_info") if isinstance(metrics_all.get("split_info"), dict) else None
+    if split_info is None:
+        split_info = artifacts.get("split_info") if isinstance(artifacts.get("split_info"), dict) else None
 
     gs = artifacts.get("grid_search") if isinstance(artifacts.get("grid_search"), dict) else {}
     best_params = gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None
@@ -71,6 +111,7 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
 
     thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else None
     balancing = artifacts.get("balancing") if isinstance(artifacts.get("balancing"), dict) else None
+    smote = artifacts.get("smote") if isinstance(artifacts.get("smote"), dict) else None
 
     return {
         "id": str(m.id),
@@ -113,15 +154,20 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
 
         "featureImportance": artifacts.get("feature_importance", []),
         "confusionMatrix": artifacts.get("confusion_matrix", []),
+        "metricsDetailed": metrics,
+        "metricsWarnings": metrics.get("warnings", []) if isinstance(metrics, dict) else [],
+        "hyperparams": artifacts.get("hyperparams", None),
 
         # Step 1 visibility
         "classDistribution": artifacts.get("class_distribution", None),
         "baselineMajority": artifacts.get("baseline_majority", None),
         "splitDebug": artifacts.get("split_debug", None),
+        "preprocessing": artifacts.get("preprocessing", None),
 
         # NEW: robust behavior visibility
         "balancing": balancing,          # auto balance info (class_weight/spw decision)
         "thresholding": thresholding,    # tuned threshold + applied_on_test flag (holdout)
+        "smote": smote,
 
         "trainingTime": training_time,
     }
@@ -153,6 +199,62 @@ def _session_to_front_session(db: Session, s: TrainingSession) -> dict[str, Any]
     }
 
 
+@router.get("/capabilities")
+def get_capabilities(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _get_owned_project(db, project_id, current_user.id)
+    return get_training_capabilities()
+
+
+@router.post("/validate", response_model=TrainingValidateOut)
+def validate_training(
+    project_id: int,
+    payload: TrainingConfigIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _get_owned_project(db, project_id, current_user.id)
+
+    version_id = payload.datasetVersionId
+    if version_id is None:
+        raise HTTPException(status_code=400, detail="datasetVersionId is required for validation")
+
+    try:
+        dataset_path, dataset_version_id = resolve_dataset_path(db, project_id, version_id)
+        df = load_dataframe(dataset_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    payload_dict = payload.model_dump()
+    result = validate_training_config_payload(payload_dict, df)
+    include_payload = payload_dict.get("include") if isinstance(payload_dict.get("include"), dict) else {}
+    include_preview = bool(include_payload.get("preview", False))
+    if include_preview:
+        try:
+            result.update(
+                build_validation_preview(
+                    payload_dict,
+                    df,
+                    dataset_version_id=int(dataset_version_id),
+                )
+            )
+        except PreviewValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": str(exc),
+                    "error_details": exc.error_details,
+                },
+            ) from exc
+
+    if isinstance(result.get("normalized_config"), dict):
+        result["normalized_config"]["datasetVersionId"] = int(dataset_version_id)
+    return result
+
+
 @router.post("/versions/{version_id}/sessions", status_code=status.HTTP_201_CREATED)
 def start_training_for_version(
     project_id: int,
@@ -174,7 +276,10 @@ def start_training_for_version(
         dataset_version_id=version_id,
         status="queued",
         progress=0,
-        config_json=payload.model_dump(),
+        config_json={
+            **payload.model_dump(),
+            "datasetVersionId": int(version_id),
+        },
     )
     db.add(s)
     db.commit()
@@ -250,6 +355,39 @@ def save_model(
     db.commit()
 
     return {"success": True, "message": "Modèle enregistré avec succès"}
+
+
+@router.post("/sessions/{session_id}/models/{model_id}/predict")
+async def predict_with_model(
+    project_id: int,
+    session_id: int,
+    model_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _get_owned_project(db, project_id, current_user.id)
+
+    m = (
+        db.query(TrainedModel)
+        .filter(
+            TrainedModel.id == model_id,
+            TrainedModel.session_id == session_id,
+            TrainedModel.project_id == project_id,
+        )
+        .first()
+    )
+    if not m:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    try:
+        content = await file.read()
+        raw_df = read_uploaded_dataframe(file.filename or "", content)
+        result = predict_with_trained_model(m, raw_df)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
+
+    return result
 
 
 @router.get("/sessions/{session_id}/download")

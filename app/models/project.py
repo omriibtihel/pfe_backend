@@ -41,12 +41,21 @@ class Project(Base):
         foreign_keys="Dataset.project_id",
         passive_deletes=True,
     )
+    
+    version_column_schemas = relationship(
+        "VersionColumnSchema",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
 
     active_dataset_id = Column(
         Integer,
         ForeignKey("datasets.id", ondelete="SET NULL"),
         nullable=True,
     )
+    
 
     # IMPORTANT : préciser foreign_keys ici aussi
     active_dataset = relationship("Dataset", foreign_keys=[active_dataset_id])

@@ -39,3 +39,11 @@ class DatasetVersion(Base):
         back_populates="workspace_owner_version",
         foreign_keys="Dataset.workspace_owner_version_id",
     )
+    
+    column_schemas = relationship(
+        "VersionColumnSchema",
+        back_populates="dataset_version",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+

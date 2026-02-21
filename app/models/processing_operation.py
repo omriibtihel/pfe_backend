@@ -16,7 +16,7 @@ class ProcessingOperation(Base):
     dataset_id = Column(Integer, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
-    op_type = Column(String, nullable=False)  # "cleaning" | "imputation" | ...
+    op_type = Column(String, nullable=False)  
     description = Column(String, nullable=False)
 
     columns = Column(JSONB, nullable=False, server_default="[]")
