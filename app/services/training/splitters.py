@@ -222,25 +222,96 @@ def iter_kfold_splits(
     X: pd.DataFrame,
     y: np.ndarray,
     *,
-    task_type: str,
+    split_method: str = "kfold",
     k_folds: int,
+    shuffle: bool = True,
     random_state: int = 42,
 ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
-    if k_folds < 2:
-        raise RuntimeError("kFolds must be >= 2")
+    """
+    Yield (train_idx, val_idx) pairs for k-fold cross-validation.
 
-    if task_type == "classification":
+    split_method:
+      - "kfold"            → plain KFold (works for classification and regression)
+      - "stratified_kfold" → StratifiedKFold (classification only; keeps class ratios per fold)
+
+    All data-leakage prevention (preprocessing fit, resampling) is the caller's
+    responsibility: only fit on the train_idx slice, transform both.
+    """
+    if k_folds < 2:
+        raise RuntimeError("kFolds must be >= 2.")
+
+    n_samples = len(X)
+    if k_folds > n_samples:
+        raise RuntimeError(
+            f"kFolds={k_folds} dépasse le nombre d'échantillons ({n_samples}). "
+            f"Réduire kFolds à <= {n_samples}."
+        )
+
+    rng_kwarg: dict = {"random_state": random_state} if shuffle else {}
+
+    if split_method == "stratified_kfold":
         vals, counts = np.unique(y, return_counts=True)
         if len(vals) < 2:
-            raise RuntimeError("Classification requires at least 2 classes.")
-        # StratifiedKFold cannot have more folds than the smallest class count.
-        max_k = int(counts.min())
-        if max_k < 2:
-            raise RuntimeError("Not enough samples per class for StratifiedKFold.")
-        k = min(k_folds, max_k)
-        splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=random_state)
+            raise RuntimeError(
+                "stratified_kfold nécessite au moins 2 classes dans la cible."
+            )
+        min_class_count = int(counts.min())
+        if min_class_count < k_folds:
+            raise RuntimeError(
+                f"stratified_kfold: la classe minoritaire n'a que {min_class_count} échantillon(s) "
+                f"pour {k_folds} folds. Réduire kFolds à <= {min_class_count}."
+            )
+        splitter = StratifiedKFold(n_splits=k_folds, shuffle=shuffle, **rng_kwarg)
     else:
-        k = min(k_folds, len(X))
-        splitter = KFold(n_splits=k, shuffle=True, random_state=random_state)
+        # Plain KFold — works for classification and regression alike.
+        splitter = KFold(n_splits=k_folds, shuffle=shuffle, **rng_kwarg)
 
     yield from splitter.split(X, y)
+
+
+def validate_kfold_config(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    *,
+    split_method: str,
+    k_folds: int,
+    task_type: str,
+) -> list[str]:
+    """
+    Return a list of human-readable error strings for the given CV config.
+    Returns [] if the config is valid.
+    """
+    errors: list[str] = []
+    n_samples = len(X)
+
+    if k_folds < 2:
+        errors.append("kFolds doit être >= 2.")
+    elif k_folds > n_samples:
+        errors.append(
+            f"kFolds={k_folds} dépasse le nombre d'échantillons ({n_samples}). "
+            f"Réduire kFolds à <= {n_samples}."
+        )
+
+    if split_method == "stratified_kfold":
+        if task_type != "classification":
+            errors.append(
+                "stratified_kfold est réservé à la classification. "
+                "Pour la régression, utiliser splitMethod='kfold'."
+            )
+        elif k_folds >= 2:
+            vals, counts = np.unique(y, return_counts=True)
+            if len(vals) < 2:
+                errors.append(
+                    "stratified_kfold nécessite au moins 2 classes dans la cible."
+                )
+            else:
+                min_class_count = int(counts.min())
+                min_class_label = str(vals[int(np.argmin(counts))])
+                if min_class_count < k_folds:
+                    errors.append(
+                        f"stratified_kfold: la classe '{min_class_label}' n'a que "
+                        f"{min_class_count} échantillon(s) pour {k_folds} folds. "
+                        f"Réduire kFolds à <= {min_class_count} ou choisir kfold simple."
+                    )
+
+    return errors

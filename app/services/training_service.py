@@ -77,14 +77,25 @@ def run_training_session(session_id: int) -> None:
         total = max(1, len(cfg.models))
         success_count = 0
 
-        _update_session(db, s, dataset_version_id=dv_id, progress=10)
+        _update_session(db, s, dataset_version_id=dv_id, progress=10, current_model=None)
 
         for i, model_type in enumerate(cfg.models, start=1):
-            _update_session(db, s, progress=min(95, int(10 + (i - 1) * (80 / total))))
+            # Progress range for this model: divide 10–95 equally among all models.
+            progress_start = min(95, int(10 + (i - 1) * (85 / total)))
+            progress_end   = min(95, int(10 + i * (85 / total)))
+            current_label  = f"{model_type} ({i}/{total})"
+
+            _update_session(db, s, progress=progress_start, current_model=current_label)
             _log_event("training.session.model.start", session_id=session_id, model_type=model_type, index=i, total=total)
 
             try:
-                res = run_one_model(df, cfg, model_type=model_type)
+                res = run_one_model(
+                    df,
+                    cfg,
+                    model_type=model_type,
+                    db=db,
+                    session_id=s.id,
+                )
 
                 # save artifact
                 pkl_path = save_pipeline(res.fitted_pipeline, out_dir, model_type)
@@ -103,6 +114,8 @@ def run_training_session(session_id: int) -> None:
                 )
 
                 success_count += 1
+                # Advance progress to end of this model's range after success.
+                _update_session(db, s, progress=progress_end)
                 _log_event("training.session.model.success", session_id=session_id, model_type=model_type)
 
             except Exception as e:
@@ -113,9 +126,11 @@ def run_training_session(session_id: int) -> None:
                     model_type=model_type,
                     reason=str(e),
                 )
+                # Still advance progress so the bar moves even on error.
+                _update_session(db, s, progress=progress_end)
 
         final_status = "succeeded" if success_count > 0 else "failed"
-        _update_session(db, s, status=final_status, progress=100, finished_at=_now())
+        _update_session(db, s, status=final_status, progress=100, finished_at=_now(), current_model=None)
         _log_event("training.session.end", session_id=session_id, status=final_status, success_count=success_count)
 
     except Exception as e:

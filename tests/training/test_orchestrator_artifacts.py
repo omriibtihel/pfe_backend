@@ -28,7 +28,7 @@ def _make_imbalanced_binary_df(n_majority: int = 180, n_minority: int = 40) -> p
     )
 
 
-def _cfg(*, use_smote: bool, models: list[str] | None = None) -> TrainingConfig:
+def _cfg(*, strategy: str = "none", models: list[str] | None = None, apply_threshold: bool = False) -> TrainingConfig:
     selected_models = models or ["randomforest"]
     return TrainingConfig.from_front(
         {
@@ -42,7 +42,12 @@ def _cfg(*, use_smote: bool, models: list[str] | None = None) -> TrainingConfig:
             "testRatio": 15,
             "kFolds": 5,
             "useGridSearch": False,
-            "useSmote": use_smote,
+            "balancing": {
+                "strategy": strategy,
+                "apply_threshold": apply_threshold,
+                "threshold_strategy": "maximize_f1",
+                "user_confirmed": True,
+            },
             "preprocessing": {
                 "numericImputation": "median",
                 "numericScaling": "standard",
@@ -53,9 +58,9 @@ def _cfg(*, use_smote: bool, models: list[str] | None = None) -> TrainingConfig:
     )
 
 
-def test_artifacts_include_preprocessing_applied_model_params_and_smote_fields():
+def test_artifacts_include_preprocessing_model_and_balancing_audit():
     df = _make_imbalanced_binary_df()
-    cfg = _cfg(use_smote=False)
+    cfg = _cfg(strategy="none")
 
     res = orchestrator.run_one_model(df, cfg, model_type="randomforest")
     artifacts = res.artifacts_json
@@ -93,55 +98,17 @@ def test_artifacts_include_preprocessing_applied_model_params_and_smote_fields()
     assert isinstance(training_schema.get("dtypes"), dict)
     assert isinstance(training_schema.get("preprocessing_config"), dict)
 
-    smote = artifacts.get("smote", {})
-    assert smote.get("requested_by_user") is False
-    assert smote.get("applied") is False
-    assert smote.get("reason") == "user_disabled"
-    assert isinstance(smote.get("train_class_counts"), dict)
-    assert smote.get("train_minority_ratio") is not None
-
-
-def test_smote_disabled_does_not_call_builder(monkeypatch):
-    df = _make_imbalanced_binary_df()
-    cfg = _cfg(use_smote=False)
-    called = {"count": 0}
-
-    def _unexpected_call(*args, **kwargs):
-        called["count"] += 1
-        raise AssertionError("build_smote_for_train must not be called when useSmote=False")
-
-    monkeypatch.setattr(orchestrator, "build_smote_for_train", _unexpected_call)
-
-    res = orchestrator.run_one_model(df, cfg, model_type="randomforest")
-    assert called["count"] == 0
-    assert res.artifacts_json["smote"]["reason"] == "user_disabled"
-    assert res.artifacts_json["smote"]["requested_by_user"] is False
-
-
-def test_smote_enabled_calls_builder(monkeypatch):
-    df = _make_imbalanced_binary_df()
-    cfg = _cfg(use_smote=True)
-    called = {"count": 0}
-
-    def _fake_builder(y_train, random_state: int = 42):
-        called["count"] += 1
-        assert len(np.unique(y_train)) == 2
-        return None, {"enabled": False, "reason": "imblearn_not_installed"}
-
-    monkeypatch.setattr(orchestrator, "build_smote_for_train", _fake_builder)
-
-    res = orchestrator.run_one_model(df, cfg, model_type="randomforest")
-    smote = res.artifacts_json["smote"]
-
-    assert called["count"] == 1
-    assert smote["requested_by_user"] is True
-    assert smote["applied"] is False
-    assert smote["reason"] == "imblearn_not_installed"
+    balancing = artifacts.get("balancing", {})
+    assert balancing.get("strategy_applied") == "none"
+    assert balancing.get("rationale")
+    assert isinstance(balancing.get("audit_flags"), list)
+    assert isinstance(balancing.get("imbalance_ratio"), float)
+    assert isinstance(balancing.get("warnings"), list)
 
 
 def test_feature_importance_works_for_logistic_regression_via_coefficients():
     df = _make_imbalanced_binary_df()
-    cfg = _cfg(use_smote=False, models=["logisticregression"])
+    cfg = _cfg(strategy="none", models=["logisticregression"])
 
     res = orchestrator.run_one_model(df, cfg, model_type="logisticregression")
     feature_importance = res.artifacts_json.get("feature_importance")

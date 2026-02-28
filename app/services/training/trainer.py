@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GridSearchCV, KFold, StratifiedKFold
 
-from .imbalance import is_binary, minority_ratio
+from .balancing.profiler import is_binary, minority_ratio
 from .models import get_model_grid
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ def _choose_refit_metric(task_type: str, y_train: np.ndarray, requested_metrics:
     return "r2"
 
 
-def _build_cv_splitter(task_type: str, y_train: np.ndarray, requested_splits: int) -> Tuple[Any, int]:
+def _build_cv_splitter(task_type: str, y_train: np.ndarray, requested_splits: int, random_state: int = 42) -> Tuple[Any, int]:
     n_samples = int(len(y_train))
     if n_samples < 2:
         raise RuntimeError("Not enough training samples for CV tuning.")
@@ -107,13 +107,13 @@ def _build_cv_splitter(task_type: str, y_train: np.ndarray, requested_splits: in
             if len(vals) >= 2:
                 cv_cls = min(cv, int(counts.min()))
                 if cv_cls >= 2:
-                    return StratifiedKFold(n_splits=cv_cls, shuffle=True, random_state=42), cv_cls
+                    return StratifiedKFold(n_splits=cv_cls, shuffle=True, random_state=random_state), cv_cls
         except Exception:
             pass
 
     if cv < 2:
         raise RuntimeError("Not enough training samples for CV tuning.")
-    return KFold(n_splits=cv, shuffle=True, random_state=42), cv
+    return KFold(n_splits=cv, shuffle=True, random_state=random_state), cv
 
 
 def _summarize_cv_results(cv_results: Dict[str, Any], max_rows: int = 5) -> list[Dict[str, Any]]:
@@ -148,6 +148,7 @@ class Trainer:
         model_type: str,
         task_type: str,
         model_param_grid: Dict[str, list[Any]] | None = None,
+        refit_metric_override: str | None = None,
     ) -> TrainerFitResult:
         fit_params: Dict[str, Any] = {}
         if fit_sample_weight is not None:
@@ -197,8 +198,15 @@ class Trainer:
                 },
             )
 
-        refit_metric = _choose_refit_metric(task_type, y_train, getattr(cfg, "metrics", []) or [])
-        cv_splitter, cv_splits = _build_cv_splitter(task_type, y_train, int(getattr(cfg, "k_folds", 5) or 5))
+        if isinstance(refit_metric_override, str) and refit_metric_override.strip():
+            refit_metric = refit_metric_override.strip()
+        else:
+            refit_metric = _choose_refit_metric(task_type, y_train, getattr(cfg, "metrics", []) or [])
+        cv_splitter, cv_splits = _build_cv_splitter(
+            task_type, y_train,
+            int(getattr(cfg, "k_folds", 5) or 5),
+            random_state=int(getattr(cfg, "random_state", 42)),
+        )
 
         _log_event(
             "training.fit",

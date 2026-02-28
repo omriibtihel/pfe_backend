@@ -5,9 +5,10 @@ from typing import Any
 import pandas as pd
 
 from .config import SUPPORTED_SPLIT_METHODS, TrainingConfig, normalize_model_hyperparams
-from .imbalance import class_counts, minority_ratio
+from .balancing.profiler import class_counts, minority_ratio
 from .models import MODEL_REGISTRY, list_available_models
 from .preprocessing import resolve_effective_preprocessing_by_column
+from .splitters import validate_kfold_config
 
 _MISSING_FRIENDLY_MODELS = {"xgboost", "lightgbm"}
 _SKLEARN_MODELS = set(MODEL_REGISTRY._specs.keys()) - _MISSING_FRIENDLY_MODELS
@@ -230,6 +231,50 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
             f"splitMethod='{cfg.split_method}' non supporte. Methodes supportees: {', '.join(SUPPORTED_SPLIT_METHODS)}.",
         )
 
+    # ── CV-specific validation ────────────────────────────────────────────────
+    is_cv = cfg.split_method in ("kfold", "stratified_kfold")
+    if is_cv:
+        # stratified_kfold only for classification
+        if cfg.split_method == "stratified_kfold" and cfg.task_type != "classification":
+            _append_unique(
+                errors,
+                "splitMethod='stratified_kfold' est réservé à la classification. "
+                "Pour la régression, utilisez splitMethod='kfold'.",
+            )
+        # kFolds bounds
+        if cfg.k_folds < 2:
+            _append_unique(errors, "kFolds doit être >= 2.")
+        elif cfg.k_folds > 20:
+            _append_unique(errors, "kFolds doit être <= 20.")
+        # trainRatio / valRatio are irrelevant in CV mode — warn if they were customised.
+        # testRatio is *not* ignored: when > 0, it carves out a holdout test set before CV.
+        holdout_ratios_customised = (
+            abs(cfg.train_ratio - 0.70) > 0.01
+            or abs(cfg.val_ratio - 0.15) > 0.01
+        )
+        if holdout_ratios_customised:
+            _append_unique(
+                warnings,
+                f"splitMethod='{cfg.split_method}': trainRatio et valRatio sont ignorés "
+                "en mode cross-validation.",
+            )
+        # testRatio > 0 in CV mode = intentional holdout test set; validate bound
+        if cfg.test_ratio > 0:
+            if cfg.test_ratio > 0.40:
+                _append_unique(
+                    errors,
+                    f"testRatio={int(cfg.test_ratio * 100)}% est trop élevé en mode CV "
+                    "(maximum recommandé : 40%).",
+                )
+        # GridSearch + CV: inform about nested-CV behaviour
+        if cfg.use_grid_search:
+            _append_unique(
+                warnings,
+                "useGridSearch=true avec splitMethod=kfold/stratified_kfold: "
+                "le GridSearch est désactivé pendant la boucle par fold (évite le double-CV) "
+                "et appliqué uniquement lors du refit final sur l'ensemble des données.",
+            )
+
     if cfg.target_column and cfg.target_column not in df.columns:
         _append_unique(errors, f"La colonne cible '{cfg.target_column}' est introuvable dans le dataset.")
 
@@ -272,6 +317,32 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
         }
 
     X = df2.drop(columns=[cfg.target_column])
+
+    # ── Data-aware CV validation (needs actual y values) ──────────────────────
+    if cfg.split_method in ("kfold", "stratified_kfold"):
+        import numpy as _np
+        _y_cv = df2[cfg.target_column].to_numpy()
+        # When testRatio > 0 the CV loop only sees (1 - testRatio) of the data.
+        # Validate kFolds against that reduced count to catch the error early.
+        if cfg.test_ratio > 0:
+            _n_cv_approx = max(1, int(len(X) * (1.0 - cfg.test_ratio)))
+            if cfg.k_folds > _n_cv_approx:
+                _append_unique(
+                    errors,
+                    f"kFolds={cfg.k_folds} dépasse le nombre d'échantillons CV disponibles "
+                    f"(≈{_n_cv_approx} après retrait du test holdout de "
+                    f"{int(cfg.test_ratio * 100)}%).",
+                )
+        cv_errors = validate_kfold_config(
+            X,
+            _y_cv,
+            split_method=cfg.split_method,
+            k_folds=cfg.k_folds,
+            task_type=cfg.task_type,
+        )
+        for cv_err in cv_errors:
+            _append_unique(errors, cv_err)
+
     if cfg.task_type == "classification":
         y_values = df2[cfg.target_column].to_numpy()
         unique_values = pd.unique(y_values)
@@ -302,11 +373,12 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
         and str(col_cfg.get("type")) in {"categorical", "ordinal"}
         and str(col_cfg.get("categoricalEncoding", "none")) == "none"
     ]
-    if categorical_no_encoding_cols and sklearn_models:
+    if categorical_no_encoding_cols and models:
         _append_unique(
             errors,
-            "categoricalEncoding='none' sur colonnes categorielles/ordinales avec modeles sklearn "
-            f"({', '.join(sklearn_models)}). Colonnes: {_preview_columns(categorical_no_encoding_cols)}.",
+            "categoricalEncoding='none' sur colonnes categorielles/ordinales: "
+            f"tous les modeles selectionnes ({', '.join(models)}) refusent les features de type string. "
+            f"Colonnes: {_preview_columns(categorical_no_encoding_cols)}.",
         )
 
     numeric_nan_cells = 0
@@ -317,6 +389,10 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
             continue
         missing_cells = int(X[col].isna().sum())
         if missing_cells <= 0:
+            continue
+
+        if missing_cells == len(X):  # 100% NaN — inutilisable quelle que soit la stratégie d'imputation
+            _append_unique(errors, f"Colonne '{col}' entièrement vide (100% NaN): inutilisable.")
             continue
 
         col_type = str(col_cfg.get("type", "categorical"))

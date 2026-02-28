@@ -34,10 +34,22 @@ class Evaluator:
         self.requested_metrics = [str(m).strip().lower() for m in (requested_metrics or [])]
         self.positive_label = positive_label
 
-    def evaluate(self, pipeline: Any, X: pd.DataFrame, y: np.ndarray) -> DatasetEval:
-        y_pred = pipeline.predict(X)
-        y_proba, y_score = get_proba_or_score(pipeline, X)
+    def evaluate(self, pipeline: Any, X: pd.DataFrame, y: np.ndarray, *, threshold: float = 0.5) -> DatasetEval:
         labels = get_class_labels(pipeline)
+        is_binary = labels is not None and len(labels) == 2
+        if threshold != 0.5 and is_binary and hasattr(pipeline, "predict_proba"):
+            # Find the column index of the positive class to avoid always using index 1.
+            pos_col = 1
+            if self.positive_label is not None and labels is not None:
+                try:
+                    pos_col = list(labels).index(self.positive_label)
+                except ValueError:
+                    pos_col = 1
+            proba = pipeline.predict_proba(X)[:, pos_col]
+            y_pred = (proba >= threshold).astype(int)
+        else:
+            y_pred = pipeline.predict(X)
+        y_proba, y_score = get_proba_or_score(pipeline, X)
 
         if self.task_type == "classification":
             metrics = classification_metrics(

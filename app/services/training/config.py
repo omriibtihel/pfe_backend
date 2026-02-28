@@ -7,8 +7,17 @@ from typing import Any, Literal, Mapping, Sequence
 from .models import MODEL_REGISTRY, list_available_models
 
 TaskType = Literal["classification", "regression"]
-SplitMethod = Literal["holdout", "kfold"]
+SplitMethod = Literal["holdout", "kfold", "stratified_kfold"]
 ColumnType = Literal["numeric", "categorical", "ordinal"]
+BalancingStrategy = Literal[
+    "none",
+    "class_weight",
+    "smote",
+    "smote_tomek",
+    "random_undersampling",
+    "threshold_optimization",
+]
+ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance"]
 
 NUMERIC_IMPUTATION_METHODS = ["none", "median", "mean", "most_frequent", "constant", "knn"]
 CATEGORICAL_IMPUTATION_METHODS = ["none", "most_frequent", "constant"]
@@ -20,7 +29,7 @@ DEFAULT_CATEGORICAL_IMPUTATION = "none"
 DEFAULT_CATEGORICAL_ENCODING = "none"
 DEFAULT_NUMERIC_SCALING = "none"
 
-SUPPORTED_SPLIT_METHODS = ["holdout"]
+SUPPORTED_SPLIT_METHODS = ["holdout", "kfold", "stratified_kfold"]
 CLASSIFICATION_METRICS = [
     "accuracy",
     "precision",
@@ -41,6 +50,15 @@ CLASSIFICATION_METRICS = [
     "confusion_matrix",
 ]
 REGRESSION_METRICS = ["mae", "mse", "rmse", "r2"]
+BALANCING_STRATEGIES = [
+    "none",
+    "class_weight",
+    "smote",
+    "smote_tomek",
+    "random_undersampling",
+    "threshold_optimization",
+]
+THRESHOLD_STRATEGIES = ["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance"]
 
 # Canonical frontend contract for Step3.
 PREPROCESSING_CAPABILITIES = {
@@ -288,11 +306,20 @@ def get_training_capabilities() -> dict[str, Any]:
         "preprocessing": _legacy_preprocessing_capabilities(),
         "preprocessingExecution": PREPROCESSING_EXECUTION_POLICY,
         "supportedSplitMethods": SUPPORTED_SPLIT_METHODS,
+        "splitMethodDefaults": {
+            "kFolds": 5,
+            "shuffle": True,
+        },
         "availableModels": list_available_models(),
         "modelHyperparamsSchema": _build_model_hp_capabilities(),
         "availableMetrics": {
             "classification": CLASSIFICATION_METRICS,
             "regression": REGRESSION_METRICS,
+        },
+        "balancingCapabilities": {
+            "strategies": list(BALANCING_STRATEGIES),
+            "thresholdStrategies": list(THRESHOLD_STRATEGIES),
+            "requiresExplicitConfirmation": True,
         },
     }
 
@@ -333,6 +360,15 @@ def _to_optional_int(raw: Any) -> int | None:
         return None
     try:
         return int(str(raw).strip())
+    except Exception:
+        return None
+
+
+def _to_optional_float(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).strip())
     except Exception:
         return None
 
@@ -883,6 +919,54 @@ class PreprocessingConfig:
 
 
 @dataclass(frozen=True)
+class BalancingConfig:
+    strategy: BalancingStrategy = "none"
+    apply_threshold: bool = False
+    threshold_strategy: ThresholdStrategy = "maximize_f1"
+    min_recall_constraint: float | None = None
+
+    @staticmethod
+    def from_front(raw: Any, *, legacy_use_smote: bool = False) -> "BalancingConfig":
+        data = _as_dict(raw)
+        legacy_default_strategy = "smote" if legacy_use_smote else "none"
+
+        strategy = _norm_choice(
+            data.get("strategy"),
+            BALANCING_STRATEGIES,
+            legacy_default_strategy,
+        )
+        apply_threshold = _to_bool(
+            data.get("apply_threshold", data.get("applyThreshold")),
+            default=False,
+        )
+        threshold_strategy = _norm_choice(
+            data.get("threshold_strategy", data.get("thresholdStrategy")),
+            THRESHOLD_STRATEGIES,
+            "maximize_f1",
+        )
+        min_recall_constraint = _to_optional_float(
+            data.get("min_recall_constraint", data.get("minRecallConstraint"))
+        )
+        if min_recall_constraint is not None and not (0.0 < min_recall_constraint < 1.0):
+            min_recall_constraint = None
+
+        return BalancingConfig(
+            strategy=strategy,  # type: ignore[arg-type]
+            apply_threshold=apply_threshold,
+            threshold_strategy=threshold_strategy,  # type: ignore[arg-type]
+            min_recall_constraint=min_recall_constraint,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": str(self.strategy),
+            "apply_threshold": bool(self.apply_threshold),
+            "threshold_strategy": str(self.threshold_strategy),
+            "min_recall_constraint": self.min_recall_constraint,
+        }
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     target_column: str
     task_type: TaskType
@@ -897,10 +981,13 @@ class TrainingConfig:
 
     use_grid_search: bool
     use_smote: bool
+    shuffle: bool
+    balancing: BalancingConfig
     preprocessing: PreprocessingConfig
     model_hyperparams: dict[str, dict[str, Any]] = field(default_factory=dict)
     positive_label: Any = None
     debug: bool = False
+    random_state: int = 42
     dataset_version_id: int | None = None
     custom_code: str = ""
 
@@ -916,7 +1003,18 @@ class TrainingConfig:
             return max(0.0, min(v, 0.99))
 
         split_raw = str(payload.get("splitMethod", "holdout")).strip().lower()
-        split_method: SplitMethod = "kfold" if split_raw == "kfold" else "holdout"
+        if split_raw == "stratified_kfold":
+            split_method: SplitMethod = "stratified_kfold"
+        elif split_raw == "kfold":
+            split_method = "kfold"
+        else:
+            split_method = "holdout"
+        legacy_use_smote = _to_bool(payload.get("useSmote"), default=False)
+        balancing_cfg = BalancingConfig.from_front(
+            payload.get("balancing"),
+            legacy_use_smote=legacy_use_smote,
+        )
+        use_smote = bool(str(balancing_cfg.strategy) in {"smote", "smote_tomek"})
 
         return TrainingConfig(
             target_column=str(payload.get("targetColumn", "")).strip(),
@@ -926,15 +1024,22 @@ class TrainingConfig:
             split_method=split_method,
             train_ratio=to_ratio(payload.get("trainRatio", 0.70), 0.70),
             val_ratio=to_ratio(payload.get("valRatio", 0.15), 0.15),
-            test_ratio=to_ratio(payload.get("testRatio", 0.15), 0.15),
+            # In CV mode the user may send testRatio=0 (no holdout test); default to 0.
+            # In holdout mode the conventional default is 15%.
+            test_ratio=to_ratio(
+                payload.get("testRatio", 0.0 if split_method != "holdout" else 0.15),
+                0.0 if split_method != "holdout" else 0.15,
+            ),
             k_folds=int(payload.get("kFolds", 5) or 5),
             use_grid_search=_to_bool(payload.get("useGridSearch"), default=False),
-            # Default is False when absent/invalid and no auto-enabling is allowed.
-            use_smote=_to_bool(payload.get("useSmote"), default=False),
+            use_smote=use_smote,
+            shuffle=_to_bool(payload.get("shuffle"), default=True),
+            balancing=balancing_cfg,
             preprocessing=PreprocessingConfig.from_front(payload),
             model_hyperparams=_normalize_model_hyperparams_payload(payload.get("modelHyperparams")),
             positive_label=payload.get("positiveLabel", payload.get("positive_label")),
             debug=_to_bool(payload.get("debug", payload.get("trainingDebug")), default=False),
+            random_state=int(payload.get("randomState", 42) or 42),
             dataset_version_id=_to_optional_int(payload.get("datasetVersionId")),
             custom_code=str(payload.get("customCode", "") or ""),
         )
@@ -951,11 +1056,14 @@ class TrainingConfig:
             "valRatio": self.val_ratio,
             "testRatio": self.test_ratio,
             "kFolds": self.k_folds,
+            "shuffle": bool(self.shuffle),
             "useGridSearch": bool(self.use_grid_search),
-            "useSmote": bool(self.use_smote),
+            "useSmote": bool(str(self.balancing.strategy) in {"smote", "smote_tomek"}),
+            "balancing": self.balancing.as_dict(),
             "preprocessing": self.preprocessing.as_dict(),
             "modelHyperparams": copy.deepcopy(self.model_hyperparams),
             "positiveLabel": self.positive_label,
             "debug": bool(self.debug),
+            "randomState": self.random_state,
             "customCode": self.custom_code,
         }

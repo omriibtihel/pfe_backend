@@ -3,6 +3,8 @@ from sqlalchemy import ForeignKey, String, Text, DateTime, Column, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base
+from app.models.dataset import Dataset  # noqa: F401
+from app.models.version_column_schema import VersionColumnSchema  # noqa: F401
 
 
 class Project(Base):
@@ -55,7 +57,15 @@ class Project(Base):
         ForeignKey("datasets.id", ondelete="SET NULL"),
         nullable=True,
     )
-    
 
     # IMPORTANT : préciser foreign_keys ici aussi
     active_dataset = relationship("Dataset", foreign_keys=[active_dataset_id])
+
+    active_model_id = Column(
+        Integer,
+        ForeignKey("trained_models.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    active_model = relationship("TrainedModel", foreign_keys="[Project.active_model_id]")

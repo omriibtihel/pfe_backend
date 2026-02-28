@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -248,7 +248,7 @@ class Reporter:
         split: Any,
         spec: Any,
         fitted_pipeline: Any,
-        smote_meta: Dict[str, Any],
+        balancing_audit: Dict[str, Any],
         training_schema: Dict[str, Any],
         tuning_artifacts: Dict[str, Any],
         confusion_matrix: Optional[list[list[int]]] = None,
@@ -287,7 +287,14 @@ class Reporter:
                 "applied": preprocessing_applied,
             },
             "training_schema": training_schema,
-            "smote": smote_meta,
+            "balancing": balancing_audit,
+            "thresholding": {
+                "enabled": bool(balancing_audit.get("apply_threshold", False)),
+                "strategy": balancing_audit.get("threshold_strategy"),
+                "optimal_threshold": balancing_audit.get("optimal_threshold"),
+                "improvement_delta": balancing_audit.get("threshold_f1_gain"),
+                "warnings": balancing_audit.get("warnings", []),
+            },
             "model": summarize_model(fitted_model),
             "feature_importance": summarize_feature_importance(fitted_pipeline),
             "grid_search": tuning_artifacts,
@@ -297,5 +304,148 @@ class Reporter:
             artifacts["confusion_matrix"] = confusion_matrix
         if class_distribution is not None:
             artifacts["class_distribution"] = class_distribution
+
+        return artifacts
+
+    def build_cv_artifacts(
+        self,
+        *,
+        cfg: Any,
+        fold_results: List[Dict[str, Any]],
+        cv_summary: Dict[str, Any],
+        actual_k: int,
+        n_folds_ok: int,
+        X_all: pd.DataFrame,
+        y_all: Any,
+        X_cv: Optional[pd.DataFrame] = None,
+        X_test_holdout: Optional[pd.DataFrame] = None,
+        final_spec: Any,
+        fitted_pipeline: Any,
+        balancing_audit: Dict[str, Any],
+        final_training_schema: Dict[str, Any],
+        tuning_artifacts: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Build the artifacts dict for a cross-validation run.
+
+        When X_test_holdout is provided (cfg.test_ratio > 0), the CV ran on
+        X_cv only and the model was refit on X_cv. The holdout test set is
+        genuinely independent.
+
+        When X_test_holdout is None (cfg.test_ratio == 0), original behaviour:
+        CV on all data, refit on all data.
+        """
+        named_steps = getattr(fitted_pipeline, "named_steps", {}) or {}
+        fitted_prep = named_steps.get("prep")
+        fitted_model = named_steps.get("model")
+
+        # Use X_cv for preprocessing summary (that's what the refit model saw)
+        X_refit = X_cv if X_cv is not None else X_all
+        has_holdout_test = X_test_holdout is not None
+        n_samples_cv = int(len(X_refit))
+        n_samples_total = int(len(X_all))
+
+        preprocessing_applied: Dict[str, Any] = {}
+        if fitted_prep is not None:
+            preprocessing_applied = summarize_preprocessing_applied(fitted_prep, X_refit)
+
+        # Aggregate fold sizes
+        ok_folds = [fr for fr in fold_results if fr.get("status") == "ok"]
+        train_sizes = [int(fr["train_size"]) for fr in ok_folds if "train_size" in fr]
+        val_sizes = [int(fr["val_size"]) for fr in ok_folds if "val_size" in fr]
+
+        # Per-fold class distribution (classification only)
+        fold_class_distributions = [
+            {"fold": fr["fold"], "class_distribution": fr.get("class_distribution")}
+            for fr in ok_folds
+            if fr.get("class_distribution") is not None
+        ]
+
+        # Balancing summary across folds
+        balancing_strategies_used = list({
+            fr.get("balancing_strategy", "none")
+            for fr in ok_folds
+            if fr.get("balancing_strategy")
+        })
+        smote_added_per_fold = [
+            fr["smote_samples_added"]
+            for fr in ok_folds
+            if fr.get("smote_samples_added") is not None
+        ]
+
+        if has_holdout_test:
+            refit_note = (
+                "The saved model was refit on the non-test CV data only. "
+                "CV metrics estimate generalisation on unseen folds; "
+                "the holdout test score is the final external evaluation."
+            )
+        else:
+            refit_note = (
+                "The saved model was refit on ALL data after cross-validation. "
+                "Use cv_summary for the honest generalisation estimate. "
+                "The refit model is suitable for deployment/prediction."
+            )
+
+        artifacts: Dict[str, Any] = {
+            "split_info": {
+                "method": str(cfg.split_method),
+                "k_folds": int(actual_k),
+                "folds_ok": int(n_folds_ok),
+                "folds_failed": int(actual_k - n_folds_ok),
+                "n_samples": n_samples_total,
+                "n_samples_cv": n_samples_cv,
+                "has_holdout_test": has_holdout_test,
+                "test_rows": int(len(X_test_holdout)) if has_holdout_test else None,
+                "shuffle": bool(getattr(cfg, "shuffle", True)),
+                "random_state": int(getattr(cfg, "random_state", 42)),
+                "avg_train_size": float(np.mean(train_sizes)) if train_sizes else None,
+                "avg_val_size": float(np.mean(val_sizes)) if val_sizes else None,
+                # Legacy holdout-style keys kept as None for frontend compat
+                "train_rows": None,
+                "val_rows": None,
+            },
+            "cv_fold_details": fold_results,
+            "cv_summary": cv_summary,
+            "columns": {
+                "numeric": final_spec.numeric_cols,
+                "categorical": final_spec.categorical_cols,
+            },
+            "preprocessing": {
+                "availableMethods": PREPROCESSING_CAPABILITIES,
+                "selectedMethods": final_spec.selected_methods,
+                "defaults": final_spec.selected_methods.get("defaults", {}),
+                "effectiveByColumn": final_spec.effective_by_column,
+                "droppedColumns": final_spec.dropped_columns,
+                "columnTypes": final_spec.column_types,
+                "execution": PREPROCESSING_EXECUTION_POLICY,
+                "applied": preprocessing_applied,
+            },
+            "training_schema": final_training_schema,
+            "balancing": balancing_audit,
+            "balancing_cv": {
+                "strategies_used_in_folds": balancing_strategies_used,
+                "smote_samples_added_per_fold": smote_added_per_fold,
+                "note": "Balancing was applied per-fold on train_fold only. "
+                        "Val folds were never resampled.",
+            },
+            "thresholding": {
+                "enabled": bool(balancing_audit.get("apply_threshold", False)),
+                "strategy": balancing_audit.get("threshold_strategy"),
+                "optimal_threshold": balancing_audit.get("optimal_threshold"),
+                "improvement_delta": balancing_audit.get("threshold_f1_gain"),
+                "warnings": balancing_audit.get("warnings", []),
+                "note": "Threshold was optimised on the refit data (non-test).",
+            },
+            "model": summarize_model(fitted_model),
+            "feature_importance": summarize_feature_importance(fitted_pipeline),
+            "grid_search": tuning_artifacts,
+            "refit_info": {
+                "refit_on_full_data": not has_holdout_test,
+                "refit_n_samples": n_samples_cv,
+                "note": refit_note,
+            },
+            # Fold-level class distributions (classification only)
+            "fold_class_distributions": fold_class_distributions if fold_class_distributions else None,
+        }
 
         return artifacts

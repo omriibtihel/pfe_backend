@@ -11,6 +11,8 @@ from typing import Any, Generic, Hashable, TypeVar
 import numpy as np
 import pandas as pd
 
+from sklearn.model_selection import train_test_split
+
 from .config import TrainingConfig
 from .preprocessing import build_preprocessor
 from .splitters import make_holdout_split
@@ -224,6 +226,58 @@ def _build_preview_key(*, prep_key: tuple[Any, ...], options: PreviewOptions) ->
     return prep_key + (options.subset, options.mode, int(options.n), int(options.seed))
 
 
+def _build_cv_preview_split(
+    *,
+    cfg: TrainingConfig,
+    X: pd.DataFrame,
+    y: np.ndarray,
+) -> SplitIndices:
+    """
+    Build a preview-only split for kfold / stratified_kfold.
+
+    If testRatio > 0, split off a holdout test set so the user can preview
+    the test subset.  Otherwise the entire dataset is treated as train.
+    There is never a val subset in CV preview mode.
+    """
+    idx_array = X.index.to_numpy()
+    test_ratio = float(cfg.test_ratio)
+
+    if test_ratio > 0:
+        stratify_y: np.ndarray | None = None
+        if cfg.task_type == "classification":
+            vals, counts = np.unique(y, return_counts=True)
+            if len(vals) >= 2 and int(counts.min()) >= 2:
+                stratify_y = y
+
+        try:
+            train_arr, test_arr = train_test_split(
+                idx_array,
+                test_size=test_ratio,
+                random_state=_SPLIT_RANDOM_STATE,
+                stratify=stratify_y,
+            )
+        except Exception:
+            # If stratified split fails (e.g. too few samples), fall back to plain split.
+            train_arr, test_arr = train_test_split(
+                idx_array,
+                test_size=test_ratio,
+                random_state=_SPLIT_RANDOM_STATE,
+            )
+
+        return SplitIndices(
+            train_idx=tuple(int(v) for v in train_arr),
+            val_idx=tuple(),
+            test_idx=tuple(int(v) for v in test_arr),
+        )
+
+    # testRatio == 0 → use all data as train for preprocessing preview
+    return SplitIndices(
+        train_idx=tuple(int(v) for v in idx_array),
+        val_idx=tuple(),
+        test_idx=tuple(),
+    )
+
+
 def _get_or_build_split(
     *,
     split_key: tuple[Any, ...],
@@ -235,11 +289,10 @@ def _get_or_build_split(
     if hit and cached is not None:
         return cached, True
 
-    if str(cfg.split_method) != "holdout":
-        raise PreviewValidationError(
-            "Preview currently supports splitMethod='holdout' only.",
-            code="preview_split_not_supported",
-        )
+    if str(cfg.split_method) in ("kfold", "stratified_kfold"):
+        built = _build_cv_preview_split(cfg=cfg, X=X, y=y)
+        _SPLIT_CACHE.set(split_key, built)
+        return built, False
 
     split = make_holdout_split(
         X,

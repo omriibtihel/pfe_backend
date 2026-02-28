@@ -29,6 +29,8 @@ class ModelSpec:
     aliases: tuple[str, ...]
     supports_classification: bool
     supports_regression: bool
+    supports_class_weight: bool
+    supports_predict_proba: bool
     default_params: Dict[str, Dict[str, Any]]
     param_grid: Dict[str, Dict[str, list[Any]]]
     estimator_factory: Callable[[str, Dict[str, Any]], Any]
@@ -113,6 +115,8 @@ class ModelRegistry:
                 aliases=("rf",),
                 supports_classification=True,
                 supports_regression=True,
+                supports_class_weight=True,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "n_estimators": 200,
@@ -154,6 +158,8 @@ class ModelRegistry:
                 aliases=("logreg",),
                 supports_classification=True,
                 supports_regression=False,
+                supports_class_weight=True,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "solver": "lbfgs",
@@ -178,6 +184,8 @@ class ModelRegistry:
                 aliases=(),
                 supports_classification=True,
                 supports_regression=True,
+                supports_class_weight=True,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "kernel": "rbf",
@@ -212,6 +220,8 @@ class ModelRegistry:
                 aliases=(),
                 supports_classification=True,
                 supports_regression=True,
+                supports_class_weight=False,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "n_neighbors": 5,
@@ -243,6 +253,8 @@ class ModelRegistry:
                 aliases=("nb", "gaussiannb"),
                 supports_classification=True,
                 supports_regression=False,
+                supports_class_weight=False,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "var_smoothing": 1e-9,
@@ -262,6 +274,8 @@ class ModelRegistry:
                 aliases=(),
                 supports_classification=True,
                 supports_regression=True,
+                supports_class_weight=True,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "max_depth": None,
@@ -294,6 +308,8 @@ class ModelRegistry:
                 aliases=(),
                 supports_classification=True,
                 supports_regression=True,
+                supports_class_weight=False,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "n_estimators": 300,
@@ -342,6 +358,8 @@ class ModelRegistry:
                 aliases=(),
                 supports_classification=True,
                 supports_regression=True,
+                supports_class_weight=True,
+                supports_predict_proba=True,
                 default_params={
                     "classification": {
                         "n_estimators": 500,
@@ -442,6 +460,18 @@ def model_is_installed(name: str) -> bool:
     if key == "lightgbm":
         return LGBMClassifier is not None and LGBMRegressor is not None
     return True
+
+
+def get_model_capabilities(model_type: str) -> Dict[str, bool]:
+    """Return static capability flags for a model without instantiating it."""
+    key = MODEL_REGISTRY.normalize_name(model_type)
+    spec = MODEL_REGISTRY._specs.get(key)
+    if spec is None:
+        return {"supports_class_weight": False, "supports_predict_proba": False}
+    return {
+        "supports_class_weight": spec.supports_class_weight,
+        "supports_predict_proba": spec.supports_predict_proba,
+    }
 
 
 def list_available_models() -> list[Dict[str, Any]]:

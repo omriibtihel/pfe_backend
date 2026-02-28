@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "Bash(python -c:*)",
+      "Read(//c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-frontend/src/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\types",
+      "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\services"
+    ]
+  }
+}

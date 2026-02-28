@@ -5,6 +5,7 @@ import io
 import json
 from typing import Any, Optional
 
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -12,10 +13,23 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, get_current_user
 from app.models.project import Project
 from app.models.training import TrainingSession, TrainedModel
-from app.schemas.training import TrainingConfigIn, TrainingValidateOut
+from app.schemas.training import (
+    ActiveModelOut,
+    BalanceAnalysisIn,
+    BalanceAnalysisResponse,
+    ManualPredictIn,
+    TrainingConfigIn,
+    TrainingValidateOut,
+)
+from app.services.training.balancing.profiler import DataProfile, profile_binary_dataset
 from app.services.training.config import get_training_capabilities
 from app.services.training.dataset_loader import load_dataframe, resolve_dataset_path
-from app.services.training.predictor import predict_with_trained_model, read_uploaded_dataframe
+from app.services.training.predictor import (
+    predict_rows_json,
+    predict_to_csv,
+    predict_with_trained_model,
+    read_uploaded_dataframe,
+)
 from app.services.training.preview import PreviewValidationError, build_validation_preview
 from app.services.training.validation import validate_training_config_payload
 from app.services.training_service import run_training_session
@@ -30,6 +44,87 @@ def _get_owned_project(db: Session, project_id: int, user_id: int) -> Project:
     if project.owner_id != user_id:
         raise HTTPException(status_code=403, detail="Not allowed")
     return project
+
+
+def _build_binary_profile(df, target_column: str) -> DataProfile:
+    if target_column not in df.columns:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "TARGET_COLUMN_NOT_FOUND",
+                "message": f"Target column '{target_column}' was not found in the selected dataset version.",
+            },
+        )
+
+    df_clean = df[df[target_column].notna()].copy()
+    if df_clean.empty:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "EMPTY_TARGET_AFTER_NA_FILTER",
+                "message": "No rows remain after dropping target NaN values.",
+            },
+        )
+
+    y = np.asarray(df_clean[target_column].values)
+    unique_classes = np.unique(y)
+    if len(unique_classes) != 2:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "BINARY_CLASSIFICATION_ONLY",
+                "message": "Balancing analysis currently supports binary classification only.",
+                "detected_classes": [str(v) for v in unique_classes],
+            },
+        )
+
+    X = df_clean.drop(columns=[target_column])
+    return profile_binary_dataset(y=y, X_shape=X.shape)
+
+
+def _json_safe_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _profile_to_response(profile: DataProfile) -> dict[str, Any]:
+    return {
+        "needs_balancing": bool(profile.needs_balancing),
+        "imbalance_level": str(profile.imbalance_level.value),
+        "imbalance_ratio": float(profile.imbalance_ratio),
+        "minority_ratio": float(profile.minority_ratio),
+        "n_samples": int(profile.n_samples),
+        "dataset_scale": str(profile.scale),
+        "majority": {
+            "label": _json_safe_scalar(profile.majority.label),
+            "count": int(profile.majority.count),
+            "ratio": float(profile.majority.ratio),
+            "role": str(profile.majority.role),
+        },
+        "minority": {
+            "label": _json_safe_scalar(profile.minority.label),
+            "count": int(profile.minority.count),
+            "ratio": float(profile.minority.ratio),
+            "role": str(profile.minority.role),
+        },
+        "summary_message": str(profile.summary_message),
+        "warnings": [str(w) for w in profile.warnings],
+        "metric_advice": [str(m) for m in profile.metric_advice],
+        "available_strategies": [
+            {
+                "id": str(s.id),
+                "label": str(s.label),
+                "description": str(s.description),
+                "impact": str(s.impact),
+                "recommended": bool(s.recommended),
+                "feasible": bool(s.feasible),
+                "infeasible_reason": s.infeasible_reason,
+            }
+            for s in profile.available_strategies
+        ],
+        "default_recommendation": str(profile.default_recommendation),
+    }
 
 
 def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
@@ -111,7 +206,43 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
 
     thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else None
     balancing = artifacts.get("balancing") if isinstance(artifacts.get("balancing"), dict) else None
-    smote = artifacts.get("smote") if isinstance(artifacts.get("smote"), dict) else None
+
+    # CV-specific
+    is_cv = bool(metrics_all.get("cv", False))
+    cv_summary = metrics_all.get("cv_summary") if isinstance(metrics_all.get("cv_summary"), dict) else None
+    cv_fold_results = metrics_all.get("fold_results") if isinstance(metrics_all.get("fold_results"), list) else None
+    k_folds_used = metrics_all.get("k_folds")
+    has_holdout_test = bool(metrics_all.get("has_holdout_test", False))
+    cv_mean_metrics = metrics_all.get("cv_mean") if isinstance(metrics_all.get("cv_mean"), dict) else None
+    holdout_test_metrics = (
+        metrics_all.get("holdout_test_metrics")
+        if isinstance(metrics_all.get("holdout_test_metrics"), dict)
+        else None
+    )
+
+    # For CV: testScore = holdout test score when available, else CV mean val score.
+    # metrics_all["test"] already holds the right value (set by orchestrator), but
+    # we derive testScore from primary_metric for consistency with holdout logic.
+    if is_cv and primary_metric:
+        if has_holdout_test and isinstance(holdout_test_metrics, dict):
+            # Prefer the genuine holdout test score
+            raw = holdout_test_metrics.get(primary_metric)
+            if raw is None:
+                lf = holdout_test_metrics.get("legacy_flat") if isinstance(holdout_test_metrics.get("legacy_flat"), dict) else {}
+                gl = holdout_test_metrics.get("global") if isinstance(holdout_test_metrics.get("global"), dict) else {}
+                raw = lf.get(primary_metric) or gl.get(primary_metric)
+            if raw is not None:
+                try:
+                    test_score = float(raw)
+                except Exception:
+                    pass
+        elif isinstance(cv_summary, dict):
+            cv_mean = cv_summary.get("mean", {})
+            if isinstance(cv_mean, dict) and primary_metric in cv_mean:
+                try:
+                    test_score = float(cv_mean[primary_metric])
+                except Exception:
+                    pass
 
     return {
         "id": str(m.id),
@@ -144,6 +275,15 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
         "primaryMetric": primary_metric,
         "splitInfo": split_info,
 
+        # Cross-validation fields (null when splitMethod=holdout)
+        "isCV": is_cv,
+        "cvFoldResults": cv_fold_results,
+        "cvSummary": cv_summary,
+        "kFoldsUsed": k_folds_used,
+        "hasHoldoutTest": has_holdout_test,
+        "cvMeanMetrics": cv_mean_metrics,
+        "cvTestMetrics": holdout_test_metrics,
+
         "gridSearch": {
             "enabled": bool(gs.get("enabled", False)),
             "cvBestScore": float(cv_best_score) if cv_best_score is not None else None,
@@ -164,10 +304,9 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
         "splitDebug": artifacts.get("split_debug", None),
         "preprocessing": artifacts.get("preprocessing", None),
 
-        # NEW: robust behavior visibility
-        "balancing": balancing,          # auto balance info (class_weight/spw decision)
-        "thresholding": thresholding,    # tuned threshold + applied_on_test flag (holdout)
-        "smote": smote,
+        # Balancing decision/audit visibility
+        "balancing": balancing,
+        "thresholding": thresholding,
 
         "trainingTime": training_time,
     }
@@ -188,6 +327,7 @@ def _session_to_front_session(db: Session, s: TrainingSession) -> dict[str, Any]
 
         "status": s.status,
         "progress": int(s.progress or 0),
+        "currentModel": s.current_model,
         "errorMessage": s.error_message,
 
         "config": s.config_json,
@@ -255,6 +395,25 @@ def validate_training(
     return result
 
 
+@router.post("/analyze-balance", response_model=BalanceAnalysisResponse)
+def analyze_balance(
+    project_id: int,
+    payload: BalanceAnalysisIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _get_owned_project(db, project_id, current_user.id)
+
+    try:
+        dataset_path, _ = resolve_dataset_path(db, project_id, payload.version_id)
+        df = load_dataframe(dataset_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    profile = _build_binary_profile(df, str(payload.target_column))
+    return _profile_to_response(profile)
+
+
 @router.post("/versions/{version_id}/sessions", status_code=status.HTTP_201_CREATED)
 def start_training_for_version(
     project_id: int,
@@ -270,6 +429,30 @@ def start_training_for_version(
         raise HTTPException(status_code=400, detail="No model selected")
     if not payload.metrics:
         raise HTTPException(status_code=400, detail="No metric selected")
+
+    if str(payload.taskType).strip().lower() == "classification":
+        try:
+            dataset_path, _ = resolve_dataset_path(db, project_id, version_id)
+            df = load_dataframe(dataset_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        profile = _build_binary_profile(df, str(payload.targetColumn))
+        balancing_cfg = payload.balancing
+
+        available_by_id = {str(s.id): s for s in profile.available_strategies}
+        chosen = available_by_id.get(str(balancing_cfg.strategy))
+        if chosen is not None and not bool(chosen.feasible):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "STRATEGY_NOT_FEASIBLE",
+                    "message": f"Selected strategy '{balancing_cfg.strategy}' is not feasible for this dataset.",
+                    "strategy": str(balancing_cfg.strategy),
+                    "reason": chosen.infeasible_reason,
+                    "fallback_suggestion": str(profile.default_recommendation),
+                },
+            )
 
     s = TrainingSession(
         project_id=project_id,
@@ -334,7 +517,7 @@ def save_model(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    project = _get_owned_project(db, project_id, current_user.id)
 
     m = (
         db.query(TrainedModel)
@@ -348,13 +531,26 @@ def save_model(
     if not m:
         raise HTTPException(status_code=404, detail="Model not found")
 
+    # Mark model as saved
     artifacts = m.artifacts_json or {}
     artifacts["saved"] = True
     m.artifacts_json = artifacts
     db.add(m)
+
+    # Set as the project's active model
+    previous_model_id = project.active_model_id
+    project.active_model_id = model_id
+    db.add(project)
+
     db.commit()
 
-    return {"success": True, "message": "Modèle enregistré avec succès"}
+    return {
+        "success": True,
+        "message": "Modèle enregistré et activé avec succès",
+        "isNowActive": True,
+        "modelId": model_id,
+        "previousActiveModelId": previous_model_id,
+    }
 
 
 @router.post("/sessions/{session_id}/models/{model_id}/predict")
@@ -414,4 +610,141 @@ def download_results(
         io.BytesIO(content),
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="training_session_{session_id}.json"'},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Active model — project-level prediction endpoints
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get_active_model_or_404(db: Session, project_id: int) -> TrainedModel:
+    """Load and return the project's active TrainedModel, or raise 404."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.active_model_id is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "NO_ACTIVE_MODEL",
+                "message": (
+                    "Aucun modèle actif pour ce projet. "
+                    "Entraînez un modèle puis cliquez sur 'Sauvegarder' pour l'activer."
+                ),
+            },
+        )
+    m = db.query(TrainedModel).filter(TrainedModel.id == project.active_model_id).first()
+    if m is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "ACTIVE_MODEL_NOT_FOUND",
+                "message": "Le modèle actif référencé n'existe plus.",
+            },
+        )
+    return m
+
+
+@router.get("/active-model", response_model=ActiveModelOut)
+def get_active_model(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Return metadata about the project's active model (used by the prediction UI)."""
+    _get_owned_project(db, project_id, current_user.id)
+    m = _get_active_model_or_404(db, project_id)
+
+    artifacts = m.artifacts_json or {}
+    training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
+    feature_names = training_schema.get("feature_names") or []
+
+    thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else {}
+    threshold = 0.5
+    raw_t = thresholding.get("optimal_threshold")
+    if raw_t is not None:
+        try:
+            threshold = float(raw_t)
+        except (TypeError, ValueError):
+            pass
+
+    trained_at = m.created_at.isoformat() if m.created_at else ""
+
+    return ActiveModelOut(
+        modelId=m.id,
+        sessionId=m.session_id,
+        modelType=m.model_type,
+        taskType=m.task_type,
+        featureNames=feature_names,
+        threshold=threshold,
+        trainedAt=trained_at,
+    )
+
+
+@router.post("/predict")
+async def predict_active_model_file(
+    project_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Run inference using the project's active model. Accepts a CSV/JSON/Parquet file."""
+    _get_owned_project(db, project_id, current_user.id)
+    m = _get_active_model_or_404(db, project_id)
+
+    try:
+        content = await file.read()
+        raw_df = read_uploaded_dataframe(file.filename or "", content)
+        result = predict_with_trained_model(m, raw_df)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
+
+    return result
+
+
+@router.post("/predict/json")
+def predict_active_model_json(
+    project_id: int,
+    payload: ManualPredictIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Run inference using the project's active model. Accepts JSON rows (manual input mode)."""
+    _get_owned_project(db, project_id, current_user.id)
+    m = _get_active_model_or_404(db, project_id)
+
+    try:
+        result = predict_rows_json(m, payload.rows)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
+
+    return result
+
+
+@router.post("/predict/export")
+async def predict_active_model_export_csv(
+    project_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Run inference and return results as a downloadable CSV file."""
+    _get_owned_project(db, project_id, current_user.id)
+    m = _get_active_model_or_404(db, project_id)
+
+    try:
+        content = await file.read()
+        raw_df = read_uploaded_dataframe(file.filename or "", content)
+        csv_str = predict_to_csv(m, raw_df)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV export failed: {str(e)}")
+
+    from datetime import datetime, timezone as _tz
+    ts = datetime.now(_tz.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"predictions_{m.model_type}_{ts}.csv"
+
+    return StreamingResponse(
+        io.BytesIO(csv_str.encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
