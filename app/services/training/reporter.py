@@ -19,28 +19,37 @@ def _extract_feature_names(fitted_pipeline: Any, n_fallback: int) -> list[str]:
     align = named_steps.get("align")
     align_feature_names = getattr(align, "feature_names", None)
 
+    names: list[str] = []
+
     if prep is not None and hasattr(prep, "get_feature_names_out"):
         try:
-            names = prep.get_feature_names_out()
-            names = [str(name) for name in names]
-            if names:
-                return names
+            names = [str(n) for n in prep.get_feature_names_out()]
         except Exception:
             pass
 
-        if isinstance(align_feature_names, (list, tuple)) and align_feature_names:
+        if not names and isinstance(align_feature_names, (list, tuple)) and align_feature_names:
             try:
-                names = prep.get_feature_names_out(input_features=list(align_feature_names))
-                names = [str(name) for name in names]
-                if names:
-                    return names
+                names = [str(n) for n in prep.get_feature_names_out(input_features=list(align_feature_names))]
             except Exception:
                 pass
 
-    if isinstance(align_feature_names, (list, tuple)) and align_feature_names:
-        return [str(name) for name in align_feature_names]
+    if not names and isinstance(align_feature_names, (list, tuple)) and align_feature_names:
+        names = [str(n) for n in align_feature_names]
 
-    return [f"f_{idx}" for idx in range(int(max(0, n_fallback)))]
+    if not names:
+        names = [f"f_{idx}" for idx in range(int(max(0, n_fallback)))]
+
+    # Apply VarianceThreshold mask if the selector step exists in the pipeline.
+    select_step = named_steps.get("select")
+    if select_step is not None and hasattr(select_step, "get_support"):
+        try:
+            mask = select_step.get_support()
+            if len(mask) == len(names):
+                names = [n for n, keep in zip(names, mask) if keep]
+        except Exception:
+            pass
+
+    return names
 
 
 def _extract_importance_values(model: Any) -> np.ndarray:

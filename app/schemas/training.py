@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, conint, field_validator
 
 TaskType = Literal["classification", "regression"]
 SplitMethod = Literal["holdout", "kfold", "stratified_kfold"]
+SearchType = Literal["none", "grid", "random"]
 PreviewSubset = Literal["train", "val", "test"]
 PreviewMode = Literal["head", "random"]
 NumericImputationMethod = Literal["none", "median", "mean", "most_frequent", "constant", "knn"]
@@ -37,6 +38,12 @@ ModelType = Literal[
     "knn",
     "naivebayes",
     "decisiontree",
+    "extratrees",
+    "et",
+    "gradientboosting",
+    "gb",
+    "gbm",
+    "ridge",
 ]
 MetricType = Literal[
     "accuracy",
@@ -137,6 +144,8 @@ class TrainingConfigIn(BaseModel):
     gridCvFolds: conint(ge=2, le=20) = 3
     gridScoring: str = "auto"
     useSmote: bool = False
+    searchType: SearchType = "none"
+    nIterRandomSearch: conint(ge=5, le=300) = 40
     balancing: BalancingConfigIn = Field(default_factory=BalancingConfigIn)
     splitMethod: SplitMethod = "holdout"
 

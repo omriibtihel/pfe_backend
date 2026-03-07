@@ -234,18 +234,20 @@ def predict_with_trained_model(
     training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
     feature_names: List[str] = training_schema.get("feature_names") or []
 
-    # Validate and reorder columns
-    validated_df = validate_feature_schema(raw_df, training_schema)
-
+    # Column alignment is handled by ColumnAligner inside the pipeline:
+    # missing columns are filled with NaN, extra columns are dropped.
+    # validate_feature_schema is kept as a strict utility for API-level checks
+    # where the caller wants an explicit error; we don't use it here.
     threshold = _get_optimal_threshold(artifacts, task_type)
-    y_pred, y_score = _run_inference(pipeline, validated_df, task_type, threshold)
+    y_pred, y_score = _run_inference(pipeline, raw_df, task_type, threshold)
 
-    rows = _build_rows(y_pred, y_score, validated_df)
+    rows = _build_rows(y_pred, y_score, raw_df)
     summary = _build_summary(y_pred, y_score, task_type)
 
     return {
         "model_id": int(trained_model.id),
         "session_id": int(trained_model.session_id),
+        "dataset_version_id": artifacts.get("dataset_version_id"),
         "model_type": str(trained_model.model_type),
         "task_type": task_type,
         "timestamp": _utc_now_iso(),
@@ -255,6 +257,7 @@ def predict_with_trained_model(
         "feature_names_expected": feature_names,
         "threshold_used": threshold,
         "rows": rows,
+        "preview": rows,
         "summary": summary,
     }
 

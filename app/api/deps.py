@@ -1,3 +1,5 @@
+import warnings
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
@@ -28,7 +30,14 @@ def get_current_user(
     db: Session = Depends(get_db),
 ):
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"datetime\.datetime\.utcnow\(\) is deprecated.*",
+                category=DeprecationWarning,
+                module=r"jose\.jwt",
+            )
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
         user_id = payload.get("sub")
 
         if user_id is None:

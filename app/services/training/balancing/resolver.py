@@ -41,6 +41,7 @@ def resolve(
     config: "BalancingConfig",  # type: ignore[name-defined]  # noqa: F821
     model_supports_class_weight: bool,
     model_supports_predict_proba: bool,
+    model_supports_sample_weight: bool = False,
     random_state: int = 42,
 ) -> BalancingDecision:
     from ..config import BalancingConfig  # local import to avoid circular at module load
@@ -94,7 +95,7 @@ def resolve(
             flags.append("class_weight_balanced")
             rationale = "User selected class_weight; class_weight='balanced' is applied to the estimator."
             strategy = "class_weight"
-        else:
+        elif model_supports_sample_weight:
             flags.extend(
                 [
                     "fallback_sample_weight:model_no_class_weight",
@@ -106,6 +107,18 @@ def resolve(
                 "sample_weight='balanced' is applied during fit."
             )
             strategy = "sample_weight"
+        else:
+            flags.extend(
+                [
+                    "fallback_none:model_no_class_weight_or_sample_weight",
+                    "fallback_none_model_no_class_weight_or_sample_weight",
+                ]
+            )
+            rationale = (
+                "User selected class_weight, but estimator supports neither class_weight nor sample_weight; "
+                "no class reweighting was applied."
+            )
+            strategy = "none"
     elif requested_strategy == "smote":
         smote_k_neighbors = _resolve_smote_k(profile.minority.count)
         flags.extend(["smote", f"smote_k_neighbors_{smote_k_neighbors}"])

@@ -107,6 +107,13 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": "sqrt",
             "help": "Number of features to consider at each split.",
         },
+        "class_weight": {
+            "type": "enum_or_null",
+            "enum": ["balanced", "balanced_subsample"],
+            "default": None,
+            "supported_in": ["classification"],
+            "help": "Weight classes inversely proportional to frequency. 'balanced' is recommended for imbalanced datasets. 'balanced_subsample' recomputes weights per bootstrap. null = disabled (default).",
+        },
     },
     "logisticregression": {
         "C": {
@@ -117,9 +124,16 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
         },
         "solver": {
             "type": "enum",
-            "enum": ["lbfgs", "liblinear", "newton-cg", "newton-cholesky", "sag", "saga"],
-            "default": "lbfgs",
-            "help": "Algorithm used in optimization.",
+            "enum": ["saga", "liblinear", "lbfgs", "newton-cg", "newton-cholesky", "sag"],
+            "default": "saga",
+            "help": "Optimization algorithm. 'saga' supports all regularization types (l1_ratio 0–1).",
+        },
+        "l1_ratio": {
+            "type": "float",
+            "default": 0.0,
+            "ge": 0.0,
+            "le": 1.0,
+            "help": "Regularization mix: 0 = pure L2 (Ridge), 1 = pure L1 (Lasso). Replaces deprecated 'penalty' in sklearn ≥ 1.8.",
         },
         "max_iter": {
             "type": "int",
@@ -127,6 +141,13 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "min": 100,
             "max": 20000,
             "help": "Maximum number of iterations.",
+        },
+        "class_weight": {
+            "type": "enum_or_null",
+            "enum": ["balanced"],
+            "default": None,
+            "supported_in": ["classification"],
+            "help": "Weight classes inversely proportional to frequency. 'balanced' is recommended for imbalanced datasets. null = disabled (default).",
         },
     },
     "svm": {
@@ -148,6 +169,13 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": "scale",
             "gt": 0.0,
             "help": "Kernel coefficient. Ignored when kernel='linear'.",
+        },
+        "class_weight": {
+            "type": "enum_or_null",
+            "enum": ["balanced"],
+            "default": None,
+            "supported_in": ["classification"],
+            "help": "Weight classes inversely proportional to frequency. 'balanced' is recommended for imbalanced datasets. null = disabled (default).",
         },
     },
     "knn": {
@@ -192,6 +220,13 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "enum": ["gini", "entropy", "log_loss"],
             "default": "gini",
             "help": "Function to measure the quality of a split.",
+        },
+        "class_weight": {
+            "type": "enum_or_null",
+            "enum": ["balanced"],
+            "default": None,
+            "supported_in": ["classification"],
+            "help": "Weight classes inversely proportional to frequency. 'balanced' is recommended for imbalanced datasets. null = disabled (default).",
         },
     },
     "xgboost": {
@@ -255,17 +290,96 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
         },
         "feature_fraction": {
             "type": "float",
-            "default": 1.0,
+            "default": 0.9,
             "gt": 0.0,
             "max": 1.0,
             "help": "Fraction of features used for each iteration.",
         },
         "bagging_fraction": {
             "type": "float",
-            "default": 1.0,
+            "default": 0.9,
             "gt": 0.0,
             "max": 1.0,
-            "help": "Fraction of data sampled for bagging.",
+            "help": "Fraction of data sampled per tree (requires bagging_freq > 0, set automatically).",
+        },
+    },
+    "extratrees": {
+        "n_estimators": {
+            "type": "int",
+            "default": 200,
+            "min": 10,
+            "max": 2000,
+            "help": "Number of trees in the forest.",
+        },
+        "max_depth": {
+            "type": "int_or_none",
+            "default": None,
+            "min": 1,
+            "max": 200,
+            "help": "Maximum depth of each tree. null means unlimited.",
+        },
+        "max_features": {
+            "type": "enum",
+            "enum": ["sqrt", "log2"],
+            "default": "sqrt",
+            "help": "Number of features to consider at each split.",
+        },
+        "min_samples_leaf": {
+            "type": "int",
+            "default": 1,
+            "min": 1,
+            "max": 100,
+            "help": "Minimum number of samples required to be at a leaf node.",
+        },
+        "class_weight": {
+            "type": "enum_or_null",
+            "enum": ["balanced", "balanced_subsample"],
+            "default": None,
+            "supported_in": ["classification"],
+            "help": "Weight classes inversely proportional to frequency. null = disabled (default).",
+        },
+    },
+    "gradientboosting": {
+        "n_estimators": {
+            "type": "int",
+            "default": 200,
+            "min": 50,
+            "max": 2000,
+            "help": "Number of boosting stages.",
+        },
+        "learning_rate": {
+            "type": "float",
+            "default": 0.1,
+            "gt": 0.0,
+            "max": 1.0,
+            "help": "Step size shrinkage in each boosting stage.",
+        },
+        "max_depth": {
+            "type": "int",
+            "default": 3,
+            "min": 1,
+            "max": 20,
+            "help": "Maximum depth of the individual estimators.",
+        },
+        "subsample": {
+            "type": "float",
+            "default": 0.8,
+            "gt": 0.0,
+            "max": 1.0,
+            "help": "Fraction of samples used for fitting each tree. < 1 enables stochastic gradient boosting.",
+        },
+        "min_samples_leaf": {
+            "type": "int",
+            "default": 1,
+            "min": 1,
+            "max": 100,
+            "help": "Minimum number of samples required to be at a leaf node.",
+        },
+        "max_features": {
+            "type": "enum_or_null",
+            "enum": ["sqrt", "log2"],
+            "default": None,
+            "help": "Features considered at each split. null = all features (default). 'sqrt'/'log2' reduce overfitting.",
         },
     },
 }
@@ -298,6 +412,23 @@ def _build_model_hp_capabilities() -> dict[str, Any]:
     return copy.deepcopy(MODEL_HP_SCHEMA)
 
 
+def _build_class_weight_capabilities() -> dict[str, Any]:
+    """Expose per-model class_weight options for the frontend."""
+    out: dict[str, Any] = {}
+    for model_name, schema in MODEL_HP_SCHEMA.items():
+        cw = schema.get("class_weight")
+        if cw is None:
+            continue
+        out[model_name] = {
+            "supported": True,
+            "supportedIn": list(cw.get("supported_in", ["classification"])),
+            "options": [None] + list(cw.get("enum", [])),
+            "default": cw.get("default"),
+            "help": cw.get("help", ""),
+        }
+    return out
+
+
 def get_training_capabilities() -> dict[str, Any]:
     return {
         "engine": "training_service",
@@ -312,6 +443,7 @@ def get_training_capabilities() -> dict[str, Any]:
         },
         "availableModels": list_available_models(),
         "modelHyperparamsSchema": _build_model_hp_capabilities(),
+        "classWeightCapabilities": _build_class_weight_capabilities(),
         "availableMetrics": {
             "classification": CLASSIFICATION_METRICS,
             "regression": REGRESSION_METRICS,
@@ -490,6 +622,17 @@ def _coerce_scalar_with_schema(field_name: str, raw_value: Any, schema: dict[str
                 return default_value, bound_error
             return value, None
 
+        if field_type == "enum_or_null":
+            if raw_value is None:
+                return None, None
+            if isinstance(raw_value, str) and raw_value.strip().lower() in {"none", "null", ""}:
+                return None, None
+            normalized = str(raw_value).strip().lower()
+            if normalized in enum_values:
+                return normalized, None
+            allowed = ", ".join(f'"{v}"' for v in enum_values)
+            return default_value, f"{field_name} must be one of: {allowed} or null"
+
         if field_type == "str":
             value = str(raw_value or "").strip()
             if value:
@@ -638,7 +781,19 @@ def normalize_model_hyperparams(
         estimator_params.pop("criterion", None)
         param_grid.pop("criterion", None)
 
-    for key, value in list(estimator_params.items()):
+    # class_weight is classification-only — strip it unconditionally in regression.
+    if "class_weight" in schema and str(task_type or "").strip().lower() == "regression":
+        if "class_weight" in source:
+            _push_issue(
+                "warning",
+                "HP_TASK_INCOMPATIBLE",
+                f"{model_name}.class_weight is classification-only and was removed for regression.",
+            )
+        effective.pop("class_weight", None)
+        estimator_params.pop("class_weight", None)
+        param_grid.pop("class_weight", None)
+
+    for key in list(estimator_params.keys()):
         if key in param_grid and isinstance(param_grid.get(key), list):
             # Keep the estimator fixed for scalar params only; grid params are set by GridSearchCV.
             estimator_params.pop(key, None)
@@ -966,6 +1121,15 @@ class BalancingConfig:
         }
 
 
+def _parse_search_type(payload: dict[str, Any]) -> str:
+    """Parse search_type from payload with backward-compat fallback from useGridSearch."""
+    raw = str(payload.get("searchType", "")).strip().lower()
+    if raw in {"none", "grid", "random"}:
+        return raw
+    # Legacy fallback: useGridSearch=true → "grid"
+    return "grid" if _to_bool(payload.get("useGridSearch"), default=False) else "none"
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     target_column: str
@@ -990,6 +1154,8 @@ class TrainingConfig:
     random_state: int = 42
     dataset_version_id: int | None = None
     custom_code: str = ""
+    search_type: str = "none"          # "none" | "grid" | "random"
+    n_iter_random_search: int = 40     # only used when search_type == "random"
 
     @staticmethod
     def from_front(payload: dict[str, Any]) -> "TrainingConfig":
@@ -1031,7 +1197,9 @@ class TrainingConfig:
                 0.0 if split_method != "holdout" else 0.15,
             ),
             k_folds=int(payload.get("kFolds", 5) or 5),
-            use_grid_search=_to_bool(payload.get("useGridSearch"), default=False),
+            search_type=_parse_search_type(payload),
+            use_grid_search=_parse_search_type(payload) != "none",
+            n_iter_random_search=int(payload.get("nIterRandomSearch", 40) or 40),
             use_smote=use_smote,
             shuffle=_to_bool(payload.get("shuffle"), default=True),
             balancing=balancing_cfg,
@@ -1057,7 +1225,9 @@ class TrainingConfig:
             "testRatio": self.test_ratio,
             "kFolds": self.k_folds,
             "shuffle": bool(self.shuffle),
-            "useGridSearch": bool(self.use_grid_search),
+            "searchType": self.search_type,
+            "nIterRandomSearch": self.n_iter_random_search,
+            "useGridSearch": bool(self.use_grid_search),  # backward compat
             "useSmote": bool(str(self.balancing.strategy) in {"smote", "smote_tomek"}),
             "balancing": self.balancing.as_dict(),
             "preprocessing": self.preprocessing.as_dict(),

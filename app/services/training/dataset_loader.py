@@ -27,6 +27,29 @@ def resolve_dataset_path(db: Session, project_id: int, dataset_version_id: int |
     return path, dv.id
 
 
+def _coerce_decimal_commas(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert string columns that use a comma as decimal separator to float.
+
+    Only columns whose every non-null value matches the pattern ``digits,digits``
+    are converted (e.g. "4,5" → 4.5).  Mixed columns or columns that contain
+    commas for other reasons are left untouched.
+    """
+    for col in df.columns:
+        series = df[col]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+        if not non_null.astype(str).str.match(r"^-?\d+,\d+$").all():
+            continue
+        df[col] = pd.to_numeric(
+            series.str.replace(",", ".", regex=False), errors="coerce"
+        )
+    return df
+
+
 def load_dataframe(path: Path) -> pd.DataFrame:
     # si tu supportes Excel plus tard: if suffix in (".xlsx", ...) => pd.read_excel
-    return pd.read_csv(path)
+    df = pd.read_csv(path)
+    return _coerce_decimal_commas(df)

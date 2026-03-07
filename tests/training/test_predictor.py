@@ -251,11 +251,15 @@ class TestPredictWithTrainedModel:
             "Threshold 0.01 vs 0.99 should produce different predictions on binary classification"
         )
 
-    def test_missing_columns_raises(self):
+    def test_missing_columns_handled_gracefully(self):
+        # ColumnAligner fills missing columns with NaN; the fitted imputer
+        # replaces them with training statistics.  predict_with_trained_model
+        # should return predictions rather than raising.
         X_bad = self.df[["age"]].copy()  # missing bmi, bp, smoker
         m = self._get_mock_model()
-        with pytest.raises(HTTPException if False else Exception):
-            predict_with_trained_model(m, X_bad)
+        result = predict_with_trained_model(m, X_bad)
+        assert result["n_rows"] == len(X_bad)
+        assert len(result["rows"]) == len(X_bad)
 
     def test_summary_class_distribution_present(self):
         X = self.df.drop(columns=["target"])

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Float
+from sqlalchemy import Boolean, Column, Integer, String, DateTime, ForeignKey, Text, Float
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -46,6 +46,9 @@ class TrainedModel(Base):
 
     model_type = Column(String(64), nullable=False)  # randomforest, svm, xgboost, ...
     task_type = Column(String(32), nullable=False)   # classification|regression
+
+    # Dedicated save flag (migration: d1e2f3a4b5c6). Also mirrored in artifacts_json["saved"].
+    is_saved = Column(Boolean, nullable=False, server_default="false", default=False)
 
     metrics_json = Column(JSON, nullable=False, default={})  # ex: {"accuracy":0.91,"f1":0.88}
     artifacts_json = Column(JSON, nullable=False, default={})  # chemins pkl, plots, etc

@@ -6,11 +6,12 @@ import json
 from typing import Any, Optional
 
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user
+from app.models.dataset_version import DatasetVersion
 from app.models.project import Project
 from app.models.training import TrainingSession, TrainedModel
 from app.schemas.training import (
@@ -127,9 +128,17 @@ def _profile_to_response(profile: DataProfile) -> dict[str, Any]:
     }
 
 
-def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
+def _model_to_front_result(
+    m: TrainedModel,
+    *,
+    is_saved: bool | None = None,
+    is_active: bool = False,
+) -> dict[str, Any]:
     metrics_all = m.metrics_json or {}
     artifacts = m.artifacts_json or {}
+    if is_saved is None:
+        # Prefer the dedicated column; fall back to artifacts_json mirror for old rows.
+        is_saved = bool(getattr(m, "is_saved", None) or artifacts.get("saved", False))
 
     test_metrics = metrics_all.get("test")
     metrics = test_metrics if isinstance(test_metrics, dict) else metrics_all
@@ -203,6 +212,18 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
     best_params = gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None
     cv_best_score = gs.get("best_score")
     cv_scoring = gs.get("scoring")
+    # Normalize cv_results_summary: stored as mean_test_score, frontend expects mean_score.
+    _raw_cv_summary = gs.get("cv_results_summary")
+    cv_results_summary: Optional[list] = None
+    if isinstance(_raw_cv_summary, list) and _raw_cv_summary:
+        cv_results_summary = [
+            {
+                "params": dict(row.get("params") or {}),
+                "mean_score": float(row.get("mean_score") or row.get("mean_test_score") or 0.0),
+            }
+            for row in _raw_cv_summary
+            if isinstance(row, dict)
+        ]
 
     thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else None
     balancing = artifacts.get("balancing") if isinstance(artifacts.get("balancing"), dict) else None
@@ -286,10 +307,13 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
 
         "gridSearch": {
             "enabled": bool(gs.get("enabled", False)),
+            "searchType": gs.get("search_type") or None,
             "cvBestScore": float(cv_best_score) if cv_best_score is not None else None,
             "cvScoring": str(cv_scoring) if cv_scoring else None,
             "bestParams": best_params,
             "cvSplits": int(gs.get("cv_splits", 0)) if gs.get("cv_splits") else None,
+            "nCandidates": int(gs.get("n_candidates", 0)) if gs.get("n_candidates") else None,
+            "cvResultsSummary": cv_results_summary,
         },
 
         "featureImportance": artifacts.get("feature_importance", []),
@@ -309,10 +333,17 @@ def _model_to_front_result(m: TrainedModel) -> dict[str, Any]:
         "thresholding": thresholding,
 
         "trainingTime": training_time,
+        "isSaved": bool(is_saved),
+        "isActive": bool(is_active),
     }
 
 
-def _session_to_front_session(db: Session, s: TrainingSession) -> dict[str, Any]:
+def _session_to_front_session(
+    db: Session,
+    s: TrainingSession,
+    *,
+    active_model_id: int | None = None,
+) -> dict[str, Any]:
     models = (
         db.query(TrainedModel)
         .filter(TrainedModel.session_id == s.id)
@@ -329,14 +360,67 @@ def _session_to_front_session(db: Session, s: TrainingSession) -> dict[str, Any]
         "progress": int(s.progress or 0),
         "currentModel": s.current_model,
         "errorMessage": s.error_message,
+        "activeModelId": str(active_model_id) if active_model_id is not None else None,
 
         "config": s.config_json,
-        "results": [_model_to_front_result(m) for m in models],
+        "results": [
+            _model_to_front_result(
+                m,
+                is_saved=bool((m.artifacts_json or {}).get("saved", False)),
+                is_active=bool(active_model_id is not None and int(m.id) == int(active_model_id)),
+            )
+            for m in models
+        ],
 
         "createdAt": s.created_at.isoformat() if s.created_at else None,
         "startedAt": s.started_at.isoformat() if s.started_at else None,
         "completedAt": s.finished_at.isoformat() if s.finished_at else None,
     }
+
+
+def _extract_threshold(artifacts: dict[str, Any]) -> float:
+    thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else {}
+    raw_t = thresholding.get("optimal_threshold")
+    if raw_t is None:
+        return 0.5
+    try:
+        return float(raw_t)
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _copy_artifacts_json(artifacts_json: Any) -> dict[str, Any]:
+    if isinstance(artifacts_json, dict):
+        return dict(artifacts_json)
+    return {}
+
+
+def _get_saved_or_active_model_or_404(
+    db: Session,
+    *,
+    project: Project,
+    model_id: int,
+) -> TrainedModel:
+    model = (
+        db.query(TrainedModel)
+        .filter(TrainedModel.id == model_id, TrainedModel.project_id == project.id)
+        .first()
+    )
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    artifacts = model.artifacts_json if isinstance(model.artifacts_json, dict) else {}
+    is_saved = bool(getattr(model, "is_saved", None) or artifacts.get("saved", False))
+    is_active = bool(project.active_model_id is not None and int(project.active_model_id) == int(model.id))
+    if not is_saved and not is_active:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "MODEL_NOT_SAVED",
+                "message": "Model is not saved for prediction.",
+            },
+        )
+    return model
 
 
 @router.get("/capabilities")
@@ -423,7 +507,7 @@ def start_training_for_version(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    project = _get_owned_project(db, project_id, current_user.id)
 
     if not payload.models:
         raise HTTPException(status_code=400, detail="No model selected")
@@ -469,7 +553,8 @@ def start_training_for_version(
     db.refresh(s)
 
     background.add_task(run_training_session, s.id)
-    return _session_to_front_session(db, s)
+    active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
+    return _session_to_front_session(db, s, active_model_id=active_model_id)
 
 
 @router.get("/sessions")
@@ -478,7 +563,7 @@ def list_sessions(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    project = _get_owned_project(db, project_id, current_user.id)
 
     sessions = (
         db.query(TrainingSession)
@@ -486,7 +571,8 @@ def list_sessions(
         .order_by(TrainingSession.id.desc())
         .all()
     )
-    return [_session_to_front_session(db, s) for s in sessions]
+    active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
+    return [_session_to_front_session(db, s, active_model_id=active_model_id) for s in sessions]
 
 
 @router.get("/sessions/{session_id}")
@@ -496,7 +582,7 @@ def get_session(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    project = _get_owned_project(db, project_id, current_user.id)
 
     s = (
         db.query(TrainingSession)
@@ -506,7 +592,126 @@ def get_session(
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return _session_to_front_session(db, s)
+    active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
+    return _session_to_front_session(db, s, active_model_id=active_model_id)
+
+
+@router.get("/saved-models")
+def list_saved_models(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    project = _get_owned_project(db, project_id, current_user.id)
+
+    active_id = int(project.active_model_id) if project.active_model_id is not None else None
+
+    from sqlalchemy import or_
+    query = db.query(TrainedModel).filter(TrainedModel.project_id == project_id)
+    if active_id is not None:
+        query = query.filter(
+            or_(TrainedModel.is_saved == True, TrainedModel.id == active_id)  # noqa: E712
+        )
+    else:
+        query = query.filter(TrainedModel.is_saved == True)  # noqa: E712
+
+    models = query.order_by(TrainedModel.created_at.desc(), TrainedModel.id.desc()).all()
+
+    # Backward-compat: also include models saved only via artifacts_json (pre-migration rows).
+    legacy_candidates = (
+        db.query(TrainedModel)
+        .filter(
+            TrainedModel.project_id == project_id,
+            TrainedModel.is_saved == False,  # noqa: E712
+        )
+        .order_by(TrainedModel.created_at.desc(), TrainedModel.id.desc())
+        .all()
+    )
+    legacy_ids = {int(m.id) for m in models}
+    for lm in legacy_candidates:
+        artifacts_lm = lm.artifacts_json if isinstance(lm.artifacts_json, dict) else {}
+        if bool(artifacts_lm.get("saved", False)) and int(lm.id) not in legacy_ids:
+            models = list(models) + [lm]
+
+    if not models:
+        return []
+
+    session_ids = list({int(m.session_id) for m in models})
+    sessions = (
+        db.query(TrainingSession)
+        .filter(TrainingSession.id.in_(session_ids))
+        .all()
+        if session_ids
+        else []
+    )
+    sessions_by_id = {int(s.id): s for s in sessions}
+
+    version_ids = list(
+        {
+            int(s.dataset_version_id)
+            for s in sessions
+            if getattr(s, "dataset_version_id", None) is not None
+        }
+    )
+    versions = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id.in_(version_ids))
+        .all()
+        if version_ids
+        else []
+    )
+    version_name_by_id = {int(v.id): str(v.name) for v in versions}
+
+    out: list[dict[str, Any]] = []
+
+    for m in models:
+        artifacts = m.artifacts_json if isinstance(m.artifacts_json, dict) else {}
+        is_saved = bool(getattr(m, "is_saved", None) or artifacts.get("saved", False))
+        is_active = bool(active_id is not None and int(m.id) == active_id)
+        if not is_saved and not is_active:
+            continue
+
+        session = sessions_by_id.get(int(m.session_id))
+        dataset_version_id = (
+            int(session.dataset_version_id)
+            if session is not None and getattr(session, "dataset_version_id", None) is not None
+            else None
+        )
+        dataset_version_name = (
+            version_name_by_id.get(dataset_version_id)
+            if dataset_version_id is not None
+            else None
+        )
+
+        training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
+        feature_names = training_schema.get("feature_names")
+        if not isinstance(feature_names, list):
+            feature_names = []
+
+        front_result = _model_to_front_result(m)
+
+        out.append(
+            {
+                "id": str(m.id),
+                "modelType": str(m.model_type),
+                "taskType": str(m.task_type),
+                "sessionId": str(m.session_id),
+                "datasetVersionId": str(dataset_version_id) if dataset_version_id is not None else None,
+                "datasetVersionName": dataset_version_name,
+                "isActive": is_active,
+                "isSaved": is_saved,
+                "featureNames": [str(x) for x in feature_names],
+                "threshold": _extract_threshold(artifacts),
+                "trainedAt": m.created_at.isoformat() if m.created_at else "",
+                "testScore": front_result.get("testScore"),
+                "primaryMetric": front_result.get("primaryMetric"),
+                "trainingTime": front_result.get("trainingTime"),
+            }
+        )
+
+    out.sort(key=lambda item: str(item.get("trainedAt") or ""), reverse=True)
+    out.sort(key=lambda item: not bool(item.get("isActive")))
+    return out
 
 
 @router.post("/sessions/{session_id}/models/{model_id}/save")
@@ -531,10 +736,11 @@ def save_model(
     if not m:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    # Mark model as saved
-    artifacts = m.artifacts_json or {}
+    # Mark model as saved (column + artifacts mirror)
+    artifacts = _copy_artifacts_json(m.artifacts_json)
     artifacts["saved"] = True
     m.artifacts_json = artifacts
+    m.is_saved = True
     db.add(m)
 
     # Set as the project's active model
@@ -551,6 +757,42 @@ def save_model(
         "modelId": model_id,
         "previousActiveModelId": previous_model_id,
     }
+
+
+@router.delete("/sessions/{session_id}/models/{model_id}/save", status_code=status.HTTP_204_NO_CONTENT)
+def unsave_model(
+    project_id: int,
+    session_id: int,
+    model_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    project = _get_owned_project(db, project_id, current_user.id)
+
+    m = (
+        db.query(TrainedModel)
+        .filter(
+            TrainedModel.id == model_id,
+            TrainedModel.session_id == session_id,
+            TrainedModel.project_id == project_id,
+        )
+        .first()
+    )
+    if not m:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    artifacts = _copy_artifacts_json(m.artifacts_json)
+    artifacts["saved"] = False
+    m.artifacts_json = artifacts
+    m.is_saved = False
+    db.add(m)
+
+    if project.active_model_id is not None and int(project.active_model_id) == int(model_id):
+        project.active_model_id = None
+        db.add(project)
+
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/sessions/{session_id}/models/{model_id}/predict")
@@ -586,6 +828,75 @@ async def predict_with_model(
     return result
 
 
+@router.post("/models/{model_id}/predict")
+async def predict_with_saved_model_file(
+    project_id: int,
+    model_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    project = _get_owned_project(db, project_id, current_user.id)
+    m = _get_saved_or_active_model_or_404(db, project=project, model_id=model_id)
+
+    try:
+        content = await file.read()
+        raw_df = read_uploaded_dataframe(file.filename or "", content)
+        result = predict_with_trained_model(m, raw_df)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
+
+    return result
+
+
+@router.post("/models/{model_id}/predict/json")
+def predict_with_saved_model_json(
+    project_id: int,
+    model_id: int,
+    payload: ManualPredictIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    project = _get_owned_project(db, project_id, current_user.id)
+    m = _get_saved_or_active_model_or_404(db, project=project, model_id=model_id)
+
+    try:
+        result = predict_rows_json(m, payload.rows)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
+
+    return result
+
+
+@router.post("/models/{model_id}/predict/export")
+async def predict_with_saved_model_export_csv(
+    project_id: int,
+    model_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    project = _get_owned_project(db, project_id, current_user.id)
+    m = _get_saved_or_active_model_or_404(db, project=project, model_id=model_id)
+
+    try:
+        content = await file.read()
+        raw_df = read_uploaded_dataframe(file.filename or "", content)
+        csv_str = predict_to_csv(m, raw_df)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV export failed: {str(e)}")
+
+    from datetime import datetime, timezone as _tz
+    ts = datetime.now(_tz.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"predictions_{m.model_type}_{ts}.csv"
+
+    return StreamingResponse(
+        io.BytesIO(csv_str.encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/sessions/{session_id}/download")
 def download_results(
     project_id: int,
@@ -593,7 +904,7 @@ def download_results(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    project = _get_owned_project(db, project_id, current_user.id)
 
     s = (
         db.query(TrainingSession)
@@ -603,7 +914,8 @@ def download_results(
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    payload = _session_to_front_session(db, s)
+    active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
+    payload = _session_to_front_session(db, s, active_model_id=active_model_id)
     content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
     return StreamingResponse(

@@ -5,6 +5,7 @@ from typing import Any, List, Tuple
 
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -28,6 +29,7 @@ class PreprocessSpec:
     effective_by_column: dict[str, dict[str, Any]]
     dropped_columns: List[str]
     column_types: dict[str, str]
+    feature_selector: Any = None  # VarianceThreshold — fitted in orchestrator, not here
 
 
 @dataclass(frozen=True)
@@ -281,4 +283,5 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
         effective_by_column=effective.effective_by_column,
         dropped_columns=effective.dropped_columns,
         column_types=effective.column_types,
+        feature_selector=VarianceThreshold(threshold=0.0),
     )

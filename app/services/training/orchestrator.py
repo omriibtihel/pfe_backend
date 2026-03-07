@@ -34,6 +34,44 @@ from .transformers import ColumnAligner
 
 logger = logging.getLogger(__name__)
 _DENSE_REQUIRED_MODELS = {"naivebayes"}
+_RESAMPLE_STRATEGIES = {"smote", "smote_tomek", "random_undersampling"}
+
+
+def _build_resampler_for_gs(decision: Any) -> Any:
+    """Build an imblearn resampler instance matching decision.strategy.
+
+    Returns None for non-resampling strategies (class_weight, sample_weight, none …).
+    The resampler is meant to be embedded *inside* a GridSearchCV pipeline so that
+    resampling is applied per-fold, which prevents leakage of synthetic samples into
+    GridSearch validation folds.
+    """
+    strategy = str(decision.strategy or "none").strip().lower()
+    random_state = int(getattr(decision, "random_state", 42))
+    k = int(getattr(decision, "smote_k_neighbors", None) or 5)
+
+    if strategy == "smote":
+        try:
+            from imblearn.over_sampling import SMOTE
+        except ImportError:
+            return None
+        return SMOTE(random_state=random_state, k_neighbors=k)
+
+    if strategy == "smote_tomek":
+        try:
+            from imblearn.combine import SMOTETomek
+            from imblearn.over_sampling import SMOTE
+        except ImportError:
+            return None
+        return SMOTETomek(random_state=random_state, smote=SMOTE(random_state=random_state, k_neighbors=k))
+
+    if strategy == "random_undersampling":
+        try:
+            from imblearn.under_sampling import RandomUnderSampler
+        except ImportError:
+            return None
+        return RandomUnderSampler(random_state=random_state)
+
+    return None
 
 
 @dataclass
@@ -54,8 +92,16 @@ def _ensure_dense_matrix(X: Any) -> Any:
     return X.toarray() if hasattr(X, "toarray") else X
 
 
-def _build_inference_pipeline(aligner: ColumnAligner, preprocessor: Any, model: Any, model_type: str) -> Pipeline:
+def _build_inference_pipeline(
+    aligner: ColumnAligner,
+    preprocessor: Any,
+    model: Any,
+    model_type: str,
+    feature_selector: Any = None,
+) -> Pipeline:
     steps = [("align", aligner), ("prep", preprocessor)]
+    if feature_selector is not None:
+        steps.append(("select", feature_selector))
     if model_type in _DENSE_REQUIRED_MODELS:
         steps.append(("dense", FunctionTransformer(_ensure_dense_matrix, accept_sparse=True)))
     steps.append(("model", model))
@@ -323,6 +369,12 @@ def _run_holdout(
     # Fit preprocessing on train split once (train-only policy), then execute balancing on transformed train data.
     X_train_aligned = aligner.fit_transform(split.X_train)
     X_train_prepared = spec.preprocessor.fit_transform(X_train_aligned, np.asarray(split.y_train))
+
+    # Fit VarianceThreshold on prepared train data, then apply to remove zero-variance features.
+    if spec.feature_selector is not None:
+        spec.feature_selector.fit(X_train_prepared)
+        X_train_prepared = spec.feature_selector.transform(X_train_prepared)
+
     if model_type_norm in _DENSE_REQUIRED_MODELS:
         X_train_prepared = _ensure_dense_matrix(X_train_prepared)
 
@@ -338,6 +390,7 @@ def _run_holdout(
             config=cfg.balancing,
             model_supports_class_weight=capabilities["supports_class_weight"],
             model_supports_predict_proba=capabilities["supports_predict_proba"],
+            model_supports_sample_weight=capabilities["supports_sample_weight"],
             random_state=cfg.random_state,
         )
 
@@ -345,16 +398,53 @@ def _run_holdout(
     X_f = X_train_prepared
     y_f = np.asarray(split.y_train)
     fit_params: dict[str, Any] = {}
+
+    # ── SMOTE + GridSearch anti-leakage fix ──────────────────────────────────
+    # When GridSearch is active AND the balancing strategy resamples the data
+    # (smote / smote_tomek / random_undersampling), applying the resampler
+    # *before* GridSearchCV causes leakage: GS's internal validation folds will
+    # contain synthetic samples whose neighbours came from those same folds.
+    # Fix: embed the resampler inside the GridSearch pipeline (imblearn.Pipeline)
+    # so resampling is applied independently within each GS fold.
+    # For non-resampling strategies (class_weight, sample_weight, none) the
+    # existing apply_prefit path is unchanged — no leakage there.
+    resampler_for_gs: Any | None = None
+    use_gs_with_resampling = (
+        cfg.search_type != "none"
+        and cfg.task_type == "classification"
+        and decision.strategy in _RESAMPLE_STRATEGIES
+    )
+
     if cfg.task_type == "classification":
-        # SMOTE/SMOTETomek/RandomUnderSampler refuse sparse matrices — convert to dense before resampling.
-        if decision.strategy in {"smote", "smote_tomek", "random_undersampling"}:
-            if hasattr(X_train_prepared, "toarray"):
+        if use_gs_with_resampling:
+            # Build resampler to inject inside GS; do NOT pre-resample X_f.
+            resampler_for_gs = _build_resampler_for_gs(decision)
+            # Dense conversion is still required for imblearn resamplers.
+            if resampler_for_gs is not None and hasattr(X_train_prepared, "toarray"):
                 X_train_prepared = X_train_prepared.toarray()
-        X_f, y_f, fit_params = executor.apply_prefit(X_train_prepared, np.asarray(split.y_train), decision)
+                X_f = X_train_prepared
+            # fit_params stays {} — no class_weight for SMOTE strategies
+        else:
+            # Original flow: pre-apply resampling before fitting (no GS, no leakage risk).
+            if decision.strategy in _RESAMPLE_STRATEGIES:
+                if hasattr(X_train_prepared, "toarray"):
+                    X_train_prepared = X_train_prepared.toarray()
+            X_f, y_f, fit_params = executor.apply_prefit(
+                X_train_prepared, np.asarray(split.y_train), decision
+            )
 
     smote_samples_added: int | None = None
     if cfg.task_type == "classification" and decision.strategy in {"smote", "smote_tomek"}:
-        smote_samples_added = int(len(np.asarray(y_f)) - len(np.asarray(split.y_train)))
+        if use_gs_with_resampling and resampler_for_gs is not None:
+            # Estimate augmented sample count for audit (fit a clone, don't mutate the GS resampler).
+            try:
+                from sklearn.base import clone as _clone
+                _, y_counted = _clone(resampler_for_gs).fit_resample(X_f, np.asarray(split.y_train))
+                smote_samples_added = int(len(y_counted) - len(np.asarray(split.y_train)))
+            except Exception:
+                smote_samples_added = None
+        else:
+            smote_samples_added = int(len(np.asarray(y_f)) - len(np.asarray(split.y_train)))
 
     if "class_weight" in fit_params:
         estimator_hyperparams["class_weight"] = fit_params["class_weight"]
@@ -375,10 +465,14 @@ def _run_holdout(
         task_type=cfg.task_type,
         model_param_grid=param_grid,
         refit_metric_override=(decision.refit_metric if cfg.task_type == "classification" else None),
+        resampler=resampler_for_gs,
     )
 
     fitted_model = fit_result.fitted_pipeline.named_steps.get("model")
-    fitted_pipe = _build_inference_pipeline(aligner, spec.preprocessor, fitted_model, model_type_norm)
+    fitted_pipe = _build_inference_pipeline(
+        aligner, spec.preprocessor, fitted_model, model_type_norm,
+        feature_selector=spec.feature_selector,
+    )
     if debug_mode and cfg.task_type == "classification":
         _log_event(
             "training.debug.model_classes",
@@ -386,14 +480,22 @@ def _run_holdout(
             model_classes=get_class_labels(fitted_pipe),
         )
 
-    # Threshold calibration must use the validation set only.
-    # If no validation set exists (val_ratio=0), threshold optimization is skipped
-    # to prevent test-set leakage: calibrating on X_test then evaluating on X_test
-    # would produce overoptimistic metrics.
-    threshold_input_X = split.X_val if split.X_val is not None and len(split.X_val) > 0 else None
-    threshold_input_y = split.y_val if split.y_val is not None and len(split.y_val) > 0 else None
+    # Threshold calibration: prefer the validation set when available; otherwise
+    # fall back to X_train (no test-set leakage, though slightly optimistic).
+    # The source is recorded in metrics_json["threshold_source"] so callers can
+    # distinguish the two cases ("val_set" vs "train_fallback" vs "disabled").
+    has_val = split.X_val is not None and len(split.X_val) > 0
+    if has_val:
+        threshold_input_X = split.X_val
+        threshold_input_y = split.y_val
+        _threshold_source_raw = "val_set"
+    else:
+        threshold_input_X = split.X_train
+        threshold_input_y = split.y_train
+        _threshold_source_raw = "train_fallback"
     optimal_threshold = 0.5
     threshold_f1_gain: float | None = None
+    threshold_source = "disabled"
     if cfg.task_type == "classification":
         optimal_threshold = executor.apply_postfit(
             fitted_pipe,
@@ -403,6 +505,8 @@ def _run_holdout(
         )
         if executor.last_threshold_result is not None:
             threshold_f1_gain = float(executor.last_threshold_result.improvement_delta)
+            r = executor.last_threshold_result
+            threshold_source = "disabled" if r.strategy_used == "disabled" else _threshold_source_raw
 
     # Build and persist the audit record in a single commit after all pipeline stages complete.
     balancing_audit: dict[str, Any] = {}
@@ -525,6 +629,8 @@ def _run_holdout(
         "train": train_eval.metrics,
         "test": test_eval.metrics,
         "training_time_sec": float(time.perf_counter() - t0),
+        "threshold_used": optimal_threshold,
+        "threshold_source": threshold_source,
     }
     if val_metrics is not None:
         metrics_json["val"] = val_metrics
@@ -725,6 +831,12 @@ def _run_kfold_cv(
             X_val_aligned = fold_aligner.transform(X_val_fold)
             X_val_prep = fold_spec.preprocessor.transform(X_val_aligned)
 
+            # ② b) Fit VarianceThreshold on train_fold ONLY, then apply to both (no leakage)
+            if fold_spec.feature_selector is not None:
+                fold_spec.feature_selector.fit(X_train_prep)
+                X_train_prep = fold_spec.feature_selector.transform(X_train_prep)
+                X_val_prep = fold_spec.feature_selector.transform(X_val_prep)
+
             if model_type_norm in _DENSE_REQUIRED_MODELS:
                 X_train_prep = _ensure_dense_matrix(X_train_prep)
                 X_val_prep = _ensure_dense_matrix(X_val_prep)
@@ -739,6 +851,7 @@ def _run_kfold_cv(
                     config=cfg.balancing,
                     model_supports_class_weight=capabilities["supports_class_weight"],
                     model_supports_predict_proba=capabilities["supports_predict_proba"],
+                    model_supports_sample_weight=capabilities["supports_sample_weight"],
                     random_state=cfg.random_state,
                 )
 
@@ -861,6 +974,12 @@ def _run_kfold_cv(
 
     X_refit_aligned = final_aligner.fit_transform(X_refit)
     X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_aligned, y_refit)
+
+    # Fit VarianceThreshold on refit data, then apply (anti-leakage: test set transforms later via pipeline)
+    if final_spec.feature_selector is not None:
+        final_spec.feature_selector.fit(X_refit_prep)
+        X_refit_prep = final_spec.feature_selector.transform(X_refit_prep)
+
     if model_type_norm in _DENSE_REQUIRED_MODELS:
         X_refit_prep = _ensure_dense_matrix(X_refit_prep)
 
@@ -875,6 +994,7 @@ def _run_kfold_cv(
             config=cfg.balancing,
             model_supports_class_weight=capabilities["supports_class_weight"],
             model_supports_predict_proba=capabilities["supports_predict_proba"],
+            model_supports_sample_weight=capabilities["supports_sample_weight"],
             random_state=cfg.random_state,
         )
 
@@ -924,7 +1044,8 @@ def _run_kfold_cv(
 
     final_fitted_model = final_fit_result.fitted_pipeline.named_steps.get("model")
     fitted_pipe = _build_inference_pipeline(
-        final_aligner, final_spec.preprocessor, final_fitted_model, model_type_norm
+        final_aligner, final_spec.preprocessor, final_fitted_model, model_type_norm,
+        feature_selector=final_spec.feature_selector,
     )
 
     # Threshold + audit — calibrated on X_refit (never on test set)
