@@ -104,6 +104,33 @@ def _get_optimal_threshold(artifacts_json: dict, task_type: str) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# AutoML preprocessing helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _fix_string_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert pandas 3.0 StringDtype columns to object dtype (FLAML compatibility)."""
+    string_cols = df.select_dtypes(include="string").columns.tolist()
+    if string_cols:
+        df = df.astype({col: "object" for col in string_cols})
+    df.columns = df.columns.astype(object)
+    return df
+
+
+def _apply_automl_features(df: pd.DataFrame, artifacts: dict) -> pd.DataFrame:
+    """Reconstruct medical interaction features that were added during AutoML training."""
+    pairs = artifacts.get("automl_feature_pairs") or []
+    if not pairs:
+        return df
+    df = df.copy()
+    for p in pairs:
+        c1, c2, fname = p["col1"], p["col2"], p["name"]
+        if c1 in df.columns and c2 in df.columns:
+            df[fname] = df[c1] * df[c2]
+    df.columns = df.columns.astype(object)
+    return df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Inference helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -143,10 +170,16 @@ def _run_inference(
     if task_type == "classification" and y_score is not None and threshold != 0.5:
         classes = getattr(pipeline, "classes_", None)
         if classes is None:
-            # Try to get from the model step inside the pipeline
+            # Try to get from the model step inside a sklearn Pipeline
             named = getattr(pipeline, "named_steps", {})
             model = named.get("model")
             classes = getattr(model, "classes_", None)
+        if classes is None:
+            # Fallback for FLAML AutoML (no named_steps)
+            try:
+                classes = pipeline.model.estimator.classes_
+            except AttributeError:
+                pass
         is_binary = classes is not None and len(classes) == 2
         if is_binary:
             y_pred = (y_score >= threshold).astype(type(classes[1]) if classes is not None else int)
@@ -239,6 +272,14 @@ def predict_with_trained_model(
     # validate_feature_schema is kept as a strict utility for API-level checks
     # where the caller wants an explicit error; we don't use it here.
     threshold = _get_optimal_threshold(artifacts, task_type)
+
+    is_automl = bool(artifacts.get("automl"))
+    if is_automl:
+        raw_df = _fix_string_dtypes(raw_df)
+        # Reconstruct any interaction features stored at training time.
+        # "automl_feature_pairs" absent = old model without stored pairs; skip gracefully.
+        raw_df = _apply_automl_features(raw_df, artifacts)
+
     y_pred, y_score = _run_inference(pipeline, raw_df, task_type, threshold)
 
     rows = _build_rows(y_pred, y_score, raw_df)

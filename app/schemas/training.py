@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, conint, field_validator
 
+TrainingMode = Literal["intelligent", "manual", "automl"]
+
 TaskType = Literal["classification", "regression"]
 SplitMethod = Literal["holdout", "kfold", "stratified_kfold"]
 SearchType = Literal["none", "grid", "random"]
@@ -167,6 +169,22 @@ class TrainingConfigIn(BaseModel):
     # Stored but never executed server side.
     customCode: str = ""
 
+    # Mode tracking: "intelligent" (system-generated config) | "manual" (user-driven)
+    configMode: TrainingMode = "manual"
+    # Keys the user has explicitly overridden in intelligent mode
+    userOverrides: List[str] = Field(default_factory=list)
+
+
+class AutoMLConfigIn(BaseModel):
+    """Payload for POST /projects/{id}/training/automl."""
+    datasetVersionId: int = Field(..., ge=1)
+    targetColumn: str = Field(..., min_length=1)
+    taskType: TaskType
+    timeBudget: int = Field(default=60, ge=10, le=3600)
+    metric: Optional[MetricType] = None
+    testRatio: float = Field(default=0.2, ge=0.0, le=0.4)
+    positiveLabel: Optional[Any] = None
+
 
 class BinaryClassProfileOut(BaseModel):
     label: Any
@@ -269,3 +287,67 @@ class ActiveModelOut(BaseModel):
     featureNames: List[str]
     threshold: float
     trainedAt: str
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataset profiling & recommendation schemas (intelligent mode)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DatasetProfileIn(BaseModel):
+    """Input for the /profile endpoint."""
+    version_id: int = Field(..., ge=1)
+    target_column: str = Field(..., min_length=1)
+
+
+class FeatureTypesOut(BaseModel):
+    numeric: int
+    categorical: int
+    text: int
+
+
+class DatasetProfileOut(BaseModel):
+    """Output of the /profile endpoint."""
+    n_samples: int
+    n_features: int
+    n_classes: Optional[int] = None
+    task_type: str
+    imbalance_ratio: Optional[float] = None
+    minority_ratio: Optional[float] = None
+    has_missing_values: bool
+    missing_ratio: float
+    feature_types: FeatureTypesOut
+    dimensionality_ratio: float
+    dataset_size_category: str
+    estimated_training_speed: str
+    recommended_cv_strategy: str
+    recommended_resampling: Optional[str] = None
+    recommended_metric: str
+    meta_features: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RecommendIn(BaseModel):
+    """Input for the /recommend endpoint."""
+    version_id: int = Field(..., ge=1)
+    target_column: str = Field(..., min_length=1)
+    # Optional: user may provide context hints
+    task_type_hint: Optional[TaskType] = None
+
+
+class TrainingRecommendationOut(BaseModel):
+    """Output of the /recommend endpoint."""
+    mode: str  # "intelligent"
+    recommended_models: List[str]
+    recommended_resampling: Optional[str] = None
+    apply_threshold: bool
+    recommended_metric: str
+    secondary_metrics: List[str]
+    recommended_cv_strategy: str
+    recommended_k_folds: int
+    recommended_search_type: str
+    recommended_time_budget_s: Optional[int] = None
+    recommended_class_weight: Optional[str] = None
+    recommended_split: Dict[str, int]
+    reasoning: Dict[str, str]
+    training_config_payload: Dict[str, Any]
+    warnings: List[str] = Field(default_factory=list)
+    profile: DatasetProfileOut

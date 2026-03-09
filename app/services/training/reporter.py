@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .config import PREPROCESSING_CAPABILITIES, PREPROCESSING_EXECUTION_POLICY
+from .utils import to_python_scalar, safe_json_value
 
 
 def _utc_now_iso() -> str:
@@ -98,54 +99,6 @@ def summarize_feature_importance(fitted_pipeline: Any, *, max_items: int = 50) -
     return items[: int(max(1, max_items))]
 
 
-def _to_builtin_scalar(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
-
-
-def _safe_value(value: Any, *, depth: int = 0, max_depth: int = 2, max_items: int = 20) -> Any:
-    value = _to_builtin_scalar(value)
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-
-    if isinstance(value, dict):
-        if depth >= max_depth:
-            return {"type": "dict", "size": int(len(value))}
-        out: Dict[str, Any] = {}
-        for i, (k, v) in enumerate(value.items()):
-            if i >= max_items:
-                out["__truncated__"] = int(len(value) - max_items)
-                break
-            out[str(k)] = _safe_value(v, depth=depth + 1, max_depth=max_depth, max_items=max_items)
-        return out
-
-    if isinstance(value, (list, tuple, set)):
-        seq = list(value)
-        if depth >= max_depth:
-            return {"type": type(value).__name__, "length": int(len(seq))}
-        out = [
-            _safe_value(v, depth=depth + 1, max_depth=max_depth, max_items=max_items)
-            for v in seq[:max_items]
-        ]
-        if len(seq) > max_items:
-            out.append(f"...(+{len(seq) - max_items} more)")
-        return out
-
-    shape = getattr(value, "shape", None)
-    if shape is not None:
-        try:
-            return {"type": value.__class__.__name__, "shape": [int(s) for s in shape]}
-        except Exception:
-            return {"type": value.__class__.__name__}
-
-    if callable(value):
-        name = getattr(value, "__name__", value.__class__.__name__)
-        return f"<callable:{name}>"
-
-    return f"<{value.__class__.__name__}>"
-
-
 def _safe_params(params: Dict[str, Any], *, max_keys: int, max_items: int = 20, max_depth: int = 2) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     keys = sorted(str(k) for k in params.keys())
@@ -153,7 +106,7 @@ def _safe_params(params: Dict[str, Any], *, max_keys: int, max_items: int = 20, 
         if i >= max_keys:
             out["__truncated_keys__"] = int(len(keys) - max_keys)
             break
-        out[key] = _safe_value(params.get(key), depth=0, max_depth=max_depth, max_items=max_items)
+        out[key] = safe_json_value(params.get(key), depth=0, max_depth=max_depth, max_items=max_items)
     return out
 
 

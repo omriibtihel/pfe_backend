@@ -18,15 +18,11 @@ from sklearn.metrics import (
 from sklearn.preprocessing import label_binarize
 from sklearn.utils.multiclass import type_of_target
 
-
-def _to_builtin_scalar(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
+from .utils import to_python_scalar
 
 
 def _to_json_label(value: Any) -> Any:
-    value = _to_builtin_scalar(value)
+    value = to_python_scalar(value)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     return str(value)
@@ -46,7 +42,7 @@ def _stable_unique(values: Sequence[Any]) -> list[Any]:
     out: list[Any] = []
     seen: set[tuple[str, str]] = set()
     for raw_value in values:
-        value = _to_builtin_scalar(raw_value)
+        value = to_python_scalar(raw_value)
         if isinstance(value, float) and np.isnan(value):
             key = ("float", "nan")
         else:
@@ -59,16 +55,16 @@ def _stable_unique(values: Sequence[Any]) -> list[Any]:
 
 
 def _matching_label(label: Any, labels: Sequence[Any]) -> Any:
-    label_str = str(_to_builtin_scalar(label))
+    label_str = str(to_python_scalar(label))
     for candidate in labels:
-        if str(_to_builtin_scalar(candidate)) == label_str:
+        if str(to_python_scalar(candidate)) == label_str:
             return candidate
     return None
 
 
 def _is_zero_one_label_set(labels: Sequence[Any]) -> bool:
     try:
-        normalized = {float(_to_builtin_scalar(v)) for v in labels}
+        normalized = {float(to_python_scalar(v)) for v in labels}
     except Exception:
         return False
     return normalized == {0.0, 1.0}
@@ -122,7 +118,7 @@ def _resolve_primary_average(requested_metrics: Optional[Sequence[str]], classif
 
 def _resolve_labels(y_true: np.ndarray, y_pred: np.ndarray, labels: Optional[Sequence[Any]]) -> list[Any]:
     if labels is not None and len(labels) > 0:
-        return [_to_builtin_scalar(v) for v in labels]
+        return [to_python_scalar(v) for v in labels]
 
     values: list[Any] = []
     values.extend(np.asarray(y_true).ravel().tolist())
@@ -147,7 +143,7 @@ def _pick_positive_label(
     if _is_zero_one_label_set(labels):
         for label in labels:
             try:
-                if float(_to_builtin_scalar(label)) == 1.0:
+                if float(to_python_scalar(label)) == 1.0:
                     return label
             except Exception:
                 continue
@@ -161,7 +157,7 @@ def _pick_positive_label(
     y_flat = np.asarray(y_true).ravel()
     for label in labels:
         count = int(np.sum(y_flat == label))
-        counts[str(_to_builtin_scalar(label))] = (label, count)
+        counts[str(to_python_scalar(label))] = (label, count)
     rare_key = min(counts.keys(), key=lambda k: counts[k][1])
     chosen = counts[rare_key][0]
     warnings.append(
@@ -216,9 +212,9 @@ def _extract_binary_score(
     estimator: Any = None,
     warnings: Optional[list[str]] = None,
 ) -> tuple[Optional[np.ndarray], Optional[str], Optional[int], Optional[float]]:
-    score_labels_list = [_to_builtin_scalar(v) for v in (score_labels or [])]
+    score_labels_list = [to_python_scalar(v) for v in (score_labels or [])]
     if not score_labels_list and estimator is not None:
-        score_labels_list = [_to_builtin_scalar(v) for v in (get_class_labels(estimator) or [])]
+        score_labels_list = [to_python_scalar(v) for v in (get_class_labels(estimator) or [])]
     pos_index = None
     if len(score_labels_list) > 0:
         matched = _matching_label(positive_label, score_labels_list)
@@ -381,7 +377,7 @@ def compute_classification_metrics(
     y_pred_arr = np.asarray(y_pred)
     warnings: list[str] = []
     estimator_classes = get_class_labels(estimator) if estimator is not None else None
-    model_classes = [_to_builtin_scalar(v) for v in (estimator_classes or labels or [])]
+    model_classes = [to_python_scalar(v) for v in (estimator_classes or labels or [])]
 
     if str(task_type or "").strip().lower() != "classification":
         return {}
@@ -403,7 +399,7 @@ def compute_classification_metrics(
     if classification_type == "multilabel":
         n_outputs = int(y_true_arr.shape[1]) if y_true_arr.ndim == 2 else 0
         resolved_labels = (
-            [_to_builtin_scalar(v) for v in labels]
+            [to_python_scalar(v) for v in labels]
             if labels is not None and len(labels) == n_outputs
             else list(range(n_outputs))
         )
@@ -747,7 +743,7 @@ def get_class_labels(model) -> Optional[list[Any]]:
     for _ in range(3):
         classes = _classes_from_estimator(candidate)
         if classes is not None:
-            return [_to_builtin_scalar(v) for v in np.asarray(classes).ravel().tolist()]
+            return [to_python_scalar(v) for v in np.asarray(classes).ravel().tolist()]
         next_estimator = getattr(candidate, "best_estimator_", None)
         if next_estimator is None:
             break

@@ -10,21 +10,32 @@ from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, 
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from fastapi.responses import StreamingResponse as _StreamingResponse
+
 from app.api.deps import get_db, get_current_user
 from app.models.dataset_version import DatasetVersion
 from app.models.project import Project
 from app.models.training import TrainingSession, TrainedModel
 from app.schemas.training import (
     ActiveModelOut,
+    AutoMLConfigIn,
     BalanceAnalysisIn,
     BalanceAnalysisResponse,
+    DatasetProfileIn,
+    DatasetProfileOut,
+    FeatureTypesOut,
     ManualPredictIn,
+    RecommendIn,
     TrainingConfigIn,
+    TrainingRecommendationOut,
+    TrainingSessionOut,
     TrainingValidateOut,
 )
 from app.services.training.balancing.profiler import DataProfile, profile_binary_dataset
 from app.services.training.config import get_training_capabilities
 from app.services.training.dataset_loader import load_dataframe, resolve_dataset_path
+from app.services.training.dataset_profiler import DatasetProfiler
+from app.services.training.notifier import training_notifier
 from app.services.training.predictor import (
     predict_rows_json,
     predict_to_csv,
@@ -32,8 +43,13 @@ from app.services.training.predictor import (
     read_uploaded_dataframe,
 )
 from app.services.training.preview import PreviewValidationError, build_validation_preview
+from app.services.training.recommendation_engine import RecommendationEngine
+from app.services.training.utils import to_python_scalar
 from app.services.training.validation import validate_training_config_payload
-from app.services.training_service import run_training_session
+from app.services.training_service import run_training_session, run_automl_session
+
+_profiler = DatasetProfiler()
+_engine = RecommendationEngine()
 
 router = APIRouter()
 
@@ -83,12 +99,6 @@ def _build_binary_profile(df, target_column: str) -> DataProfile:
     return profile_binary_dataset(y=y, X_shape=X.shape)
 
 
-def _json_safe_scalar(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
-
-
 def _profile_to_response(profile: DataProfile) -> dict[str, Any]:
     return {
         "needs_balancing": bool(profile.needs_balancing),
@@ -98,13 +108,13 @@ def _profile_to_response(profile: DataProfile) -> dict[str, Any]:
         "n_samples": int(profile.n_samples),
         "dataset_scale": str(profile.scale),
         "majority": {
-            "label": _json_safe_scalar(profile.majority.label),
+            "label": to_python_scalar(profile.majority.label),
             "count": int(profile.majority.count),
             "ratio": float(profile.majority.ratio),
             "role": str(profile.majority.role),
         },
         "minority": {
-            "label": _json_safe_scalar(profile.minority.label),
+            "label": to_python_scalar(profile.minority.label),
             "count": int(profile.minority.count),
             "ratio": float(profile.minority.ratio),
             "role": str(profile.minority.role),
@@ -128,44 +138,16 @@ def _profile_to_response(profile: DataProfile) -> dict[str, Any]:
     }
 
 
-def _model_to_front_result(
-    m: TrainedModel,
-    *,
-    is_saved: bool | None = None,
-    is_active: bool = False,
-) -> dict[str, Any]:
-    metrics_all = m.metrics_json or {}
-    artifacts = m.artifacts_json or {}
-    if is_saved is None:
-        # Prefer the dedicated column; fall back to artifacts_json mirror for old rows.
-        is_saved = bool(getattr(m, "is_saved", None) or artifacts.get("saved", False))
-
-    test_metrics = metrics_all.get("test")
-    metrics = test_metrics if isinstance(test_metrics, dict) else metrics_all
-    metrics_legacy = metrics.get("legacy_flat") if isinstance(metrics.get("legacy_flat"), dict) else {}
-    metrics_global = metrics.get("global") if isinstance(metrics.get("global"), dict) else {}
-    metrics_binary = metrics.get("binary") if isinstance(metrics.get("binary"), dict) else {}
-
-    def mget(k: str) -> Optional[float]:
-        v = metrics.get(k)
-        if v is None:
-            v = metrics_legacy.get(k)
-        if v is None:
-            v = metrics_global.get(k)
-        if v is None:
-            v = metrics_binary.get(k)
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except Exception:
-            return None
-
-    task_type = str(m.task_type or "").lower()
+def _extract_primary_score(
+    metrics_all: dict,
+    metrics: dict,
+    task_type: str,
+    mget: Any,
+) -> tuple[Optional[str], float, float, float]:
+    """Returns (primary_metric, test_score, train_score, training_time)."""
     primary = metrics_all.get("primary_score") if isinstance(metrics_all.get("primary_score"), dict) else {}
     primary_metric = primary.get("metric")
 
-    # Legacy format contains primary_score. Refactor format may not, so infer robustly.
     if not primary_metric:
         candidates = (
             ["f1", "accuracy", "roc_auc", "pr_auc"]
@@ -182,53 +164,53 @@ def _model_to_front_result(
     test_score = 0.0
     if isinstance(primary, dict) and primary.get("value") is not None:
         try:
-            test_score = float(primary.get("value"))
+            test_score = float(primary["value"])
         except Exception:
-            test_score = 0.0
+            pass
     elif primary_metric and isinstance(metrics, dict):
         try:
             test_score = float(metrics.get(primary_metric, 0.0))
         except Exception:
-            test_score = 0.0
+            pass
 
     train_score = 0.0
     train_block = metrics_all.get("train")
     if isinstance(train_block, dict) and primary_metric and primary_metric in train_block:
         try:
-            train_score = float(train_block.get(primary_metric, 0.0))
+            train_score = float(train_block[primary_metric])
         except Exception:
-            train_score = 0.0
+            pass
 
     try:
         training_time = float(metrics_all.get("training_time_sec", 0.0))
     except Exception:
         training_time = 0.0
 
-    split_info = metrics_all.get("split_info") if isinstance(metrics_all.get("split_info"), dict) else None
-    if split_info is None:
-        split_info = artifacts.get("split_info") if isinstance(artifacts.get("split_info"), dict) else None
+    return primary_metric, test_score, train_score, training_time
 
-    gs = artifacts.get("grid_search") if isinstance(artifacts.get("grid_search"), dict) else {}
-    best_params = gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None
-    cv_best_score = gs.get("best_score")
-    cv_scoring = gs.get("scoring")
-    # Normalize cv_results_summary: stored as mean_test_score, frontend expects mean_score.
-    _raw_cv_summary = gs.get("cv_results_summary")
-    cv_results_summary: Optional[list] = None
-    if isinstance(_raw_cv_summary, list) and _raw_cv_summary:
-        cv_results_summary = [
-            {
-                "params": dict(row.get("params") or {}),
-                "mean_score": float(row.get("mean_score") or row.get("mean_test_score") or 0.0),
-            }
-            for row in _raw_cv_summary
-            if isinstance(row, dict)
-        ]
 
-    thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else None
-    balancing = artifacts.get("balancing") if isinstance(artifacts.get("balancing"), dict) else None
+def _extract_automl_fields(metrics_all: dict, artifacts: dict) -> Optional[dict]:
+    """Returns the automl result dict when the model was trained with AutoML, else None."""
+    if not bool(metrics_all.get("automl", False)):
+        return None
+    automl_artifacts = artifacts.get("automl") if isinstance(artifacts.get("automl"), dict) else {}
+    return {
+        "isAutoML": True,
+        "bestEstimator": metrics_all.get("best_estimator"),
+        "nIterations": metrics_all.get("n_iterations"),
+        "totalTimeS": metrics_all.get("total_time_s"),
+        "timeBudgetS": automl_artifacts.get("time_budget_s"),
+        "metricOptimized": automl_artifacts.get("metric_optimized"),
+    }
 
-    # CV-specific
+
+def _extract_cv_fields(
+    metrics_all: dict,
+    *,
+    primary_metric: Optional[str],
+    test_score: float,
+) -> tuple[dict, float]:
+    """Returns (cv_fields_dict, updated_test_score)."""
     is_cv = bool(metrics_all.get("cv", False))
     cv_summary = metrics_all.get("cv_summary") if isinstance(metrics_all.get("cv_summary"), dict) else None
     cv_fold_results = metrics_all.get("fold_results") if isinstance(metrics_all.get("fold_results"), list) else None
@@ -241,12 +223,9 @@ def _model_to_front_result(
         else None
     )
 
-    # For CV: testScore = holdout test score when available, else CV mean val score.
-    # metrics_all["test"] already holds the right value (set by orchestrator), but
-    # we derive testScore from primary_metric for consistency with holdout logic.
+    # For CV: prefer holdout test score, fall back to CV mean val score.
     if is_cv and primary_metric:
         if has_holdout_test and isinstance(holdout_test_metrics, dict):
-            # Prefer the genuine holdout test score
             raw = holdout_test_metrics.get(primary_metric)
             if raw is None:
                 lf = holdout_test_metrics.get("legacy_flat") if isinstance(holdout_test_metrics.get("legacy_flat"), dict) else {}
@@ -265,6 +244,94 @@ def _model_to_front_result(
                 except Exception:
                     pass
 
+    cv_fields = {
+        "isCV": is_cv,
+        "cvFoldResults": cv_fold_results,
+        "cvSummary": cv_summary,
+        "kFoldsUsed": k_folds_used,
+        "hasHoldoutTest": has_holdout_test,
+        "cvMeanMetrics": cv_mean_metrics,
+        "cvTestMetrics": holdout_test_metrics,
+    }
+    return cv_fields, test_score
+
+
+def _extract_tuning_fields(artifacts: dict) -> tuple[dict, Any]:
+    """Returns (gridSearch_response_dict, gs_raw) for the tuning block."""
+    gs = artifacts.get("grid_search") if isinstance(artifacts.get("grid_search"), dict) else {}
+    best_params = gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None
+    cv_best_score = gs.get("best_score")
+    cv_scoring = gs.get("scoring")
+
+    # Normalize cv_results_summary: stored as mean_test_score, frontend expects mean_score.
+    _raw = gs.get("cv_results_summary")
+    cv_results_summary: Optional[list] = None
+    if isinstance(_raw, list) and _raw:
+        cv_results_summary = [
+            {
+                "params": dict(row.get("params") or {}),
+                "mean_score": float(row.get("mean_score") or row.get("mean_test_score") or 0.0),
+            }
+            for row in _raw
+            if isinstance(row, dict)
+        ]
+
+    grid_search_block = {
+        "enabled": bool(gs.get("enabled", False)),
+        "searchType": gs.get("search_type") or None,
+        "cvBestScore": float(cv_best_score) if cv_best_score is not None else None,
+        "cvScoring": str(cv_scoring) if cv_scoring else None,
+        "bestParams": best_params,
+        "cvSplits": int(gs.get("cv_splits", 0)) if gs.get("cv_splits") else None,
+        "nCandidates": int(gs.get("n_candidates", 0)) if gs.get("n_candidates") else None,
+        "cvResultsSummary": cv_results_summary,
+    }
+    return grid_search_block, gs
+
+
+def _model_to_front_result(
+    m: TrainedModel,
+    *,
+    is_saved: bool | None = None,
+    is_active: bool = False,
+) -> dict[str, Any]:
+    metrics_all = m.metrics_json or {}
+    artifacts = m.artifacts_json or {}
+    if is_saved is None:
+        is_saved = bool(getattr(m, "is_saved", None) or artifacts.get("saved", False))
+
+    # Build the active metrics dict and a resolver closure.
+    test_metrics = metrics_all.get("test")
+    metrics = test_metrics if isinstance(test_metrics, dict) else metrics_all
+    metrics_legacy = metrics.get("legacy_flat") if isinstance(metrics.get("legacy_flat"), dict) else {}
+    metrics_global = metrics.get("global") if isinstance(metrics.get("global"), dict) else {}
+    metrics_binary = metrics.get("binary") if isinstance(metrics.get("binary"), dict) else {}
+
+    def mget(k: str) -> Optional[float]:
+        for d in (metrics, metrics_legacy, metrics_global, metrics_binary):
+            v = d.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return None
+
+    task_type = str(m.task_type or "").lower()
+    primary_metric, test_score, train_score, training_time = _extract_primary_score(
+        metrics_all, metrics, task_type, mget
+    )
+
+    split_info = metrics_all.get("split_info") if isinstance(metrics_all.get("split_info"), dict) else None
+    if split_info is None:
+        split_info = artifacts.get("split_info") if isinstance(artifacts.get("split_info"), dict) else None
+
+    grid_search_block, _ = _extract_tuning_fields(artifacts)
+    thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else None
+    balancing = artifacts.get("balancing") if isinstance(artifacts.get("balancing"), dict) else None
+    automl_result = _extract_automl_fields(metrics_all, artifacts)
+    cv_fields, test_score = _extract_cv_fields(metrics_all, primary_metric=primary_metric, test_score=test_score)
+
     return {
         "id": str(m.id),
         "modelType": m.model_type,
@@ -275,17 +342,11 @@ def _model_to_front_result(
             "recall": mget("recall"),
             "f1": mget("f1"),
             "roc_auc": mget("roc_auc"),
-
-            # imbalance-friendly
             "pr_auc": mget("pr_auc"),
             "precision_pos": mget("precision_pos"),
             "recall_pos": mget("recall_pos"),
             "f1_pos": mget("f1_pos"),
-
-            # macro (useful even for binary imbalance)
             "f1_macro": mget("f1_macro"),
-
-            # regression (only meaningful when taskType=regression)
             "mse": mget("mse"),
             "rmse": mget("rmse"),
             "mae": mget("mae"),
@@ -295,46 +356,23 @@ def _model_to_front_result(
         "testScore": test_score,
         "primaryMetric": primary_metric,
         "splitInfo": split_info,
-
-        # Cross-validation fields (null when splitMethod=holdout)
-        "isCV": is_cv,
-        "cvFoldResults": cv_fold_results,
-        "cvSummary": cv_summary,
-        "kFoldsUsed": k_folds_used,
-        "hasHoldoutTest": has_holdout_test,
-        "cvMeanMetrics": cv_mean_metrics,
-        "cvTestMetrics": holdout_test_metrics,
-
-        "gridSearch": {
-            "enabled": bool(gs.get("enabled", False)),
-            "searchType": gs.get("search_type") or None,
-            "cvBestScore": float(cv_best_score) if cv_best_score is not None else None,
-            "cvScoring": str(cv_scoring) if cv_scoring else None,
-            "bestParams": best_params,
-            "cvSplits": int(gs.get("cv_splits", 0)) if gs.get("cv_splits") else None,
-            "nCandidates": int(gs.get("n_candidates", 0)) if gs.get("n_candidates") else None,
-            "cvResultsSummary": cv_results_summary,
-        },
-
+        **cv_fields,
+        "gridSearch": grid_search_block,
         "featureImportance": artifacts.get("feature_importance", []),
         "confusionMatrix": artifacts.get("confusion_matrix", []),
         "metricsDetailed": metrics,
         "metricsWarnings": metrics.get("warnings", []) if isinstance(metrics, dict) else [],
         "hyperparams": artifacts.get("hyperparams", None),
-
-        # Step 1 visibility
         "classDistribution": artifacts.get("class_distribution", None),
         "baselineMajority": artifacts.get("baseline_majority", None),
         "splitDebug": artifacts.get("split_debug", None),
         "preprocessing": artifacts.get("preprocessing", None),
-
-        # Balancing decision/audit visibility
         "balancing": balancing,
         "thresholding": thresholding,
-
         "trainingTime": training_time,
         "isSaved": bool(is_saved),
         "isActive": bool(is_active),
+        "automl": automl_result,
     }
 
 
@@ -376,6 +414,40 @@ def _session_to_front_session(
         "startedAt": s.started_at.isoformat() if s.started_at else None,
         "completedAt": s.finished_at.isoformat() if s.finished_at else None,
     }
+
+
+def _extract_feature_names_for_prediction(artifacts: dict[str, Any]) -> list[str]:
+    """
+    Return the list of feature names the user should provide for manual prediction.
+
+    Priority:
+    1. artifacts["training_schema"]["feature_names"]  — most accurate (includes order)
+    2. artifacts["columns"]["numeric"] + ["categorical"]  — fallback for older models
+    3. Empty list                                         — nothing found
+
+    AutoML interaction features (automl_feature_pairs) are excluded since the backend
+    reconstructs them automatically at inference time.
+    """
+    training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
+    feature_names = training_schema.get("feature_names")
+
+    if not isinstance(feature_names, list) or not feature_names:
+        # Fallback: reconstruct from column type lists stored in artifacts
+        columns_block = artifacts.get("columns") if isinstance(artifacts.get("columns"), dict) else {}
+        numeric = columns_block.get("numeric") or []
+        categorical = columns_block.get("categorical") or []
+        if isinstance(numeric, list) and isinstance(categorical, list):
+            feature_names = list(numeric) + [c for c in categorical if c not in numeric]
+        else:
+            feature_names = []
+
+    # Exclude engineered AutoML interaction features — user shouldn't enter these manually.
+    automl_pairs = artifacts.get("automl_feature_pairs")
+    if isinstance(automl_pairs, list) and automl_pairs:
+        engineered = {str(p["name"]) for p in automl_pairs if isinstance(p, dict) and "name" in p}
+        feature_names = [f for f in feature_names if str(f) not in engineered]
+
+    return [str(f) for f in feature_names]
 
 
 def _extract_threshold(artifacts: dict[str, Any]) -> float:
@@ -498,6 +570,157 @@ def analyze_balance(
     return _profile_to_response(profile)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Intelligent-mode routes: dataset profiling, recommendation, SSE events
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.post("/profile", response_model=DatasetProfileOut)
+def profile_dataset(
+    project_id: int,
+    payload: DatasetProfileIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Phase 1 — Profile the dataset.
+    Returns a DatasetProfile describing size, task type, imbalance,
+    missing values, feature types, and initial recommendations.
+    """
+    _get_owned_project(db, project_id, current_user.id)
+    try:
+        dataset_path, _ = resolve_dataset_path(db, project_id, payload.version_id)
+        df = load_dataframe(dataset_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        prof = _profiler.profile(df, str(payload.target_column))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return DatasetProfileOut(
+        n_samples=prof.n_samples,
+        n_features=prof.n_features,
+        n_classes=prof.n_classes,
+        task_type=prof.task_type,
+        imbalance_ratio=prof.imbalance_ratio,
+        minority_ratio=prof.minority_ratio,
+        has_missing_values=prof.has_missing_values,
+        missing_ratio=prof.missing_ratio,
+        feature_types=FeatureTypesOut(**prof.feature_types),
+        dimensionality_ratio=prof.dimensionality_ratio,
+        dataset_size_category=prof.dataset_size_category,
+        estimated_training_speed=prof.estimated_training_speed,
+        recommended_cv_strategy=prof.recommended_cv_strategy,
+        recommended_resampling=prof.recommended_resampling,
+        recommended_metric=prof.recommended_metric,
+        meta_features=prof.meta_features,
+    )
+
+
+@router.post("/recommend", response_model=TrainingRecommendationOut)
+def recommend_training_config(
+    project_id: int,
+    payload: RecommendIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Phase 2 — Generate a full TrainingRecommendation.
+    Returns recommended models, balancing strategy, metric, CV strategy,
+    HPO strategy, reasonings, and a ready-to-use training_config_payload.
+    """
+    _get_owned_project(db, project_id, current_user.id)
+    try:
+        dataset_path, _ = resolve_dataset_path(db, project_id, payload.version_id)
+        df = load_dataframe(dataset_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        prof = _profiler.profile(df, str(payload.target_column))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    rec = _engine.recommend(prof)
+
+    profile_out = DatasetProfileOut(
+        n_samples=prof.n_samples,
+        n_features=prof.n_features,
+        n_classes=prof.n_classes,
+        task_type=prof.task_type,
+        imbalance_ratio=prof.imbalance_ratio,
+        minority_ratio=prof.minority_ratio,
+        has_missing_values=prof.has_missing_values,
+        missing_ratio=prof.missing_ratio,
+        feature_types=FeatureTypesOut(**prof.feature_types),
+        dimensionality_ratio=prof.dimensionality_ratio,
+        dataset_size_category=prof.dataset_size_category,
+        estimated_training_speed=prof.estimated_training_speed,
+        recommended_cv_strategy=prof.recommended_cv_strategy,
+        recommended_resampling=prof.recommended_resampling,
+        recommended_metric=prof.recommended_metric,
+        meta_features=prof.meta_features,
+    )
+
+    return TrainingRecommendationOut(
+        mode=rec.mode,
+        recommended_models=rec.recommended_models,
+        recommended_resampling=rec.recommended_resampling,
+        apply_threshold=rec.apply_threshold,
+        recommended_metric=rec.recommended_metric,
+        secondary_metrics=rec.secondary_metrics,
+        recommended_cv_strategy=rec.recommended_cv_strategy,
+        recommended_k_folds=rec.recommended_k_folds,
+        recommended_search_type=rec.recommended_search_type,
+        recommended_time_budget_s=rec.recommended_time_budget_s,
+        recommended_class_weight=rec.recommended_class_weight,
+        recommended_split=rec.recommended_split,
+        reasoning=rec.reasoning,
+        training_config_payload=rec.training_config_payload,
+        warnings=rec.warnings,
+        profile=profile_out,
+    )
+
+
+@router.get("/sessions/{session_id}/events")
+async def stream_training_events(
+    project_id: int,
+    session_id: int,
+    last_seq: int = -1,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Phase 9 — Real-time training events via SSE.
+    The client connects and receives Server-Sent Events as the training
+    progresses (model complete, HPO progress, final complete, errors).
+
+    Query params:
+      last_seq: last event sequence number received (for resumption).
+    """
+    _get_owned_project(db, project_id, current_user.id)
+
+    # Verify session belongs to project
+    s = (
+        db.query(TrainingSession)
+        .filter(TrainingSession.id == session_id, TrainingSession.project_id == project_id)
+        .first()
+    )
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return _StreamingResponse(
+        training_notifier.subscribe(session_id, last_seq=last_seq),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @router.post("/versions/{version_id}/sessions", status_code=status.HTTP_201_CREATED)
 def start_training_for_version(
     project_id: int,
@@ -555,6 +778,61 @@ def start_training_for_version(
     background.add_task(run_training_session, s.id)
     active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
     return _session_to_front_session(db, s, active_model_id=active_model_id)
+
+
+@router.post("/automl", status_code=status.HTTP_201_CREATED, response_model=TrainingSessionOut)
+def start_automl_training(
+    project_id: int,
+    payload: AutoMLConfigIn,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Launch an AutoML (FLAML) training session. FLAML handles full pipeline: preprocessing, model selection, HPO."""
+    _get_owned_project(db, project_id, current_user.id)
+
+    dv = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id == payload.datasetVersionId, DatasetVersion.project_id == project_id)
+        .first()
+    )
+    if not dv:
+        raise HTTPException(status_code=404, detail="Dataset version not found")
+
+    s = TrainingSession(
+        project_id=project_id,
+        dataset_version_id=payload.datasetVersionId,
+        status="queued",
+        progress=0,
+        config_json={
+            "datasetVersionId": payload.datasetVersionId,
+            "targetColumn": payload.targetColumn,
+            "taskType": payload.taskType,
+            "timeBudget": payload.timeBudget,
+            "metric": payload.metric,
+            "testRatio": payload.testRatio,
+            "positiveLabel": payload.positiveLabel,
+            "configMode": "automl",
+        },
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+
+    background.add_task(run_automl_session, s.id)
+
+    return {
+        "id": s.id,
+        "project_id": s.project_id,
+        "dataset_version_id": s.dataset_version_id,
+        "status": s.status,
+        "progress": int(s.progress or 0),
+        "config": s.config_json,
+        "error_message": s.error_message,
+        "created_at": s.created_at.isoformat() if s.created_at else "",
+        "started_at": None,
+        "finished_at": None,
+    }
 
 
 @router.get("/sessions")
@@ -683,10 +961,7 @@ def list_saved_models(
             else None
         )
 
-        training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
-        feature_names = training_schema.get("feature_names")
-        if not isinstance(feature_names, list):
-            feature_names = []
+        feature_names = _extract_feature_names_for_prediction(artifacts)
 
         front_result = _model_to_front_result(m)
 
@@ -791,6 +1066,52 @@ def unsave_model(
         project.active_model_id = None
         db.add(project)
 
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/sessions/{session_id}/models/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_trained_model(
+    project_id: int,
+    session_id: int,
+    model_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Permanently delete a TrainedModel record and its pkl file from disk."""
+    from pathlib import Path
+
+    project = _get_owned_project(db, project_id, current_user.id)
+
+    m = (
+        db.query(TrainedModel)
+        .filter(
+            TrainedModel.id == model_id,
+            TrainedModel.session_id == session_id,
+            TrainedModel.project_id == project_id,
+        )
+        .first()
+    )
+    if not m:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    # Unset active model if this one was active
+    if project.active_model_id is not None and int(project.active_model_id) == int(model_id):
+        project.active_model_id = None
+        db.add(project)
+
+    # Delete pkl file from disk
+    artifacts = m.artifacts_json if isinstance(m.artifacts_json, dict) else {}
+    pkl_path_str = artifacts.get("model_pkl")
+    if pkl_path_str:
+        try:
+            pkl_path = Path(str(pkl_path_str))
+            if pkl_path.exists():
+                pkl_path.unlink()
+        except Exception:
+            pass  # Non-fatal: DB record is deleted regardless
+
+    db.delete(m)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -968,8 +1289,7 @@ def get_active_model(
     m = _get_active_model_or_404(db, project_id)
 
     artifacts = m.artifacts_json or {}
-    training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
-    feature_names = training_schema.get("feature_names") or []
+    feature_names = _extract_feature_names_for_prediction(artifacts)
 
     thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else {}
     threshold = 0.5
