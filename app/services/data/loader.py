@@ -50,6 +50,6 @@ def _coerce_decimal_commas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_dataframe(path: Path) -> pd.DataFrame:
-    # si tu supportes Excel plus tard: if suffix in (".xlsx", ...) => pd.read_excel
-    df = pd.read_csv(path)
+    suffix = path.suffix.lower()
+    df = pd.read_excel(path) if suffix in (".xlsx", ".xls") else pd.read_csv(path)
     return _coerce_decimal_commas(df)

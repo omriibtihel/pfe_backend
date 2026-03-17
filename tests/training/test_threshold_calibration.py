@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 import app.services.training.orchestrator as orchestrator
-from app.services.training.config import TrainingConfig
+from app.services.training.config.schema import TrainingConfig
 
 
 # ──────────────────────────────────────────────────────────────────────────────

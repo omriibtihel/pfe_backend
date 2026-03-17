@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.services.training.dataset_profiler import DatasetProfiler, DatasetProfile
+from app.services.data.profiler import DatasetProfiler, DatasetProfile
 
 
 @pytest.fixture()

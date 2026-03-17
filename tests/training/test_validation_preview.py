@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.services.training.preview import (
+from app.services.data.preview import (
     PreviewValidationError,
     _to_json_rows,
     build_validation_preview,

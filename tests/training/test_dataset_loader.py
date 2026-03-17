@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from app.services.training.dataset_loader import _coerce_decimal_commas, load_dataframe
-from app.services.training.preview import build_validation_preview
+from app.services.data.loader import _coerce_decimal_commas, load_dataframe
+from app.services.data.preview import build_validation_preview
 
 
 def _preview_payload() -> dict:

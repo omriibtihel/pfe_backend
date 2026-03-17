@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 import app.services.training.orchestrator as orchestrator
-from app.services.training.config import TrainingConfig
+from app.services.training.config.schema import TrainingConfig
 
 
 def _make_imbalanced_binary_df(n_majority: int = 180, n_minority: int = 40) -> pd.DataFrame:

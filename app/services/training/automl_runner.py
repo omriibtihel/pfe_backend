@@ -14,8 +14,8 @@ from sklearn.metrics import precision_recall_curve
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_sample_weight
 
-from app.services.training.automl_config import AutoMLConfig
-from app.services.training.evaluator import Evaluator
+from app.services.training.config.automl import AutoMLConfig
+from app.services.training.pipeline.evaluator import Evaluator
 
 logger = logging.getLogger(__name__)
 

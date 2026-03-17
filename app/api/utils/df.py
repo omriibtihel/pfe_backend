@@ -26,6 +26,11 @@ def read_df(
 
     path = Path(path)
 
+    # Excel files must be read with read_excel, never read_csv
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(path, nrows=nrows, usecols=usecols)
+        return _whitespace_only_to_na(df)
+
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
     last_err: Exception | None = None
 
@@ -33,8 +38,6 @@ def read_df(
         try:
             df = pd.read_csv(path, nrows=nrows, encoding=enc, usecols=usecols)
             return _whitespace_only_to_na(df)
-        except UnicodeDecodeError as e:
-            last_err = e
         except Exception as e:
             last_err = e
 

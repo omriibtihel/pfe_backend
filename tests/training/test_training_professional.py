@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 
 from app.models.training import TrainedModel
-from app.services.training.config import TrainingConfig
+from app.services.training.config.schema import TrainingConfig
 from app.services.training.orchestrator import run_one_model
-from app.services.training.persistence import load_pipeline, save_pipeline
-from app.services.training.predictor import predict_with_trained_model
-from app.services.training.splitters import make_holdout_split
+from app.services.training.output.persistence import load_pipeline, save_pipeline
+from app.services.training.output.predictor import predict_with_trained_model
+from app.services.training.pipeline.splitters import make_holdout_split
 
 
 def _make_dataset(n_rows: int = 220) -> pd.DataFrame:

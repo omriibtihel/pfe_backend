@@ -19,8 +19,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.services.training.config import TrainingConfig
-from app.services.training.splitters import iter_kfold_splits, validate_kfold_config
+from app.services.training.config.schema import TrainingConfig
+from app.services.training.pipeline.splitters import iter_kfold_splits, validate_kfold_config
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -14,10 +14,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .dataset_profiler import DatasetProfile
-from .imbalance_handler import recommend_imbalance_strategy
-from .metric_selector import select_metrics
-from .zero_shot_config import get_zero_shot_hyperparams
+from app.services.data.profiler import DatasetProfile
+from app.services.training.intelligence.imbalance_handler import recommend_imbalance_strategy
+from app.services.training.intelligence.metric_selector import select_metrics
+from app.services.training.config.zero_shot import get_zero_shot_hyperparams
 
 
 # ──────────────────────────────────────────────────────────────────────────────

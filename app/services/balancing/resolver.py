@@ -44,7 +44,7 @@ def resolve(
     model_supports_sample_weight: bool = False,
     random_state: int = 42,
 ) -> BalancingDecision:
-    from ..config import BalancingConfig  # local import to avoid circular at module load
+    from app.services.training.config.schema import BalancingConfig  # local import to avoid circular at module load
 
     requested_strategy = str(config.strategy or "none").strip().lower()
     threshold_strategy = str(config.threshold_strategy or "maximize_f1").strip().lower()

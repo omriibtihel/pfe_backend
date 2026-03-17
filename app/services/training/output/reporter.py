@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .config import PREPROCESSING_CAPABILITIES, PREPROCESSING_EXECUTION_POLICY
-from .utils import to_python_scalar, safe_json_value
+from app.services.training.config.schema import PREPROCESSING_CAPABILITIES, PREPROCESSING_EXECUTION_POLICY
+from app.services.training.utils import to_python_scalar, safe_json_value
 
 
 def _utc_now_iso() -> str:

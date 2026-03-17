@@ -7,7 +7,7 @@ import pytest
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from app.api.routes.training import _model_to_front_result
-from app.services.training.metrics import compute_classification_metrics
+from app.services.training.pipeline.metrics import compute_classification_metrics
 
 
 def test_imbalanced_binary_keeps_recall_pos_separate_from_weighted_recall() -> None:

@@ -1,1 +1,1 @@
-from .config import TrainingConfig
+from app.services.training.config.schema import TrainingConfig

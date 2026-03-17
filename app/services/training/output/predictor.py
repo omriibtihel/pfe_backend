@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from app.models.training import TrainedModel
-from .persistence import load_pipeline
+from app.services.training.output.persistence import load_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +32,13 @@ def read_uploaded_dataframe(filename: str, content: bytes) -> pd.DataFrame:
     buff = io.BytesIO(content)
     if name.endswith(".csv") or name.endswith(".txt"):
         return pd.read_csv(buff)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(buff)
     if name.endswith(".json"):
         return pd.read_json(buff)
     if name.endswith(".parquet"):
         return pd.read_parquet(buff)
-    raise RuntimeError("Unsupported file type. Use CSV, JSON or Parquet.")
+    raise RuntimeError("Unsupported file type. Use CSV, Excel, JSON or Parquet.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -107,8 +109,64 @@ def _get_optimal_threshold(artifacts_json: dict, task_type: str) -> float:
 # AutoML preprocessing helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _normalize_input_dtypes(df: pd.DataFrame, pipeline: Any) -> pd.DataFrame:
+    """
+    Normalize input dtypes so every model receives numeric (or Categorical) data.
+
+    Steps applied in order:
+    1. pandas StringDtype → object  (imblearn / FLAML require object, not StringDtype)
+    2. Object columns that represent numbers ("1", "2.5") → float via pd.to_numeric.
+    3. Remaining object columns (true categoricals: "yes/no", region names …)
+       → pd.Categorical.  XGBoost ≥ 1.7 supports Categorical natively; we also set
+       enable_categorical=True on the estimator when needed.
+
+    This is safe regardless of whether the pipeline has a preprocessing step:
+    - Columns handled by a fitted ColumnTransformer are transformed inside the
+      pipeline and don't reach this code path as object dtype.
+    - Passthrough columns that were numeric during training but arrive as strings
+      from an Excel file are the typical case that needs fixing.
+    """
+    # 1. StringDtype → object
+    string_cols = df.select_dtypes(include="string").columns.tolist()
+    if string_cols:
+        df = df.astype({col: "object" for col in string_cols})
+    df.columns = df.columns.astype(object)
+
+    obj_cols = df.select_dtypes(include="object").columns.tolist()
+    if not obj_cols:
+        return df
+
+    df = df.copy()
+    categorical_cols_added: list[str] = []
+
+    for col in obj_cols:
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        non_null = df[col].notna().sum()
+        # Accept the numeric conversion if at least 90 % of non-null values parse.
+        if non_null == 0 or numeric.notna().sum() >= non_null * 0.9:
+            df[col] = numeric
+        else:
+            df[col] = pd.Categorical(df[col])
+            categorical_cols_added.append(col)
+
+    # Enable XGBoost categorical support when Categorical columns are present.
+    if categorical_cols_added:
+        named = getattr(pipeline, "named_steps", {})
+        model = named.get("model") if named else pipeline
+        if model is not None and "XGB" in type(model).__name__:
+            try:
+                model.enable_categorical = True
+            except Exception:
+                pass
+
+    return df
+
+
 def _fix_string_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert pandas 3.0 StringDtype columns to object dtype (FLAML compatibility)."""
+    """Convert pandas 3.0 StringDtype columns to object dtype (FLAML compatibility).
+
+    Kept for backward compatibility; new code should prefer _normalize_input_dtypes.
+    """
     string_cols = df.select_dtypes(include="string").columns.tolist()
     if string_cols:
         df = df.astype({col: "object" for col in string_cols})
@@ -267,18 +325,28 @@ def predict_with_trained_model(
     training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
     feature_names: List[str] = training_schema.get("feature_names") or []
 
-    # Column alignment is handled by ColumnAligner inside the pipeline:
-    # missing columns are filled with NaN, extra columns are dropped.
-    # validate_feature_schema is kept as a strict utility for API-level checks
-    # where the caller wants an explicit error; we don't use it here.
     threshold = _get_optimal_threshold(artifacts, task_type)
 
     is_automl = bool(artifacts.get("automl"))
     if is_automl:
-        raw_df = _fix_string_dtypes(raw_df)
         # Reconstruct any interaction features stored at training time.
         # "automl_feature_pairs" absent = old model without stored pairs; skip gracefully.
         raw_df = _apply_automl_features(raw_df, artifacts)
+
+    # Pre-inference alignment: drop columns unknown to the model and add any
+    # missing columns as NaN.  This is a safety net for pipelines that were
+    # saved before the ColumnAligner step was introduced — without it, models
+    # such as XGBoost reject extra columns with a feature_names mismatch error.
+    if feature_names:
+        raw_df = raw_df.copy()
+        for col in feature_names:
+            if col not in raw_df.columns:
+                raw_df[col] = np.nan
+        raw_df = raw_df[feature_names]
+
+    # Normalize dtypes for all models (StringDtype → object, numeric strings → float,
+    # categorical strings → pd.Categorical with XGBoost enable_categorical support).
+    raw_df = _normalize_input_dtypes(raw_df, pipeline)
 
     y_pred, y_score = _run_inference(pipeline, raw_df, task_type, threshold)
 

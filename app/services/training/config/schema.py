@@ -4,7 +4,7 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
-from .models import MODEL_REGISTRY, list_available_models
+from app.services.training.pipeline.models import MODEL_REGISTRY, list_available_models
 
 TaskType = Literal["classification", "regression"]
 SplitMethod = Literal["holdout", "kfold", "stratified_kfold"]

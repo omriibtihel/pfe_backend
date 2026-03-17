@@ -111,8 +111,9 @@ def _imbalance_stats(y: pd.Series, task_type: str) -> tuple[float | None, float 
 def _feature_types(df: pd.DataFrame, target_col: str) -> dict[str, int]:
     features = df.drop(columns=[target_col], errors="ignore")
     numeric = int(features.select_dtypes(include=[np.number]).shape[1])
-    text = int(
-        features.select_dtypes(include=["object", "string"])
+    _text_df = features.select_dtypes(include=["object", "string"])
+    text = 0 if _text_df.empty else int(
+        _text_df
         .apply(lambda s: s.dropna().str.split().str.len().median() or 0)
         .gt(5)
         .sum()

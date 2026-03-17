@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from app.services.training.splitters import make_holdout_split
+from app.services.training.pipeline.splitters import make_holdout_split
 
 
 def _binary_dataset(n_majority: int, n_minority: int, seed: int = 42) -> tuple[pd.DataFrame, np.ndarray]:

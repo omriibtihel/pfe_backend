@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from .metrics import (
+from app.services.training.pipeline.metrics import (
     classification_metrics,
     get_class_labels,
     get_proba_or_score,

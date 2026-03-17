@@ -5,12 +5,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.services.training.dataset_profiler import DatasetProfiler
-from app.services.training.recommendation_engine import RecommendationEngine
-from app.services.training.metric_selector import select_metrics
-from app.services.training.imbalance_handler import recommend_imbalance_strategy
-from app.services.training.config_builder import TrainingConfigBuilder
-from app.services.training.config import TrainingConfig
+from app.services.data.profiler import DatasetProfiler
+from app.services.training.intelligence.recommender import RecommendationEngine
+from app.services.training.intelligence.metric_selector import select_metrics
+from app.services.training.intelligence.imbalance_handler import recommend_imbalance_strategy
+from app.services.training.config.builder import TrainingConfigBuilder
+from app.services.training.config.schema import TrainingConfig
 
 
 profiler = DatasetProfiler()

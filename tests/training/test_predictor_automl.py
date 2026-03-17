@@ -21,13 +21,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.services.training.predictor import (
+from app.services.training.output.predictor import (
     _apply_automl_features,
     _fix_string_dtypes,
     _run_inference,
     predict_with_trained_model,
 )
-from app.services.training.config import TrainingConfig
+from app.services.training.config.schema import TrainingConfig
 from app.services.training.orchestrator import run_one_model
 
 

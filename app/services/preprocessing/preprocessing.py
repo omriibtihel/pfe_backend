@@ -17,7 +17,7 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 
-from .config import PreprocessingConfig
+from app.services.training.config.schema import PreprocessingConfig
 
 
 @dataclass(frozen=True)

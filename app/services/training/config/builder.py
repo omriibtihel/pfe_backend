@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .recommendation_engine import TrainingRecommendation
+from app.services.training.intelligence.recommender import TrainingRecommendation
 
 
 ConfigMode = str  # "intelligent" | "manual"

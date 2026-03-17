@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .dataset_profiler import DatasetProfile
+from app.services.data.profiler import DatasetProfile
 
 
 @dataclass(frozen=True)

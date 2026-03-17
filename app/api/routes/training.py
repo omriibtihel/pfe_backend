@@ -31,21 +31,21 @@ from app.schemas.training import (
     TrainingSessionOut,
     TrainingValidateOut,
 )
-from app.services.training.balancing.profiler import DataProfile, profile_binary_dataset
-from app.services.training.config import get_training_capabilities
-from app.services.training.dataset_loader import load_dataframe, resolve_dataset_path
-from app.services.training.dataset_profiler import DatasetProfiler
+from app.services.balancing.profiler import DataProfile, profile_binary_dataset
+from app.services.training.config.schema import get_training_capabilities
+from app.services.data.loader import load_dataframe, resolve_dataset_path
+from app.services.data.profiler import DatasetProfiler
 from app.services.training.notifier import training_notifier
-from app.services.training.predictor import (
+from app.services.training.output.predictor import (
     predict_rows_json,
     predict_to_csv,
     predict_with_trained_model,
     read_uploaded_dataframe,
 )
-from app.services.training.preview import PreviewValidationError, build_validation_preview
-from app.services.training.recommendation_engine import RecommendationEngine
+from app.services.data.preview import PreviewValidationError, build_validation_preview
+from app.services.training.intelligence.recommender import RecommendationEngine
 from app.services.training.utils import to_python_scalar
-from app.services.training.validation import validate_training_config_payload
+from app.services.training.config.validation import validate_training_config_payload
 from app.services.training_service import run_training_session, run_automl_session
 
 _profiler = DatasetProfiler()

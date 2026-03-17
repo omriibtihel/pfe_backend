@@ -19,14 +19,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.services.training.predictor import (
+from app.services.training.output.predictor import (
     _get_optimal_threshold,
     predict_rows_json,
     predict_to_csv,
     predict_with_trained_model,
     validate_feature_schema,
 )
-from app.services.training.config import TrainingConfig
+from app.services.training.config.schema import TrainingConfig
 from app.services.training.orchestrator import run_one_model
 
 

@@ -18,7 +18,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import label_binarize
 from sklearn.utils.multiclass import type_of_target
 
-from .utils import to_python_scalar
+from app.services.training.utils import to_python_scalar
 
 
 def _to_json_label(value: Any) -> Any:

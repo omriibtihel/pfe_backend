@@ -12,13 +12,13 @@ from app.db.session import SessionLocal
 from app.core.config import PROJECTS_PATH
 from app.models.training import TrainingSession
 
-from app.services.training.config import TrainingConfig
-from app.services.training.dataset_loader import resolve_dataset_path, load_dataframe
+from app.services.training.config.schema import TrainingConfig
+from app.services.data.loader import resolve_dataset_path, load_dataframe
 from app.services.training.orchestrator import run_one_model
-from app.services.training.persistence import save_pipeline, persist_trained_model
+from app.services.training.output.persistence import save_pipeline, persist_trained_model
 from app.services.training.notifier import training_notifier, EventType
-from app.services.training.meta_learner import MetaLearner, build_training_record
-from app.services.training.automl_config import AutoMLConfig
+from app.services.training.intelligence.meta_learner import MetaLearner, build_training_record
+from app.services.training.config.automl import AutoMLConfig
 from app.services.training.automl_runner import run_automl
 
 logger = logging.getLogger(__name__)

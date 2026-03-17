@@ -3,9 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from app.services.training.config import TrainingConfig, get_training_capabilities
+from app.services.training.config.schema import TrainingConfig, get_training_capabilities
 from app.services.training.orchestrator import run_one_model
-from app.services.training.validation import validate_training_config_payload
+from app.services.training.config.validation import validate_training_config_payload
 
 
 def _make_df(rows: int = 180) -> pd.DataFrame:
