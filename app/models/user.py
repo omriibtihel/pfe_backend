@@ -22,6 +22,12 @@ class User(Base):
 
     role: Mapped[UserRole] = mapped_column(Enum(UserRole), default=UserRole.DOCTOR, nullable=False)
     status: Mapped[AccountStatus] = mapped_column(Enum(AccountStatus), default=AccountStatus.PENDING, nullable=False)
+    profile_photo: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    date_of_birth: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    specialty: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    hospital: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
     projects = relationship(
         "Project",

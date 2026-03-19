@@ -20,22 +20,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade():
-    # 1) ajouter nullable=True d'abord (sinon crash si table contient déjà des rows)
-    op.add_column(
-        "processing_operations",
-        sa.Column("params", postgresql.JSONB(), nullable=True),
-    )
-
-    # 2) remplir les NULL existants
-    op.execute("UPDATE processing_operations SET params='{}'::jsonb WHERE params IS NULL")
-
-    # 3) rendre NOT NULL + default
-    op.alter_column(
-        "processing_operations",
-        "params",
-        nullable=False,
-        server_default=sa.text("'{}'::jsonb"),
-    )
+    # ADD COLUMN IF NOT EXISTS : no-op sur DB fraîche (déjà créée par a96b219a7482),
+    # applique le changement sur les anciennes DB locales où la colonne manquait.
+    op.execute("""
+        ALTER TABLE processing_operations
+        ADD COLUMN IF NOT EXISTS params JSONB NOT NULL DEFAULT '{}'::jsonb
+    """)
 
 def downgrade():
     op.drop_column("processing_operations", "params")

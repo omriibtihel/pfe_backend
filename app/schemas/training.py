@@ -16,18 +16,22 @@ CategoricalImputationMethod = Literal["none", "most_frequent", "constant"]
 CategoricalEncodingMethod = Literal["none", "onehot", "label", "ordinal"]
 NumericScalingMethod = Literal["none", "standard", "minmax", "robust", "maxabs"]
 ColumnType = Literal["numeric", "categorical", "ordinal"]
-StrategyChoice = Literal[
-    "none",
-    "class_weight",
-    "smote",
-    "smote_tomek",
-    "random_undersampling",
-    "threshold_optimization",
-]
 ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance"]
-ImbalanceLevel = Literal["balanced", "mild", "moderate", "severe", "critical"]
-DatasetScale = Literal["tiny", "small", "medium", "large"]
-ImpactLevel = Literal["low", "medium", "high"]
+
+# Preparation-related types re-imported from preparation schemas
+from app.schemas.preparation import (  # noqa: E402
+    ImpactLevel,
+    ImbalanceLevel,
+    DatasetScale,
+    StrategyChoice,
+    BinaryClassProfileOut,
+    AvailableStrategyOut,
+    BalanceAnalysisResponse,
+    BalanceAnalysisIn,
+    DatasetProfileIn,
+    FeatureTypesOut,
+    DatasetProfileOut,
+)
 
 # frontend-side aliases: ModelType / MetricType
 ModelType = Literal[
@@ -186,44 +190,6 @@ class AutoMLConfigIn(BaseModel):
     positiveLabel: Optional[Any] = None
 
 
-class BinaryClassProfileOut(BaseModel):
-    label: Any
-    count: int
-    ratio: float
-    role: Literal["majority", "minority"]
-
-
-class AvailableStrategyOut(BaseModel):
-    id: StrategyChoice
-    label: str
-    description: str
-    impact: ImpactLevel
-    recommended: bool
-    feasible: bool
-    infeasible_reason: str | None = None
-
-
-class BalanceAnalysisResponse(BaseModel):
-    needs_balancing: bool
-    imbalance_level: ImbalanceLevel
-    imbalance_ratio: float
-    minority_ratio: float
-    n_samples: int
-    dataset_scale: DatasetScale
-    majority: BinaryClassProfileOut
-    minority: BinaryClassProfileOut
-    summary_message: str
-    warnings: List[str] = Field(default_factory=list)
-    metric_advice: List[str] = Field(default_factory=list)
-    available_strategies: List[AvailableStrategyOut] = Field(default_factory=list)
-    default_recommendation: StrategyChoice
-
-
-class BalanceAnalysisIn(BaseModel):
-    version_id: int = Field(..., ge=1)
-    target_column: str = Field(..., min_length=1)
-
-
 class TrainingSessionOut(BaseModel):
     id: int
     project_id: int
@@ -292,38 +258,6 @@ class ActiveModelOut(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset profiling & recommendation schemas (intelligent mode)
 # ──────────────────────────────────────────────────────────────────────────────
-
-class DatasetProfileIn(BaseModel):
-    """Input for the /profile endpoint."""
-    version_id: int = Field(..., ge=1)
-    target_column: str = Field(..., min_length=1)
-
-
-class FeatureTypesOut(BaseModel):
-    numeric: int
-    categorical: int
-    text: int
-
-
-class DatasetProfileOut(BaseModel):
-    """Output of the /profile endpoint."""
-    n_samples: int
-    n_features: int
-    n_classes: Optional[int] = None
-    task_type: str
-    imbalance_ratio: Optional[float] = None
-    minority_ratio: Optional[float] = None
-    has_missing_values: bool
-    missing_ratio: float
-    feature_types: FeatureTypesOut
-    dimensionality_ratio: float
-    dataset_size_category: str
-    estimated_training_speed: str
-    recommended_cv_strategy: str
-    recommended_resampling: Optional[str] = None
-    recommended_metric: str
-    meta_features: Dict[str, Any] = Field(default_factory=dict)
-
 
 class RecommendIn(BaseModel):
     """Input for the /recommend endpoint."""

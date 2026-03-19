@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.api.routes.auth import router as auth_router
@@ -8,8 +9,9 @@ from app.api.routes.projects import router as projects_router
 from app.api.routes.datasets import router as datasets_router
 from app.api.routes.database import router as database_router
 from app.api.routes.charts import router as charts_router
-from app.api.routes.processing import router as processing_router
+from app.api.routes.nettoyage import router as nettoyage_router
 from app.api.routes.versions import router as versions_router
+from app.api.routes.preparation import router as preparation_router
 from app.api.routes.training import router as training_router
 from app.api.routes.versions_workspace import router as versions_workspace_router
 from app.api.routes.version_schema import router as version_schema_router
@@ -38,6 +40,8 @@ app.add_middleware(
 )
 
 
+app.mount("/static", StaticFiles(directory="storage"), name="static")
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -48,8 +52,9 @@ app.include_router(projects_router, prefix="/api/projects", tags=["Projects"])
 app.include_router(datasets_router, prefix="/api/projects/{project_id}/datasets", tags=["Datasets"])
 app.include_router(database_router, prefix="/api/projects/{project_id}", tags=["Database"])
 app.include_router(charts_router,prefix="/api/projects/{project_id}/datasets",tags=["Charts"])
-app.include_router(processing_router, prefix="/api/projects/{project_id}", tags=["processing"])
+app.include_router(nettoyage_router, prefix="/api/projects/{project_id}", tags=["nettoyage"])
 app.include_router(versions_router, prefix="/api/projects/{project_id}/versions", tags=["versions"])
+app.include_router(preparation_router, prefix="/api/projects/{project_id}/training", tags=["preparation"])
 app.include_router(training_router, prefix="/api/projects/{project_id}/training", tags=["training"])
 app.include_router(versions_workspace_router,prefix="/api/projects/{project_id}/versions",tags=["versions-workspace"],)
 app.include_router(version_schema_router,prefix="/api/projects/{project_id}/versions",tags=["versions-schema"],)

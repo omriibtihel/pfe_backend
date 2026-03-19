@@ -8,7 +8,7 @@ from pathlib import Path
 from app.api.deps import get_current_user, get_db, ensure_project_owner
 from app.models.dataset_version import DatasetVersion
 from app.api.utils.datasets import get_dataset_or_404
-from app.api.utils.processing_df import load_current_df
+from app.api.utils.nettoyage_df import load_current_df
 
 from app.services.column_inference import infer_kind_for_series
 from app.crud import version_column_schema as crud_schema

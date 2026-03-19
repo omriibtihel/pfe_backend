@@ -13,7 +13,7 @@ from app.core.config import PROJECTS_PATH
 from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion
 from app.models.processing_operation import ProcessingOperation
-from app.services.processing_rebuild import rebuild_processed
+from app.services.nettoyage_rebuild import rebuild_processed
 
 
 def _workspace_dir(project_id: int) -> Path:

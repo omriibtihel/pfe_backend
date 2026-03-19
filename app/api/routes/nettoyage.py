@@ -15,10 +15,10 @@ from uuid import uuid4
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
 from app.api.utils.datasets import get_dataset_or_404
-from app.api.utils.processing_df import load_current_df
-from app.schemas.processing import OperationIn, OperationOut
-from app.crud import processing as crud_processing
-from app.services.processing_rebuild import rebuild_processed
+from app.api.utils.nettoyage_df import load_current_df
+from app.schemas.nettoyage import OperationIn, OperationOut
+from app.crud import nettoyage as crud_nettoyage
+from app.services.nettoyage_rebuild import rebuild_processed
 from app.models.dataset_version import DatasetVersion
 from app.core.config import PROJECTS_PATH
 
@@ -406,7 +406,7 @@ def _validate_schema_decision(payload: SchemaDecisionIn, df_current: pd.DataFram
 # -----------------------------
 # Routes
 # -----------------------------
-@router.get("/datasets/{dataset_id}/processing/operations", response_model=list[OperationOut])
+@router.get("/datasets/{dataset_id}/nettoyage/operations", response_model=list[OperationOut])
 def list_operations(
     project_id: int,
     dataset_id: int,
@@ -414,10 +414,10 @@ def list_operations(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    return crud_processing.list_operations(db, project_id, dataset_id)
+    return crud_nettoyage.list_operations(db, project_id, dataset_id)
 
 
-@router.post("/datasets/{dataset_id}/processing/operations", response_model=OperationOut)
+@router.post("/datasets/{dataset_id}/nettoyage/operations", response_model=OperationOut)
 def apply_operation(
     project_id: int,
     dataset_id: int,
@@ -431,7 +431,7 @@ def apply_operation(
     df_current = load_current_df(ds.file_path, dataset_id)
     _validate_cleaning_payload(payload, df_current)
 
-    op = crud_processing.create_operation(
+    op = crud_nettoyage.create_operation(
         db=db,
         project_id=project_id,
         dataset_id=dataset_id,
@@ -446,14 +446,14 @@ def apply_operation(
         rebuild_processed(db, project_id, dataset_id)
     except Exception as e:
         db.rollback()
-        crud_processing.pop_last_operation(db, project_id, dataset_id, op_type="cleaning")
+        crud_nettoyage.pop_last_operation(db, project_id, dataset_id, op_type="cleaning")
         raise HTTPException(status_code=400, detail=str(e))
 
     db.refresh(op)
     return op
 
 
-@router.post("/datasets/{dataset_id}/processing/schema", response_model=OperationOut)
+@router.post("/datasets/{dataset_id}/nettoyage/schema", response_model=OperationOut)
 def apply_schema_decision(
     project_id: int,
     dataset_id: int,
@@ -487,7 +487,7 @@ def apply_schema_decision(
             else f"Schema: undismissed alert ({params.get('alert_key')})"
         )
 
-    op = crud_processing.create_operation(
+    op = crud_nettoyage.create_operation(
         db=db,
         project_id=project_id,
         dataset_id=dataset_id,
@@ -502,8 +502,8 @@ def apply_schema_decision(
     return op
 
 
-@router.get("/datasets/{dataset_id}/processing/schema")
-@router.get("/datasets/{dataset_id}/processing/schema-state")
+@router.get("/datasets/{dataset_id}/nettoyage/schema")
+@router.get("/datasets/{dataset_id}/nettoyage/schema-state")
 def get_schema_state(
     project_id: int,
     dataset_id: int,
@@ -511,10 +511,10 @@ def get_schema_state(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    return crud_processing.get_schema_state(db, project_id, dataset_id)
+    return crud_nettoyage.get_schema_state(db, project_id, dataset_id)
 
 
-@router.post("/datasets/{dataset_id}/processing/undo")
+@router.post("/datasets/{dataset_id}/nettoyage/undo")
 def undo_last(
     project_id: int,
     dataset_id: int,
@@ -523,7 +523,7 @@ def undo_last(
 ):
     ensure_project_owner(db, project_id, current_user.id)
 
-    last = crud_processing.pop_last_operation(db, project_id, dataset_id, op_type=None)
+    last = crud_nettoyage.pop_last_operation(db, project_id, dataset_id, op_type=None)
     if not last:
         return {"ok": False, "reason": "no_operations"}
 
@@ -533,7 +533,7 @@ def undo_last(
     return {"ok": True, "undone_type": last.op_type, "undone_id": last.id}
 
 
-@router.get("/datasets/{dataset_id}/processing/preview")
+@router.get("/datasets/{dataset_id}/nettoyage/preview")
 def processing_preview(
     project_id: int,
     dataset_id: int,
@@ -549,7 +549,7 @@ def processing_preview(
     return df_preview_payload(df, page, page_size)
 
 
-@router.get("/datasets/{dataset_id}/processing/columns-meta")
+@router.get("/datasets/{dataset_id}/nettoyage/columns-meta")
 def processing_columns_meta(
     project_id: int,
     dataset_id: int,
@@ -562,7 +562,7 @@ def processing_columns_meta(
 
     payload = _columns_meta_payload(df)
 
-    state = crud_processing.get_schema_state(db, project_id, dataset_id)
+    state = crud_nettoyage.get_schema_state(db, project_id, dataset_id)
     overrides = state.get("kind_overrides", {}) or {}
 
     for col in payload.get("columns", []):
@@ -574,7 +574,7 @@ def processing_columns_meta(
     return payload
 
 
-@router.get("/datasets/{dataset_id}/processing/export")
+@router.get("/datasets/{dataset_id}/nettoyage/export")
 def export_cleaned_dataset(
     project_id: int,
     dataset_id: int,
@@ -602,7 +602,7 @@ def export_cleaned_dataset(
     )
 
 
-@router.post("/datasets/{dataset_id}/processing/save")
+@router.post("/datasets/{dataset_id}/nettoyage/save")
 def save_cleaned_as_version(
     project_id: int,
     dataset_id: int,
@@ -614,7 +614,7 @@ def save_cleaned_as_version(
     src = get_dataset_or_404(db, project_id, dataset_id)
     df = load_current_df(src.file_path, dataset_id)
 
-    ops = crud_processing.list_operations(db, project_id, dataset_id)
+    ops = crud_nettoyage.list_operations(db, project_id, dataset_id)
     ops_payload = []
     for o in ops:
         ops_payload.append(

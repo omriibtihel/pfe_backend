@@ -6,9 +6,9 @@ import json
 import os
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.api.utils.processing_df import load_current_df
+from app.api.utils.nettoyage_df import load_current_df
 from app.api.utils.workspaces import get_or_create_workspace_for_version
-from app.crud import processing as crud_processing
+from app.crud import nettoyage as crud_nettoyage
 from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion
 from app.core.config import PROJECTS_PATH
@@ -96,7 +96,7 @@ def commit_workspace(
     version.can_predict = bool(target_value)
 
     # 6) Recréer operations_json depuis le workspace
-    ops = crud_processing.list_operations(db, project_id, ws.id)
+    ops = crud_nettoyage.list_operations(db, project_id, ws.id)
 
     ops_payload = []
     for o in ops:

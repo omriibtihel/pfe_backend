@@ -13,7 +13,7 @@ from sklearn.preprocessing import FunctionTransformer
 from sqlalchemy.orm import Session
 
 from app.services.training.output.audit import build_and_persist_audit
-from app.services.balancing import (
+from app.services.preparation.balancing import (
     BalancingExecutor,
     BalancingDecision,
     DataProfile,
@@ -26,11 +26,11 @@ from app.services.training.config.schema import TrainingConfig, normalize_model_
 from app.services.training.pipeline.evaluator import Evaluator
 from app.services.training.pipeline.metrics import get_class_labels
 from app.services.training.pipeline.models import build_model, get_model_capabilities
-from app.services.preprocessing.preprocessing import build_preprocessor
+from app.services.preparation.preprocessing.preprocessing import build_preprocessor
 from app.services.training.output.reporter import Reporter, build_training_schema
 from app.services.training.pipeline.splitters import make_holdout_split, iter_kfold_splits
 from app.services.training.pipeline.trainer import Trainer
-from app.services.preprocessing.transformers import ColumnAligner
+from app.services.preparation.preprocessing.transformers import ColumnAligner
 
 logger = logging.getLogger(__name__)
 _DENSE_REQUIRED_MODELS = {"naivebayes"}

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GridSearchCV, KFold, RandomizedSearchCV, StratifiedKFold
 
-from app.services.balancing.profiler import is_binary, minority_ratio
+from app.services.preparation.balancing.profiler import is_binary, minority_ratio
 from app.services.training.pipeline.models import get_model_distributions, get_model_grid
 from app.services.training.utils import log_event, to_python_scalar
 

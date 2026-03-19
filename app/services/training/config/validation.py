@@ -5,9 +5,9 @@ from typing import Any
 import pandas as pd
 
 from app.services.training.config.schema import SUPPORTED_SPLIT_METHODS, TrainingConfig, normalize_model_hyperparams
-from app.services.balancing.profiler import class_counts, minority_ratio
+from app.services.preparation.balancing.profiler import class_counts, minority_ratio
 from app.services.training.pipeline.models import MODEL_REGISTRY, list_available_models
-from app.services.preprocessing.preprocessing import resolve_effective_preprocessing_by_column
+from app.services.preparation.preprocessing.preprocessing import resolve_effective_preprocessing_by_column
 from app.services.training.pipeline.splitters import validate_kfold_config
 
 _MISSING_FRIENDLY_MODELS = {"xgboost", "lightgbm"}

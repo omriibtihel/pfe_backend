@@ -1,14 +1,14 @@
-# app/services/processing_rebuild.py
+# app/services/nettoyage_rebuild.py
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
 import pandas as pd
 import numpy as np
 
-from app.crud import processing as crud_processing
+from app.crud import nettoyage as crud_nettoyage
 from app.api.utils.datasets import get_dataset_or_404
 from app.api.utils.df import read_df
-from app.api.utils.processing_df import save_processed_df
+from app.api.utils.nettoyage_df import save_processed_df
 
 # ---------------------------------------------------------------------
 # LIMITED to "safe cleaning" operations.
@@ -435,7 +435,7 @@ def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
     ds = get_dataset_or_404(db, project_id, dataset_id)
     df = read_df(ds.file_path)  # start from SOURCE file
 
-    ops = crud_processing.list_operations_by_type(db, project_id, dataset_id, op_type="cleaning")
+    ops = crud_nettoyage.list_operations_by_type(db, project_id, dataset_id, op_type="cleaning")
 
     alias_map: dict[str, str] = {}
 
@@ -456,7 +456,7 @@ def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
             effect = compute_operation_effect(before, df, op.params or {})
             if extra:
                 effect.update(extra)
-            crud_processing.set_operation_result(db, op.id, effect)
+            crud_nettoyage.set_operation_result(db, op.id, effect)
         except Exception:
             pass
 
