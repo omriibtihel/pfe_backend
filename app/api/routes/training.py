@@ -35,7 +35,8 @@ from app.services.training.output.predictor import (
 )
 from app.services.training.intelligence.recommender import RecommendationEngine
 from app.services.training.utils import to_python_scalar
-from app.services.training_service import run_training_session, run_automl_session
+from app.services.training.training_service import run_training_session, run_automl_session
+from app.api.routes.preparation import _build_binary_profile
 
 _profiler = DatasetProfiler()
 _engine = RecommendationEngine()
@@ -110,6 +111,7 @@ def _extract_automl_fields(metrics_all: dict, artifacts: dict) -> Optional[dict]
     automl_artifacts = artifacts.get("automl") if isinstance(artifacts.get("automl"), dict) else {}
     return {
         "isAutoML": True,
+        "isBest": bool(automl_artifacts.get("is_best", True)),
         "bestEstimator": metrics_all.get("best_estimator"),
         "nIterations": metrics_all.get("n_iterations"),
         "totalTimeS": metrics_all.get("total_time_s"),
@@ -160,6 +162,7 @@ def _extract_cv_fields(
 
     cv_fields = {
         "isCV": is_cv,
+        "nestedCv": bool(metrics_all.get("nested_cv", False)),
         "cvFoldResults": cv_fold_results,
         "cvSummary": cv_summary,
         "kFoldsUsed": k_folds_used,
@@ -273,6 +276,7 @@ def _model_to_front_result(
         **cv_fields,
         "gridSearch": grid_search_block,
         "featureImportance": artifacts.get("feature_importance", []),
+        "curves": artifacts.get("curves", None),
         "confusionMatrix": artifacts.get("confusion_matrix", []),
         "metricsDetailed": metrics,
         "metricsWarnings": metrics.get("warnings", []) if isinstance(metrics, dict) else [],
@@ -663,6 +667,70 @@ def get_session(
 
     active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
     return _session_to_front_session(db, s, active_model_id=active_model_id)
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_session(
+    project_id: int,
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Delete a training session and all its models (cascade)."""
+    _get_owned_project(db, project_id, current_user.id)
+    s = (
+        db.query(TrainingSession)
+        .filter(TrainingSession.id == session_id, TrainingSession.project_id == project_id)
+        .first()
+    )
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Delete pkl files from disk before removing DB rows
+    from pathlib import Path
+    for m in s.models:
+        try:
+            arts = m.artifacts_json if isinstance(m.artifacts_json, dict) else {}
+            pkl = arts.get("model_pkl")
+            if pkl:
+                p = Path(pkl)
+                if p.exists():
+                    p.unlink()
+        except Exception:
+            pass  # Non-fatal
+
+    db.delete(s)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.patch("/sessions/{session_id}")
+def rename_session(
+    project_id: int,
+    session_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Rename a session by storing a `name` key in its config_json."""
+    _get_owned_project(db, project_id, current_user.id)
+    s = (
+        db.query(TrainingSession)
+        .filter(TrainingSession.id == session_id, TrainingSession.project_id == project_id)
+        .first()
+    )
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name must not be empty")
+
+    config = dict(s.config_json) if isinstance(s.config_json, dict) else {}
+    config["name"] = name
+    s.config_json = config
+    db.commit()
+    return {"id": str(s.id), "name": name}
 
 
 @router.get("/saved-models")

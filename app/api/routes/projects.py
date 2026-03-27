@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm.exc import StaleDataError
 
 
 from app.api.deps import get_db, get_current_user
@@ -55,13 +56,13 @@ def create_project(
     try:
         project_dir = _project_storage_dir(project.id)
         (project_dir / "datasets").mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except OSError as e:
         db.delete(project)
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create project storage directories",
-        )
+        ) from e
 
     return project
 
@@ -100,7 +101,11 @@ def delete_project(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    project = _get_owned_project(db, project_id, current_user.id)
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return None  # déjà supprimé — DELETE est idempotent
+    if project.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
 
     try:
         project.active_dataset_id = None
@@ -110,9 +115,14 @@ def delete_project(
         db.commit()
         return None
 
+    except StaleDataError:
+        # Suppression concurrente — déjà supprimé par une autre requête
+        db.rollback()
+        return None
+
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete project: {e}",
-        )
+        ) from e

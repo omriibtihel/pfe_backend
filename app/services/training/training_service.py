@@ -55,8 +55,8 @@ def _append_session_message(db: Session, s: TrainingSession, msg: str):
 
 def run_training_session(session_id: int) -> None:
     """
-    Worker appelé par ta route (background task).
-    Version PRO (refactor) : split->preprocess->smote(train only)->fit->eval->persist.
+    Worker appelé par la route (background task).
+    split->preprocess->smote(train only)->fit->eval->persist.
     Pour l’instant: orchestrator = HOLDOUT (kfold arrive juste après).
     """
     t_start = time.monotonic()
@@ -115,21 +115,28 @@ def run_training_session(session_id: int) -> None:
                     session_id=s.id,
                 )
 
-                # save artifact
+                # save artifact then persist to DB atomically:
+                # if DB write fails, remove the orphaned pkl so disk stays clean.
                 pkl_path = save_pipeline(res.fitted_pipeline, out_dir, model_type)
                 res.artifacts_json["model_pkl"] = str(pkl_path)
                 res.artifacts_json["dataset_version_id"] = dv_id
 
-                # persist trained model
-                persist_trained_model(
-                    db,
-                    session_id=session_id,
-                    project_id=s.project_id,
-                    model_type=str(model_type),
-                    task_type=str(res.task_type),
-                    metrics_json=res.metrics_json,
-                    artifacts_json=res.artifacts_json,
-                )
+                try:
+                    persist_trained_model(
+                        db,
+                        session_id=session_id,
+                        project_id=s.project_id,
+                        model_type=str(model_type),
+                        task_type=str(res.task_type),
+                        metrics_json=res.metrics_json,
+                        artifacts_json=res.artifacts_json,
+                    )
+                except Exception:
+                    try:
+                        pkl_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise
 
                 success_count += 1
 

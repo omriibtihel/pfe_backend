@@ -1,19 +1,16 @@
 """
-TrainingConfigBuilder — Phase 6
-Central merge point between:
-  - a system-generated recommendation (mode="intelligent"),
-  - user overrides (mode="manual" or partial adjustments in "intelligent" mode).
+TrainingConfigBuilder
+Central merge point for building a training-config payload.
+
+Two paths:
+  - build_from_recommendation(recommendation, user_overrides) → config pre-filled
+    by the recommendation engine, with optional user adjustments applied on top.
+    Always tagged configMode="manual" since the user validates the config
+    in the wizard before launching.
+  - build_manual(user_payload) → config as submitted by the user, verbatim.
 
 The output is always a plain dict payload compatible with
-``TrainingConfig.from_front()``.  The builder never calls from_front()
-directly so that callers can inspect/validate the payload first.
-
-Rules
------
-* mode="intelligent" (no overrides)  → use recommendation payload as-is.
-* mode="intelligent" + user_overrides → deep-merge overrides on top.
-* mode="manual"                       → use user payload as-is (system
-  recommendations are shown in UI only, never injected silently).
+``TrainingConfig.from_front()``.
 """
 from __future__ import annotations
 
@@ -23,10 +20,9 @@ from typing import Any
 from app.services.training.intelligence.recommender import TrainingRecommendation
 
 
-ConfigMode = str  # "intelligent" | "manual"
+ConfigMode = str  # "manual" | "automl"
 
-# Keys that the user is allowed to override in intelligent mode.
-# Everything else in the recommendation payload is authoritative.
+# Keys the user can adjust when the wizard pre-fills from a recommendation.
 _OVERRIDABLE_KEYS = {
     "models",
     "searchType",
@@ -49,36 +45,36 @@ class TrainingConfigBuilder:
     Build a final training-config payload from a recommendation and/or
     user-supplied overrides.
 
-    Usage (intelligent mode, user accepted recommendation as-is)::
+    Usage (wizard pre-filled by recommendation, user accepted as-is)::
 
         builder = TrainingConfigBuilder()
-        payload = builder.build_intelligent(recommendation)
+        payload = builder.build_from_recommendation(recommendation)
 
-    Usage (intelligent mode, user tweaked some fields)::
+    Usage (wizard pre-filled, user tweaked some fields)::
 
-        payload = builder.build_intelligent(recommendation, user_overrides={
+        payload = builder.build_from_recommendation(recommendation, user_overrides={
             "models": ["logisticregression"],
             "searchType": "grid",
         })
 
-    Usage (manual mode)::
+    Usage (fully manual)::
 
         payload = builder.build_manual(user_payload)
     """
 
-    def build_intelligent(
+    def build_from_recommendation(
         self,
         recommendation: TrainingRecommendation,
         user_overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Start from the recommendation payload and apply user overrides.
-        Only keys in ``_OVERRIDABLE_KEYS`` are applied from overrides to
-        prevent the user silently breaking authoritative system decisions
-        (task_type, target_column, datasetVersionId).
+        Only keys in ``_OVERRIDABLE_KEYS`` are applied from overrides.
+        Always tagged configMode="manual" — the recommendation is a pre-fill
+        helper in the wizard, not a separate training mode.
         """
         payload = copy.deepcopy(recommendation.training_config_payload)
-        payload["configMode"] = "intelligent"
+        payload["configMode"] = "manual"
 
         if user_overrides:
             for key, value in user_overrides.items():
@@ -109,7 +105,6 @@ class TrainingConfigBuilder:
 
     def resolve(
         self,
-        mode: ConfigMode,
         *,
         recommendation: TrainingRecommendation | None = None,
         user_payload: dict[str, Any] | None = None,
@@ -118,30 +113,16 @@ class TrainingConfigBuilder:
         """
         Unified entry point.
 
-        Parameters
-        ----------
-        mode:
-            "intelligent" or "manual".
-        recommendation:
-            Required when mode="intelligent".
-        user_payload:
-            Required when mode="manual".
-            Also used to supply target_column, datasetVersionId, etc. in
-            intelligent mode (non-overridable metadata).
-        user_overrides:
-            Optional extra overrides applied on top of the recommendation
-            in intelligent mode.
+        - recommendation provided → pre-fill from recommendation, apply overrides,
+          inject metadata from user_payload (targetColumn, datasetVersionId, etc.).
+        - recommendation=None → use user_payload as-is (fully manual).
         """
-        if mode == "manual":
+        if recommendation is None:
             if user_payload is None:
-                raise ValueError("user_payload is required in manual mode.")
+                raise ValueError("user_payload is required when no recommendation is provided.")
             return self.build_manual(user_payload)
 
-        # intelligent mode
-        if recommendation is None:
-            raise ValueError("recommendation is required in intelligent mode.")
-
-        payload = self.build_intelligent(recommendation, user_overrides)
+        payload = self.build_from_recommendation(recommendation, user_overrides)
 
         # Inject non-overridable metadata from user_payload
         if user_payload:

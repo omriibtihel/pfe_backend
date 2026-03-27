@@ -5,10 +5,15 @@ from typing import Any
 import pandas as pd
 
 from app.services.training.config.schema import SUPPORTED_SPLIT_METHODS, TrainingConfig, normalize_model_hyperparams
-from app.services.preparation.balancing.profiler import class_counts, minority_ratio
+from app.services.preparation_ml.balancing.profiler import class_counts, minority_ratio
 from app.services.training.pipeline.models import MODEL_REGISTRY, list_available_models
-from app.services.preparation.preprocessing.preprocessing import resolve_effective_preprocessing_by_column
-from app.services.training.pipeline.splitters import validate_kfold_config
+from app.services.preparation_ml.preprocessing.preprocessing import resolve_effective_preprocessing_by_column
+from app.services.preparation_ml.splitters import (
+    validate_kfold_config,
+    validate_repeated_kfold_config,
+    validate_group_kfold_config,
+    validate_loo_config,
+)
 
 _MISSING_FRIENDLY_MODELS = {"xgboost", "lightgbm"}
 _SKLEARN_MODELS = set(MODEL_REGISTRY._specs.keys()) - _MISSING_FRIENDLY_MODELS
@@ -232,7 +237,13 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
         )
 
     # ── CV-specific validation ────────────────────────────────────────────────
-    is_cv = cfg.split_method in ("kfold", "stratified_kfold")
+    _ALL_CV_METHODS = {
+        "kfold", "stratified_kfold",
+        "repeated_stratified_kfold",
+        "group_kfold", "stratified_group_kfold",
+        "loo",
+    }
+    is_cv = cfg.split_method in _ALL_CV_METHODS
     if is_cv:
         # stratified_kfold only for classification
         if cfg.split_method == "stratified_kfold" and cfg.task_type != "classification":
@@ -241,13 +252,13 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
                 "splitMethod='stratified_kfold' est réservé à la classification. "
                 "Pour la régression, utilisez splitMethod='kfold'.",
             )
-        # kFolds bounds
-        if cfg.k_folds < 2:
-            _append_unique(errors, "kFolds doit être >= 2.")
-        elif cfg.k_folds > 20:
-            _append_unique(errors, "kFolds doit être <= 20.")
-        # trainRatio / valRatio are irrelevant in CV mode — warn if they were customised.
-        # testRatio is *not* ignored: when > 0, it carves out a holdout test set before CV.
+        # kFolds bounds (not relevant for LOO)
+        if cfg.split_method != "loo":
+            if cfg.k_folds < 2:
+                _append_unique(errors, "kFolds doit être >= 2.")
+            elif cfg.k_folds > 20:
+                _append_unique(errors, "kFolds doit être <= 20.")
+        # trainRatio / valRatio are irrelevant in CV mode
         holdout_ratios_customised = (
             abs(cfg.train_ratio - 0.70) > 0.01
             or abs(cfg.val_ratio - 0.15) > 0.01
@@ -260,7 +271,12 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
             )
         # testRatio > 0 in CV mode = intentional holdout test set; validate bound
         if cfg.test_ratio > 0:
-            if cfg.test_ratio > 0.40:
+            if cfg.split_method == "loo":
+                _append_unique(
+                    warnings,
+                    "testRatio ignoré en mode LOO (pas de holdout test séparé).",
+                )
+            elif cfg.test_ratio > 0.40:
                 _append_unique(
                     errors,
                     f"testRatio={int(cfg.test_ratio * 100)}% est trop élevé en mode CV "
@@ -270,9 +286,50 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
         if cfg.use_grid_search:
             _append_unique(
                 warnings,
-                "useGridSearch=true avec splitMethod=kfold/stratified_kfold: "
+                f"useGridSearch=true avec splitMethod={cfg.split_method}: "
                 "le GridSearch est désactivé pendant la boucle par fold (évite le double-CV) "
                 "et appliqué uniquement lors du refit final sur l'ensemble des données.",
+            )
+
+        # ── repeated_stratified_kfold ─────────────────────────────────────────
+        if cfg.split_method == "repeated_stratified_kfold":
+            if cfg.task_type != "classification":
+                _append_unique(
+                    errors,
+                    "splitMethod='repeated_stratified_kfold' est réservé à la classification.",
+                )
+            n_repeats = int(getattr(cfg, "n_repeats", 3))
+            if n_repeats < 1:
+                _append_unique(errors, "nRepeats doit être >= 1.")
+            elif cfg.k_folds >= 2 and cfg.k_folds * n_repeats > 100:
+                _append_unique(
+                    warnings,
+                    f"kFolds ({cfg.k_folds}) × nRepeats ({n_repeats}) = "
+                    f"{cfg.k_folds * n_repeats} folds: l'entraînement peut être lent.",
+                )
+
+        # ── group_kfold / stratified_group_kfold ─────────────────────────────
+        if cfg.split_method in ("group_kfold", "stratified_group_kfold"):
+            gc = getattr(cfg, "group_column", None)
+            if not gc:
+                _append_unique(
+                    errors,
+                    f"splitMethod='{cfg.split_method}' requiert groupColumn "
+                    "(nom de la colonne identifiant le groupe, ex: 'patient_id').",
+                )
+            if cfg.split_method == "stratified_group_kfold" and cfg.task_type != "classification":
+                _append_unique(
+                    errors,
+                    "splitMethod='stratified_group_kfold' est réservé à la classification. "
+                    "Utilisez 'group_kfold' pour la régression.",
+                )
+
+        # ── loo ───────────────────────────────────────────────────────────────
+        if cfg.split_method == "loo" and cfg.use_grid_search:
+            _append_unique(
+                warnings,
+                "LOO avec useGridSearch=true: le GridSearch est désactivé par fold "
+                "(coûteux) et appliqué uniquement lors du refit final.",
             )
 
     if cfg.target_column and cfg.target_column not in df.columns:
@@ -319,11 +376,10 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
     X = df2.drop(columns=[cfg.target_column])
 
     # ── Data-aware CV validation (needs actual y values) ──────────────────────
+    import numpy as _np
+
     if cfg.split_method in ("kfold", "stratified_kfold"):
-        import numpy as _np
         _y_cv = df2[cfg.target_column].to_numpy()
-        # When testRatio > 0 the CV loop only sees (1 - testRatio) of the data.
-        # Validate kFolds against that reduced count to catch the error early.
         if cfg.test_ratio > 0:
             _n_cv_approx = max(1, int(len(X) * (1.0 - cfg.test_ratio)))
             if cfg.k_folds > _n_cv_approx:
@@ -334,14 +390,44 @@ def validate_training_config_payload(payload: dict[str, Any], df: pd.DataFrame) 
                     f"{int(cfg.test_ratio * 100)}%).",
                 )
         cv_errors = validate_kfold_config(
-            X,
-            _y_cv,
-            split_method=cfg.split_method,
-            k_folds=cfg.k_folds,
-            task_type=cfg.task_type,
+            X, _y_cv, split_method=cfg.split_method,
+            k_folds=cfg.k_folds, task_type=cfg.task_type,
         )
         for cv_err in cv_errors:
             _append_unique(errors, cv_err)
+
+    if cfg.split_method == "repeated_stratified_kfold":
+        _y_cv = df2[cfg.target_column].to_numpy()
+        n_repeats = int(getattr(cfg, "n_repeats", 3))
+        rk_errors = validate_repeated_kfold_config(
+            X, _y_cv, split_method=cfg.split_method,
+            k_folds=cfg.k_folds, n_repeats=n_repeats, task_type=cfg.task_type,
+        )
+        for rk_err in rk_errors:
+            _append_unique(errors, rk_err)
+
+    if cfg.split_method in ("group_kfold", "stratified_group_kfold"):
+        _y_cv = df2[cfg.target_column].to_numpy()
+        gc = getattr(cfg, "group_column", None)
+        if gc and gc in df2.columns:
+            _groups = _np.asarray(df2[gc].values)
+            gk_errors = validate_group_kfold_config(
+                X, _y_cv, _groups, split_method=cfg.split_method,
+                k_folds=cfg.k_folds, task_type=cfg.task_type,
+            )
+            for gk_err in gk_errors:
+                _append_unique(errors, gk_err)
+        elif gc and cfg.target_column:
+            # group_column provided but not found in dataset — already caught above
+            _append_unique(
+                errors,
+                f"groupColumn='{gc}' introuvable dans le dataset.",
+            )
+
+    if cfg.split_method == "loo":
+        loo_errors = validate_loo_config(X, df2[cfg.target_column].to_numpy())
+        for loo_err in loo_errors:
+            _append_unique(errors, loo_err)
 
     if cfg.task_type == "classification":
         y_values = df2[cfg.target_column].to_numpy()

@@ -126,6 +126,70 @@ def get_version_columns_meta(
     return _build_columns_meta(df, schema_map)
 
 
+@router.get("/{version_id}/column-values")
+def get_version_column_values(
+    project_id: int,
+    version_id: int,
+    column: str = Query(..., description="Column name to get unique values for"),
+    max_values: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Return sorted unique non-null values for a specific column (used for positive label selector)."""
+    ensure_project_owner(db, project_id, current_user.id)
+    df = _load_version_df(db, project_id, version_id)
+    if column not in df.columns:
+        raise HTTPException(status_code=404, detail=f"Column '{column}' not found")
+    unique_vals = sorted(
+        df[column].dropna().astype(str).unique().tolist()
+    )[:max_values]
+    return {"column": column, "values": unique_vals, "total": len(unique_vals)}
+
+
+@router.get("/{version_id}/column-distribution")
+def get_version_column_distribution(
+    project_id: int,
+    version_id: int,
+    column: str = Query(..., description="Column name to get distribution for"),
+    max_bins: int = Query(default=20, ge=2, le=100),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Return value distribution for a column:
+    - Categorical/low-cardinality: sorted value counts (up to max_bins entries).
+    - Numeric/high-cardinality: histogram with max_bins buckets.
+    """
+    ensure_project_owner(db, project_id, current_user.id)
+    df = _load_version_df(db, project_id, version_id)
+    if column not in df.columns:
+        raise HTTPException(status_code=404, detail=f"Column '{column}' not found")
+
+    series = df[column].dropna()
+    total = len(series)
+    n_unique = series.nunique()
+
+    # Categorical / low-cardinality: return value counts
+    if n_unique <= max_bins or not pd.api.types.is_numeric_dtype(series):
+        counts = series.astype(str).value_counts().head(max_bins)
+        bars = [{"label": str(label), "count": int(cnt)} for label, cnt in counts.items()]
+        return {"type": "categorical", "column": column, "total": total, "bars": bars}
+
+    # Numeric / high-cardinality: histogram
+    import numpy as np
+    counts, edges = np.histogram(series.astype(float).dropna(), bins=max_bins)
+    bars = [
+        {
+            "label": f"{edges[i]:.2g}–{edges[i+1]:.2g}",
+            "count": int(counts[i]),
+            "rangeMin": float(edges[i]),
+            "rangeMax": float(edges[i + 1]),
+        }
+        for i in range(len(counts))
+    ]
+    return {"type": "histogram", "column": column, "total": total, "bars": bars}
+
+
 @router.post("/{version_id}/column-kinds")
 def set_version_column_kinds(
     project_id: int,

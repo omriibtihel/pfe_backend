@@ -1,11 +1,14 @@
 # app/services/nettoyage_rebuild.py
 from __future__ import annotations
 
+import logging
 from sqlalchemy.orm import Session
 import pandas as pd
 import numpy as np
 
 from app.crud import nettoyage as crud_nettoyage
+
+logger = logging.getLogger(__name__)
 from app.api.utils.datasets import get_dataset_or_404
 from app.api.utils.df import read_df
 from app.api.utils.nettoyage_df import save_processed_df
@@ -125,7 +128,7 @@ def _strip_whitespace(
     cols: list[str] | None,
     *,
     strict: bool = STRICT_REBUILD,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     df2 = df.copy()
 
     if not cols:
@@ -136,19 +139,24 @@ def _strip_whitespace(
                 cols.append(str(c))
 
     if not cols:
-        return df2
+        return df2, {}
 
     present, missing = _split_existing_missing(df2, cols)
     if missing and strict:
         raise ValueError(f"Colonnes introuvables: {missing}")
     if not present:
-        return df2
+        return df2, {}
 
+    per_column: dict = {}
     for c in present:
         s = df2[c]
         if pd.api.types.is_string_dtype(s) or pd.api.types.is_object_dtype(s):
-            df2[c] = s.astype("string").str.strip()
-    return df2
+            stripped = s.astype("string").str.strip()
+            changed = int((stripped != s.astype("string")).sum())
+            df2[c] = stripped
+            per_column[c] = {"changed_count": changed}
+
+    return df2, {"per_column": per_column}
 
 
 # -----------------------------
@@ -409,7 +417,9 @@ def _apply_one(
             present, missing = _split_existing_missing(df, subset)
             if missing:
                 extra["ignored_missing_cols"] = missing
-        return _strip_whitespace(df, cols=subset, strict=STRICT_REBUILD), extra
+        df2, strip_eff = _strip_whitespace(df, cols=subset, strict=STRICT_REBUILD)
+        extra.update(strip_eff)
+        return df2, extra
 
     if action == "substitute_values":
         if len(cols) != 1:
@@ -458,6 +468,6 @@ def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
                 effect.update(extra)
             crud_nettoyage.set_operation_result(db, op.id, effect)
         except Exception:
-            pass
+            logger.warning("rebuild_processed: failed to compute/store effect for op %s", op.id, exc_info=True)
 
     save_processed_df(df, ds.file_path, dataset_id)

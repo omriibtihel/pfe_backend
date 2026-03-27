@@ -844,6 +844,234 @@ MODEL_REGISTRY = ModelRegistry()
 
 
 # ---------------------------------------------------------------------------
+# Adaptive parameter grids (dataset-aware: size + imbalance)
+# ---------------------------------------------------------------------------
+#
+# Design goals:
+#   - Combo count stays manageable → fast GridSearch at all sizes
+#   - Tiny  (<  500): ≤ 20 combos   (each fold has few samples)
+#   - Small (< 2000): ≤ 80 combos   (exhaustive grid still feasible)
+#   - Medium(<50000): ≤ 100 combos  (mostly for RandomSearch; compact for Grid)
+#   - Large (≥50000): ≤ 20 combos   (only a light sweep if grid is requested)
+#   - Imbalanced classification: inject class_weight=["balanced", None]
+#     for models that support it (doubles combos, still within budget).
+#
+# These override the static ModelSpec.param_grid when n_samples is known.
+# ---------------------------------------------------------------------------
+
+_ADAPTIVE_GRIDS: Dict[str, Dict[str, Dict[str, Dict[str, list]]]] = {
+    # model → task → size_cat → {param: [values]}
+    "randomforest": {
+        "classification": {
+            "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
+            "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [1, 4], "max_features": ["sqrt", "log2"]},
+            "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
+        },
+        "regression": {
+            "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
+            "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [2, 5], "max_features": ["sqrt", "log2"]},
+            "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
+        },
+    },
+    "logisticregression": {
+        "classification": {
+            "tiny":   {"C": [0.1, 1.0, 10.0]},
+            "small":  {"C": [0.01, 0.1, 1.0, 10.0], "solver": ["liblinear", "saga"]},
+            "medium": {"C": [0.01, 0.1, 1.0, 10.0], "solver": ["liblinear", "saga"], "l1_ratio": [0, 1]},
+            "large":  {"C": [0.1, 1.0, 10.0]},
+        },
+    },
+    "svm": {
+        "classification": {
+            "tiny":   {"C": [0.1, 1.0, 10.0]},
+            "small":  {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"]},
+            "medium": {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"], "kernel": ["rbf", "linear"]},
+            "large":  {"C": [0.1, 1.0]},
+        },
+        "regression": {
+            "tiny":   {"C": [0.1, 1.0, 10.0]},
+            "small":  {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"]},
+            "medium": {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"], "epsilon": [0.01, 0.1, 0.5]},
+            "large":  {"C": [0.1, 1.0], "epsilon": [0.1, 0.5]},
+        },
+    },
+    "knn": {
+        "classification": {
+            "tiny":   {"n_neighbors": [3, 5, 9]},
+            "small":  {"n_neighbors": [3, 5, 9, 15], "weights": ["uniform", "distance"]},
+            "medium": {"n_neighbors": [3, 5, 9, 15, 21], "weights": ["uniform", "distance"]},
+            "large":  {"n_neighbors": [5, 9, 15]},
+        },
+        "regression": {
+            "tiny":   {"n_neighbors": [3, 5, 9]},
+            "small":  {"n_neighbors": [3, 5, 9, 15], "weights": ["uniform", "distance"]},
+            "medium": {"n_neighbors": [3, 5, 9, 15, 21], "weights": ["uniform", "distance"]},
+            "large":  {"n_neighbors": [5, 9, 15]},
+        },
+    },
+    "naivebayes": {
+        "classification": {
+            "tiny":   {"var_smoothing": [1e-11, 1e-9, 1e-7, 1e-5]},
+            "small":  {"var_smoothing": [1e-11, 1e-9, 1e-7, 1e-5]},
+            "medium": {"var_smoothing": [1e-11, 1e-9, 1e-7, 1e-5]},
+            "large":  {"var_smoothing": [1e-9, 1e-7, 1e-5]},
+        },
+    },
+    "decisiontree": {
+        "classification": {
+            "tiny":   {"max_depth": [3, 7, None]},
+            "small":  {"max_depth": [3, 7, 15, None], "min_samples_leaf": [1, 4]},
+            "medium": {"max_depth": [3, 7, 15, None], "min_samples_leaf": [1, 4, 10], "criterion": ["gini", "entropy"]},
+            "large":  {"max_depth": [3, 7, None], "min_samples_leaf": [1, 4]},
+        },
+        "regression": {
+            "tiny":   {"max_depth": [3, 7, None]},
+            "small":  {"max_depth": [3, 7, 15, None], "min_samples_leaf": [2, 5]},
+            "medium": {"max_depth": [3, 7, 15, None], "min_samples_leaf": [2, 5, 10]},
+            "large":  {"max_depth": [3, 7, None], "min_samples_leaf": [2, 5]},
+        },
+    },
+    # XGBoost: old static grid had 972 combos — replaced by size-aware compact grids
+    "xgboost": {
+        "classification": {
+            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]},
+            "small":  {"n_estimators": [200, 400], "learning_rate": [0.03, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0]},
+            "medium": {"n_estimators": [200, 400], "learning_rate": [0.05, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0]},
+            "large":  {"n_estimators": [200, 400], "learning_rate": [0.1, 0.2], "max_depth": [3, 6]},
+        },
+        "regression": {
+            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]},
+            "small":  {"n_estimators": [200, 400], "learning_rate": [0.03, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0]},
+            "medium": {"n_estimators": [200, 400], "learning_rate": [0.05, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0]},
+            "large":  {"n_estimators": [200, 400], "learning_rate": [0.1, 0.2], "max_depth": [3, 6]},
+        },
+    },
+    "lightgbm": {
+        "classification": {
+            "tiny":   {"n_estimators": [200, 300], "learning_rate": [0.05, 0.1], "num_leaves": [15, 31]},
+            "small":  {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63]},
+            "medium": {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63, 127], "min_child_samples": [10, 30]},
+            "large":  {"n_estimators": [300, 500], "learning_rate": [0.05, 0.1], "num_leaves": [31, 63]},
+        },
+        "regression": {
+            "tiny":   {"n_estimators": [200, 300], "learning_rate": [0.05, 0.1], "num_leaves": [15, 31]},
+            "small":  {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63]},
+            "medium": {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63, 127], "min_child_samples": [10, 30]},
+            "large":  {"n_estimators": [300, 500], "learning_rate": [0.05, 0.1], "num_leaves": [31, 63]},
+        },
+    },
+    "extratrees": {
+        "classification": {
+            "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
+            "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [1, 4], "max_features": ["sqrt", "log2"]},
+            "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
+        },
+        "regression": {
+            "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
+            "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [2, 5], "max_features": ["sqrt", "log2"]},
+            "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
+        },
+    },
+    "gradientboosting": {
+        "classification": {
+            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1]},
+            "small":  {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5]},
+            "medium": {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "subsample": [0.7, 1.0]},
+            "large":  {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1], "max_depth": [3]},
+        },
+        "regression": {
+            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1]},
+            "small":  {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5]},
+            "medium": {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "subsample": [0.7, 1.0]},
+            "large":  {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1], "max_depth": [3]},
+        },
+    },
+    "ridge": {
+        "regression": {
+            "tiny":   {"alpha": [0.1, 1.0, 10.0]},
+            "small":  {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
+            "medium": {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
+            "large":  {"alpha": [0.1, 1.0, 10.0, 100.0]},
+        },
+    },
+}
+
+# Models that support class_weight — used to inject it in grids for imbalanced data
+_CLASS_WEIGHT_MODELS = frozenset({"randomforest", "logisticregression", "svm", "decisiontree", "extratrees"})
+
+# n_iter budget for RandomizedSearchCV per dataset size
+_RANDOM_SEARCH_N_ITER: Dict[str, int] = {
+    "tiny":   20,
+    "small":  30,
+    "medium": 50,
+    "large":  60,
+}
+
+
+def _n_samples_to_size_cat(n_samples: int) -> str:
+    if n_samples < 500:
+        return "tiny"
+    if n_samples < 2_000:
+        return "small"
+    if n_samples < 50_000:
+        return "medium"
+    return "large"
+
+
+def get_adaptive_model_grid(
+    model_type: str,
+    task_type: str,
+    *,
+    n_samples: int,
+    imbalanced: bool = False,
+) -> Dict[str, list]:
+    """
+    Return a context-aware param grid for GridSearchCV.
+
+    - Grid size scales with ``n_samples``:
+        tiny (<500)   → ≤ 20 combos
+        small (<2000) → ≤ 80 combos
+        medium        → ≤ 100 combos
+        large         → ≤ 20 combos
+    - For imbalanced classification with supporting models,
+      ``class_weight=["balanced", None]`` is injected so GridSearch
+      can evaluate both class-weight strategies.
+    - Falls back to the static ModelSpec grid when no adaptive grid is defined.
+    """
+    model_key = MODEL_REGISTRY.normalize_name(model_type)
+    size_cat = _n_samples_to_size_cat(n_samples)
+
+    adaptive = _ADAPTIVE_GRIDS.get(model_key, {}).get(task_type, {}).get(size_cat)
+    if adaptive is None:
+        try:
+            grid = dict(MODEL_REGISTRY.model_grid(model_key, task_type))
+        except RuntimeError:
+            return {}
+    else:
+        grid = dict(adaptive)
+
+    # Inject class_weight for imbalanced classification (supporting models only)
+    if (
+        imbalanced
+        and task_type == "classification"
+        and model_key in _CLASS_WEIGHT_MODELS
+        and "class_weight" not in grid
+    ):
+        grid["class_weight"] = ["balanced", None]
+
+    return grid
+
+
+def get_adaptive_n_iter(n_samples: int) -> int:
+    """Return a sensible ``n_iter`` for RandomizedSearchCV based on dataset size."""
+    return _RANDOM_SEARCH_N_ITER[_n_samples_to_size_cat(n_samples)]
+
+
+# ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
 

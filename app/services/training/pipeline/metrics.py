@@ -11,9 +11,11 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     multilabel_confusion_matrix,
+    precision_recall_curve,
     precision_recall_fscore_support,
     r2_score,
     roc_auc_score,
+    roc_curve,
 )
 from sklearn.preprocessing import label_binarize
 from sklearn.utils.multiclass import type_of_target
@@ -265,6 +267,7 @@ def _compute_multiclass_auc(
     y_score: Any,
     proba: Any,
     warnings: list[str],
+    score_labels: Optional[Sequence[Any]] = None,
 ) -> tuple[Optional[float], Optional[float]]:
     if int(np.unique(y_true).size) < 2:
         warnings.append(
@@ -288,6 +291,21 @@ def _compute_multiclass_auc(
     if score_matrix is None:
         warnings.append("ROC-AUC/PR-AUC unavailable for multiclass: no probability/score matrix.")
         return None, None
+
+    # Reorder score_matrix columns to match `labels` when the model's class order
+    # (score_labels) differs from resolved_labels — prevents column misalignment in AUC.
+    if score_labels is not None and list(score_labels) != list(labels):
+        str_score = [str(s) for s in score_labels]
+        str_labels = [str(lbl) for lbl in labels]
+        if set(str_score) == set(str_labels):
+            try:
+                col_order = [str_score.index(lbl) for lbl in str_labels]
+                score_matrix = score_matrix[:, col_order]
+            except (ValueError, IndexError):
+                warnings.append(
+                    "ROC-AUC/PR-AUC: could not reorder score columns to match labels."
+                )
+                return None, None
 
     if score_matrix.shape[1] != len(labels):
         warnings.append(
@@ -359,6 +377,44 @@ def _compute_multilabel_auc(
         warnings.append(f"PR-AUC unavailable for multilabel: {exc}")
 
     return roc_auc, pr_auc
+
+
+def _downsample_curve(x: np.ndarray, y: np.ndarray, max_points: int = 100) -> list[list[float]]:
+    """Return [[x, y], ...] downsampled to at most max_points points."""
+    n = len(x)
+    if n <= max_points:
+        idx = np.arange(n)
+    else:
+        idx = np.round(np.linspace(0, n - 1, max_points)).astype(int)
+    return [[round(float(x[i]), 6), round(float(y[i]), 6)] for i in idx]
+
+
+def compute_roc_pr_curves(
+    y_true_bin: np.ndarray,
+    score_vector: np.ndarray,
+    *,
+    max_points: int = 100,
+) -> Optional[Dict[str, Any]]:
+    """
+    Compute downsampled ROC and Precision-Recall curves for binary classification.
+
+    Returns a dict with keys:
+      "roc":  [[fpr, tpr], ...]  (max_points entries)
+      "pr":   [[recall, precision], ...]  (max_points entries)
+    or None if computation fails.
+    """
+    try:
+        fpr, tpr, _ = roc_curve(y_true_bin, score_vector)
+        precision_arr, recall_arr, _ = precision_recall_curve(y_true_bin, score_vector)
+        # precision_recall_curve returns arrays in decreasing threshold order; flip so recall is ascending
+        precision_arr = precision_arr[::-1]
+        recall_arr = recall_arr[::-1]
+        return {
+            "roc": _downsample_curve(fpr, tpr, max_points),
+            "pr": _downsample_curve(recall_arr, precision_arr, max_points),
+        }
+    except Exception:
+        return None
 
 
 def compute_classification_metrics(
@@ -618,6 +674,7 @@ def compute_classification_metrics(
             y_score=y_score,
             proba=proba,
             warnings=warnings,
+            score_labels=score_labels,
         )
         global_metrics["roc_auc"] = roc_auc
         global_metrics["pr_auc"] = pr_auc
@@ -698,6 +755,11 @@ def compute_classification_metrics(
     }
     if classification_type == "binary":
         out["binary"] = binary_block
+        # Compute ROC/PR curves (stored so orchestrator can copy them into artifacts_json)
+        if pos_label is not None and score_vector is not None:
+            _y_true_bin = np.asarray(y_true_arr == pos_label, dtype=int)
+            if int(np.unique(_y_true_bin).size) == 2:
+                out["curves"] = compute_roc_pr_curves(_y_true_bin, score_vector)
 
     out.update(legacy_flat)
     return out

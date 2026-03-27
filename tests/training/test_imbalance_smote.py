@@ -5,8 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from app.services.balancing.profiler import ImbalanceLevel, profile_binary_dataset
-from app.services.balancing.resolver import resolve
+from app.services.preparation_ml.balancing import ImbalanceLevel, profile_binary_dataset, resolve
 from app.services.training.config.schema import TrainingConfig
 from app.services.training.orchestrator import run_one_model
 

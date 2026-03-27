@@ -8,8 +8,13 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GridSearchCV, KFold, RandomizedSearchCV, StratifiedKFold
 
-from app.services.preparation.balancing.profiler import is_binary, minority_ratio
-from app.services.training.pipeline.models import get_model_distributions, get_model_grid
+from app.services.preparation_ml.balancing.profiler import is_binary, minority_ratio
+from app.services.training.pipeline.models import (
+    get_adaptive_model_grid,
+    get_adaptive_n_iter,
+    get_model_distributions,
+    get_model_grid,
+)
 from app.services.training.utils import log_event, to_python_scalar
 
 logger = logging.getLogger(__name__)
@@ -183,6 +188,8 @@ class Trainer:
         model_param_grid: Dict[str, list[Any]] | None = None,
         refit_metric_override: str | None = None,
         resampler: Any | None = None,
+        n_samples: int | None = None,
+        imbalanced: bool = False,
     ) -> TrainerFitResult:
         fit_params: Dict[str, Any] = {}
         if fit_sample_weight is not None:
@@ -250,7 +257,13 @@ class Trainer:
                 )
 
             param_distributions = {f"model__{k}": v for k, v in model_distributions.items()}
-            n_iter = int(getattr(cfg, "n_iter_random_search", 40) or 40)
+
+            # Adaptive n_iter: scales with dataset size (20 tiny → 60 large).
+            # User-supplied n_iter_random_search overrides when explicitly set.
+            _n_samples_actual = n_samples if n_samples is not None else int(len(y_train))
+            _adaptive_n_iter = get_adaptive_n_iter(_n_samples_actual)
+            _cfg_n_iter = getattr(cfg, "n_iter_random_search", None)
+            n_iter = int(_cfg_n_iter if _cfg_n_iter else _adaptive_n_iter)
 
             log_event(
                 "training.fit",
@@ -290,11 +303,19 @@ class Trainer:
             )
 
         # ── GridSearchCV ──────────────────────────────────────────────────────
-        model_grid = (
-            dict(model_param_grid)
-            if isinstance(model_param_grid, dict) and model_param_grid
-            else get_model_grid(model_type, task_type)
-        )
+        if isinstance(model_param_grid, dict) and model_param_grid:
+            # Caller provided an explicit grid (e.g. from user hyperparams) — use it verbatim.
+            model_grid = dict(model_param_grid)
+        elif n_samples is not None:
+            # Use the adaptive grid that scales with dataset size and injects
+            # class_weight for imbalanced datasets on supporting models.
+            model_grid = get_adaptive_model_grid(
+                model_type, task_type,
+                n_samples=n_samples,
+                imbalanced=imbalanced,
+            )
+        else:
+            model_grid = get_model_grid(model_type, task_type)
         if not model_grid:
             log_event("training.fit", model_type=model_type, tuning=False, reason="empty_param_grid")
             pipeline.fit(X_train, y_train, **fit_params)
@@ -330,6 +351,11 @@ class Trainer:
             cv_splits=cv_splits,
             refit_metric=refit_metric,
             resampler_in_pipeline=resampler is not None,
+            n_samples=n_samples,
+            imbalanced=imbalanced,
+            n_grid_combos=int(
+                __import__("math").prod(len(v) for v in model_grid.values()) if model_grid else 0
+            ),
         )
 
         gs = GridSearchCV(

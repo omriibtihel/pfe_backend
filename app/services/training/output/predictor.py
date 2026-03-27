@@ -206,21 +206,24 @@ def _run_inference(
     X: pd.DataFrame,
     task_type: str,
     threshold: float,
+    positive_class_index: int = 1,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Run pipeline.predict() with optional threshold application for binary classification.
 
     Returns (y_pred, y_score_col1_or_None).
-    y_score is the probability of the positive class (column index 1 for binary).
+    y_score is the probability of the positive class (column index positive_class_index).
     """
     y_score: Optional[np.ndarray] = None
 
-    # Try to get probability scores
+    # Try to get probability scores (binary only — multiclass has 3+ columns and
+    # extracting a single column would be misleading, so y_score stays None).
     if hasattr(pipeline, "predict_proba"):
         try:
             proba = pipeline.predict_proba(X)
-            if proba is not None and proba.ndim == 2 and proba.shape[1] >= 2:
-                y_score = proba[:, 1].astype(float)
+            if proba is not None and proba.ndim == 2 and proba.shape[1] == 2:
+                pos_col = positive_class_index if positive_class_index < proba.shape[1] else 1
+                y_score = proba[:, pos_col].astype(float)
         except Exception:
             pass
 
@@ -240,7 +243,8 @@ def _run_inference(
                 pass
         is_binary = classes is not None and len(classes) == 2
         if is_binary:
-            y_pred = (y_score >= threshold).astype(type(classes[1]) if classes is not None else int)
+            pos_cls = classes[positive_class_index] if positive_class_index < len(classes) else classes[1]
+            y_pred = (y_score >= threshold).astype(type(pos_cls))
             return np.asarray(y_pred), y_score
 
     y_pred = pipeline.predict(X)
@@ -293,6 +297,67 @@ def _build_rows(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Data drift detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _detect_drift(raw_df: pd.DataFrame, training_schema: dict) -> List[Dict[str, Any]]:
+    """
+    Lightweight drift detection: compare input DataFrame statistics against
+    training-time statistics stored in training_schema["column_stats"].
+
+    Returns a list of drift warnings (empty list = no drift detected or stats unavailable).
+    Each entry: {"column": str, "type": "mean_shift"|"std_shift"|"new_categories",
+                 "severity": "warning"|"critical", "detail": str}
+    """
+    col_stats: Dict[str, Any] = training_schema.get("column_stats") or {}
+    if not col_stats:
+        return []
+
+    warnings: List[Dict[str, Any]] = []
+    for col, stats in col_stats.items():
+        if col not in raw_df.columns:
+            continue
+        series = raw_df[col].dropna()
+        if len(series) == 0:
+            continue
+
+        col_type = stats.get("type", "numeric")
+
+        if col_type == "numeric":
+            train_mean = stats.get("mean")
+            train_std = stats.get("std")
+            if train_mean is None or train_std is None or train_std == 0:
+                continue
+            cur_mean = float(series.astype(float).mean())
+            shift = abs(cur_mean - train_mean) / train_std
+            if shift > 3.0:
+                warnings.append({
+                    "column": col, "type": "mean_shift", "severity": "critical",
+                    "detail": f"Mean shifted {shift:.1f}σ (train={train_mean:.3g}, current={cur_mean:.3g})",
+                })
+            elif shift > 1.5:
+                warnings.append({
+                    "column": col, "type": "mean_shift", "severity": "warning",
+                    "detail": f"Mean shifted {shift:.1f}σ (train={train_mean:.3g}, current={cur_mean:.3g})",
+                })
+
+        elif col_type in ("categorical", "text"):
+            train_cats = set(stats.get("categories") or [])
+            if not train_cats:
+                continue
+            cur_cats = set(series.astype(str).unique().tolist())
+            new_cats = cur_cats - train_cats
+            if new_cats:
+                severity = "critical" if len(new_cats) > len(train_cats) * 0.3 else "warning"
+                warnings.append({
+                    "column": col, "type": "new_categories", "severity": severity,
+                    "detail": f"{len(new_cats)} new categor(y/ies) not seen at training: {sorted(new_cats)[:5]}",
+                })
+
+    return warnings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Public prediction functions
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -327,11 +392,22 @@ def predict_with_trained_model(
 
     threshold = _get_optimal_threshold(artifacts, task_type)
 
+    # Extract stored positive_class_index so binary score column is always correct.
+    # Stored by reporter.py in artifacts["balancing"]["positive_class_index"].
+    # Falls back to 1 (sklearn default) when absent (older models / regression).
+    _balancing = artifacts.get("balancing") or {}
+    _pos_idx = _balancing.get("positive_class_index")
+    positive_class_index: int = int(_pos_idx) if _pos_idx is not None else 1
+
     is_automl = bool(artifacts.get("automl"))
     if is_automl:
         # Reconstruct any interaction features stored at training time.
         # "automl_feature_pairs" absent = old model without stored pairs; skip gracefully.
         raw_df = _apply_automl_features(raw_df, artifacts)
+
+    # Capture the full DataFrame (including interaction features) for display before
+    # the alignment step strips columns that the pipeline doesn't expect as input.
+    display_df = raw_df
 
     # Pre-inference alignment: drop columns unknown to the model and add any
     # missing columns as NaN.  This is a safety net for pipelines that were
@@ -348,10 +424,18 @@ def predict_with_trained_model(
     # categorical strings → pd.Categorical with XGBoost enable_categorical support).
     raw_df = _normalize_input_dtypes(raw_df, pipeline)
 
-    y_pred, y_score = _run_inference(pipeline, raw_df, task_type, threshold)
+    y_pred, y_score = _run_inference(pipeline, raw_df, task_type, threshold, positive_class_index)
 
-    rows = _build_rows(y_pred, y_score, raw_df)
+    rows = _build_rows(y_pred, y_score, display_df)
     summary = _build_summary(y_pred, y_score, task_type)
+
+    drift_warnings = _detect_drift(raw_df, training_schema)
+    if drift_warnings:
+        logger.warning(
+            "predict.drift_detected: model_id=%s, warnings=%d",
+            trained_model.id,
+            len(drift_warnings),
+        )
 
     return {
         "model_id": int(trained_model.id),
@@ -368,6 +452,7 @@ def predict_with_trained_model(
         "rows": rows,
         "preview": rows,
         "summary": summary,
+        "drift_warnings": drift_warnings,
     }
 
 

@@ -60,7 +60,7 @@ def test_recommendation_config_payload_valid():
     assert "taskType" in payload
     assert "models" in payload
     assert "balancing" in payload
-    assert payload["configMode"] == "intelligent"
+    assert payload["configMode"] == "manual"
 
 
 def test_recommendation_has_reasoning():
@@ -177,22 +177,22 @@ def test_imbalance_handler_smote_infeasible():
 # TrainingConfigBuilder
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_builder_intelligent_no_overrides():
+def test_builder_from_recommendation_no_overrides():
     prof = _make_profile(n=500, ir=1.0, task="binary")
     rec = engine.recommend(prof)
-    payload = builder.build_intelligent(rec)
-    assert payload["configMode"] == "intelligent"
+    payload = builder.build_from_recommendation(rec)
+    assert payload["configMode"] == "manual"
     assert "models" in payload
     assert "balancing" in payload
 
 
-def test_builder_intelligent_with_overrides():
+def test_builder_from_recommendation_with_overrides():
     prof = _make_profile(n=500, ir=1.0, task="binary")
     rec = engine.recommend(prof)
-    payload = builder.build_intelligent(rec, user_overrides={"models": ["logisticregression"]})
+    payload = builder.build_from_recommendation(rec, user_overrides={"models": ["logisticregression"]})
     assert payload["models"] == ["logisticregression"]
     assert "models" in payload.get("userOverrides", [])
-    assert payload["configMode"] == "intelligent"
+    assert payload["configMode"] == "manual"
 
 
 def test_builder_override_non_overridable_key_ignored():
@@ -200,7 +200,7 @@ def test_builder_override_non_overridable_key_ignored():
     prof = _make_profile(n=500, ir=1.0, task="binary")
     rec = engine.recommend(prof)
     original_task = rec.training_config_payload.get("taskType")
-    payload = builder.build_intelligent(rec, user_overrides={"taskType": "regression"})
+    payload = builder.build_from_recommendation(rec, user_overrides={"taskType": "regression"})
     # taskType override should be silently ignored
     assert payload.get("taskType") == original_task
 
@@ -221,23 +221,23 @@ def test_builder_manual_mode():
     assert payload["models"] == ["randomforest"]
 
 
-def test_builder_resolve_intelligent():
+def test_builder_resolve_with_recommendation():
     prof = _make_profile(n=500, ir=1.0, task="binary")
     rec = engine.recommend(prof)
     user_meta = {"targetColumn": "t", "datasetVersionId": 42, "taskType": "classification"}
-    payload = builder.resolve("intelligent", recommendation=rec, user_payload=user_meta)
+    payload = builder.resolve(recommendation=rec, user_payload=user_meta)
     assert payload["targetColumn"] == "t"
     assert payload["datasetVersionId"] == 42
 
 
 def test_builder_resolve_manual_requires_payload():
     with pytest.raises(ValueError, match="user_payload"):
-        builder.resolve("manual", user_payload=None)
+        builder.resolve(recommendation=None, user_payload=None)
 
 
-def test_builder_resolve_intelligent_requires_recommendation():
-    with pytest.raises(ValueError, match="recommendation"):
-        builder.resolve("intelligent", recommendation=None)
+def test_builder_resolve_without_recommendation_requires_payload():
+    with pytest.raises(ValueError, match="user_payload"):
+        builder.resolve(user_payload=None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -249,7 +249,6 @@ def test_recommendation_to_training_config():
     prof = _make_profile(n=500, ir=2.0, task="binary")
     rec = engine.recommend(prof)
     payload = builder.resolve(
-        "intelligent",
         recommendation=rec,
         user_payload={"targetColumn": "my_target", "datasetVersionId": 1, "taskType": "classification"},
     )

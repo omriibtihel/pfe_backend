@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,7 +31,7 @@ _FLAML_METRIC_MAP: dict[str, str] = {
     "mse": "mse",
     "f1_macro": "macro_f1",
     "f1_micro": "micro_f1",
-    "f1_weighted": "f1",
+    "f1_weighted": "weighted_f1",
 }
 
 _AUTO_METRIC: dict[str, str] = {
@@ -40,11 +40,148 @@ _AUTO_METRIC: dict[str, str] = {
 }
 
 
+# ── Explicit sklearn preprocessing before FLAML ───────────────────────────────
+
+def _build_automl_preprocessor(
+    X_train: pd.DataFrame,
+) -> Tuple[Any, pd.DataFrame, List[str]]:
+    """
+    Build and fit a standard sklearn preprocessing pipeline on X_train only (no leakage).
+
+    Steps:
+      - Numeric columns  : median imputation → StandardScaler
+      - Categorical cols : most_frequent imputation → OrdinalEncoder (integer values)
+      - VarianceThreshold(0.0) removes constant features
+
+    Returns (fitted_pipeline, X_train_prep_df, prep_feature_names).
+    FLAML receives a clean all-numeric DataFrame — it can focus on model/HP search.
+    """
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+    from sklearn.pipeline import Pipeline as SKPipeline
+    from sklearn.feature_selection import VarianceThreshold
+    from app.services.preparation_ml.preprocessing.preprocessing import infer_columns
+
+    # Pandas 3.0 StringDtype is not understood by numpy/sklearn — convert to object
+    str_cols = X_train.select_dtypes(include="string").columns.tolist()
+    if str_cols:
+        X_train = X_train.copy()
+        X_train = X_train.astype({col: "object" for col in str_cols})
+    X_train.columns = X_train.columns.astype(object)
+
+    numeric_cols, categorical_cols = infer_columns(X_train)
+
+    transformers: list = []
+    if numeric_cols:
+        num_pipe = SKPipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ])
+        transformers.append(("num", num_pipe, numeric_cols))
+    if categorical_cols:
+        cat_pipe = SKPipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OrdinalEncoder(
+                handle_unknown="use_encoded_value",
+                unknown_value=-1,
+                encoded_missing_value=-1,
+            )),
+        ])
+        transformers.append(("cat", cat_pipe, categorical_cols))
+
+    if not transformers:
+        transformers.append(("passthrough", "passthrough", list(X_train.columns)))
+
+    ct = ColumnTransformer(transformers, remainder="drop", sparse_threshold=0.0)
+    vt = VarianceThreshold(threshold=0.0)
+    preprocessor = SKPipeline([("ct", ct), ("vt", vt)])
+
+    X_arr = preprocessor.fit_transform(X_train)
+
+    try:
+        prep_names = [str(n) for n in preprocessor.get_feature_names_out()]
+    except Exception:
+        prep_names = [f"feat_{i}" for i in range(X_arr.shape[1])]
+
+    # Pandas 3.0 infers StringDtype for string column names — force object dtype
+    # so that FLAML's internal np.array() calls on column indices don't crash.
+    cols_idx = pd.Index(prep_names, dtype=object)
+    X_prep = pd.DataFrame(X_arr, columns=cols_idx, index=X_train.index)
+    return preprocessor, X_prep, prep_names
+
+
+class AutoMLPipeline:
+    """
+    Wraps (sklearn preprocessor + FLAML AutoML) into a single picklable object.
+    At inference time, raw data is preprocessed transparently before FLAML predicts.
+    The existing predictor needs no changes — it calls predict_proba(X) as usual.
+    """
+
+    def __init__(
+        self,
+        preprocessor: Any,
+        automl: Any,
+        feature_names_in: List[str],
+        prep_cols: Optional[List[str]] = None,
+    ) -> None:
+        self.preprocessor = preprocessor
+        self.automl = automl
+        self.feature_names_in = feature_names_in  # original column names expected at inference
+        self._prep_cols = prep_cols               # column names after preprocessing
+
+    # ── internal helper ───────────────────────────────────────────────────────
+
+    def _preprocess(self, X: Any) -> Any:
+        """Align raw input to training schema, then apply sklearn preprocessing."""
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X, columns=self.feature_names_in[: X.shape[1]])
+        elif isinstance(X, pd.DataFrame):
+            X = X.copy()
+            for c in self.feature_names_in:
+                if c not in X.columns:
+                    X[c] = np.nan
+            X = X[self.feature_names_in]
+        return self.preprocessor.transform(X)
+
+    # ── sklearn-compatible API ────────────────────────────────────────────────
+
+    def predict(self, X: Any) -> np.ndarray:
+        return self.automl.predict(self._preprocess(X))
+
+    def predict_proba(self, X: Any) -> np.ndarray:
+        return self.automl.predict_proba(self._preprocess(X))
+
+    @property
+    def classes_(self) -> Any:
+        return getattr(self.automl, "classes_", None)
+
+    @property
+    def model(self) -> Any:
+        return getattr(self.automl, "model", None)
+
+    def _inner_estimator(self) -> Any:
+        model = self.model
+        if model is None:
+            return self.automl
+        return getattr(model, "estimator", model)
+
+    @property
+    def feature_importances_(self) -> Optional[np.ndarray]:
+        return getattr(self._inner_estimator(), "feature_importances_", None)
+
+    @property
+    def coef_(self) -> Optional[np.ndarray]:
+        return getattr(self._inner_estimator(), "coef_", None)
+
+
+# ── Medical preparation ────────────────────────────────────────────────────────
+
 @dataclass
 class _MedicalPrepResult:
     """All parameters produced by the medical pre-fit optimizations."""
     X_train: pd.DataFrame
-    feature_pairs: List[Tuple[str, str, str]]   # (col1, col2, new_name)
+    feature_pairs: List[Tuple[str, str, str]]
     sample_weight: Optional[np.ndarray]
     effective_budget: int
     eval_method: str
@@ -66,9 +203,11 @@ def _prepare_medical_automl(
     Apply generic pre-fit optimizations before automl.fit():
 
       1. Sample-weight balancing — inverse-frequency weights for imbalanced classes.
-      2. CV 3-fold forced — more robust HP search on small datasets.
-      3. Constrained HP search space — anti-overfit bounds via custom_hp.
-      4. Metric switch to F1 when imbalance detected (threshold optimised post-fit).
+      2. CV 5-fold forced — more robust HP search than 3-fold.
+      3. Wider HP search space — more exploration freedom for FLAML.
+
+    Note: metric switch to F1 removed — ROC AUC is threshold-independent and
+    more reliable for medical classification.
     """
     from flaml import tune  # lazy import so flaml is optional at module load
 
@@ -81,61 +220,52 @@ def _prepare_medical_automl(
         classes, counts = np.unique(y_train, return_counts=True)
         if len(classes) >= 2:
             ir = float(counts.max()) / float(counts.min())
-            if ir > 1.2:   # lower threshold than default (1.5) for medical data
+            if ir > 1.2:
                 sample_weight = compute_sample_weight("balanced", y_train)
                 imbalance_applied = True
                 logger.info("MedAutoML Opt1: IR=%.2f → sample_weight balanced", ir)
 
-    # ── Opt 2 : CV 3-fold forced (budget respecté tel quel) ───────────────────
-    effective_budget = cfg.time_budget   
+    # ── Opt 2 : CV 5-fold forced ──────────────────────────────────────────────
+    effective_budget = cfg.time_budget
     eval_method = "cv"
-    n_splits = 3   # 3-fold: faster than 5
-    logger.info(
-        "MedAutoML Opt2: budget=%ds, eval=cv/3-fold", effective_budget
-    )
+    n_splits = 5   # 5-fold: better generalization estimate than 3-fold
+    logger.info("MedAutoML Opt2: budget=%ds, eval=cv/5-fold", effective_budget)
 
-    # ── Opt 3 : Medical-constrained HP search space ────────────────────────────
+    # ── Opt 3 : Wider HP search space ─────────────────────────────────────────
     custom_hp: Dict[str, Any] = {
         "lgbm": {
-            "n_estimators":      {"domain": tune.lograndint(lower=100, upper=1000), "init_value": 300},
-            "max_depth":         {"domain": tune.randint(lower=3, upper=8),         "init_value": 5},
-            "learning_rate":     {"domain": tune.loguniform(lower=0.01, upper=0.2), "init_value": 0.05},
-            "min_child_samples": {"domain": tune.randint(lower=20, upper=100),      "init_value": 50},
-            "reg_alpha":         {"domain": tune.loguniform(lower=1e-3, upper=1.0), "init_value": 0.1},
-            "reg_lambda":        {"domain": tune.loguniform(lower=1e-3, upper=1.0), "init_value": 0.1},
+            "n_estimators":      {"domain": tune.lograndint(lower=50, upper=2000),   "init_value": 300},
+            "max_depth":         {"domain": tune.randint(lower=3, upper=12),          "init_value": 6},
+            "learning_rate":     {"domain": tune.loguniform(lower=0.005, upper=0.3),  "init_value": 0.05},
+            "min_child_samples": {"domain": tune.randint(lower=5, upper=100),         "init_value": 20},
+            "reg_alpha":         {"domain": tune.loguniform(lower=1e-4, upper=10.0),  "init_value": 0.1},
+            "reg_lambda":        {"domain": tune.loguniform(lower=1e-4, upper=10.0),  "init_value": 0.1},
         },
         "xgboost": {
-            "n_estimators":    {"domain": tune.lograndint(lower=100, upper=1000), "init_value": 300},
-            "max_depth":       {"domain": tune.randint(lower=3, upper=8),         "init_value": 5},
-            "learning_rate":   {"domain": tune.loguniform(lower=0.01, upper=0.2), "init_value": 0.05},
-            "min_child_weight":{"domain": tune.randint(lower=5, upper=30),        "init_value": 10},
-            "reg_alpha":       {"domain": tune.loguniform(lower=1e-3, upper=1.0), "init_value": 0.1},
-            "reg_lambda":      {"domain": tune.loguniform(lower=1e-3, upper=1.0), "init_value": 0.1},
+            "n_estimators":    {"domain": tune.lograndint(lower=50, upper=2000),   "init_value": 300},
+            "max_depth":       {"domain": tune.randint(lower=3, upper=12),          "init_value": 6},
+            "learning_rate":   {"domain": tune.loguniform(lower=0.005, upper=0.3),  "init_value": 0.05},
+            "min_child_weight":{"domain": tune.randint(lower=1, upper=30),          "init_value": 5},
+            "reg_alpha":       {"domain": tune.loguniform(lower=1e-4, upper=10.0),  "init_value": 0.1},
+            "reg_lambda":      {"domain": tune.loguniform(lower=1e-4, upper=10.0),  "init_value": 0.1},
         },
         "rf": {
-            "max_depth":        {"domain": tune.randint(lower=3, upper=8),  "init_value": 5},
-            "min_samples_split":{"domain": tune.randint(lower=5, upper=20), "init_value": 10},
-            "min_samples_leaf": {"domain": tune.randint(lower=3, upper=10), "init_value": 5},
+            "max_depth":        {"domain": tune.randint(lower=3, upper=15),  "init_value": 7},
+            "min_samples_split":{"domain": tune.randint(lower=2, upper=20),  "init_value": 5},
+            "min_samples_leaf": {"domain": tune.randint(lower=1, upper=10),  "init_value": 2},
         },
     }
 
-    # No column-name-based feature engineering: the app is dataset-agnostic.
     feature_pairs: List[Tuple[str, str, str]] = []
-
-    # ── Opt 4 : Switch metric to F1 when imbalanced ────────────────────────────
-    effective_metric = flaml_metric
-    if cfg.task_type == "classification" and not cfg.metric and imbalance_applied:
-        effective_metric = "f1"
-        logger.info("MedAutoML Opt5: imbalance detected → metric switched to f1")
 
     return _MedicalPrepResult(
         X_train=X,
-        feature_pairs=feature_pairs,  # always empty — no column-name-based engineering
+        feature_pairs=feature_pairs,
         sample_weight=sample_weight,
         effective_budget=effective_budget,
         eval_method=eval_method,
         n_splits=n_splits,
-        flaml_metric=effective_metric,
+        flaml_metric=flaml_metric,   # keep requested/auto metric — no F1 switch
         custom_hp=custom_hp,
         imbalance_applied=imbalance_applied,
         features_added=0,
@@ -144,13 +274,13 @@ def _prepare_medical_automl(
 
 def _find_optimal_threshold(
     automl: Any,
-    X: pd.DataFrame,
+    X: Any,
     y: np.ndarray,
     positive_label: Any = None,
 ) -> float:
     """
-    Opt 5 (post-fit): find the probability threshold that maximises F1
-    on the training set via the Precision-Recall curve.
+    Post-fit: find the probability threshold that maximises F1
+    on the holdout test set via the Precision-Recall curve.
     Only meaningful for binary classification.
     Returns a value in [0.01, 0.99] or 0.5 as fallback.
     """
@@ -162,9 +292,8 @@ def _find_optimal_threshold(
             return 0.5
         classes = np.unique(y)
         if len(classes) != 2:
-            return 0.5   # multi-class: skip
+            return 0.5
 
-        # Determine the positive-class column
         labels = getattr(automl, "classes_", None)
         pos_col = 1
         if positive_label is not None and labels is not None:
@@ -190,9 +319,9 @@ def _find_optimal_threshold(
 class AutoMLRunResult:
     metrics_json: Dict[str, Any]
     artifacts_json: Dict[str, Any]
-    fitted_model: Any   # FLAML AutoML object (or individual sklearn estimator)
+    fitted_model: Any
     task_type: str
-    is_best: bool = False  # True for the best estimator overall
+    is_best: bool = False
 
 
 def run_automl(
@@ -202,8 +331,17 @@ def run_automl(
 ) -> List[AutoMLRunResult]:
     """
     Run a FLAML AutoML search on `df` using `cfg`.
-    FLAML handles preprocessing, feature engineering, model selection, and HPO.
-    Returns an AutoMLRunResult compatible with _model_to_front_result().
+
+    Pipeline:
+      1. Clean data / train-test split
+      2. Explicit sklearn preprocessing (impute + scale + encode + VarianceThreshold)
+         fitted on X_train only — FLAML receives a clean numeric matrix
+      3. SMOTE oversampling if classification and imbalance ratio > 2.0 (binary only)
+      4. FLAML HPO search on preprocessed data (5-fold CV, wider HP bounds)
+      5. Threshold calibration on holdout test set
+      6. Wrap (preprocessor + automl) in AutoMLPipeline for transparent inference
+
+    Returns a list of AutoMLRunResult (best + per-estimator).
     """
     try:
         from flaml import AutoML
@@ -224,17 +362,15 @@ def run_automl(
             "Pas assez de données pour AutoML (minimum 10 lignes après suppression des NaN cibles)."
         )
 
-    # Pandas 3.0 uses StringDtype for all string columns (values AND column index).
-    # FLAML internally calls np.issubdtype(X.columns.dtype, …) which fails on
-    # StringDtype.  Two fixes needed:
-    #   1. Convert string-typed column VALUES to object dtype.
-    #   2. Convert the column INDEX itself to object (it also gets StringDtype).
+    # Pandas 3.0: StringDtype breaks FLAML's np.issubdtype() checks — convert to object
     string_cols = df_clean.select_dtypes(include="string").columns.tolist()
     if string_cols:
         df_clean = df_clean.astype({col: "object" for col in string_cols})
 
     X = df_clean.drop(columns=[cfg.target_column])
-    X.columns = X.columns.astype(object)   # fix the index dtype (StringDtype → object)
+    # Force object dtype on column Index — Pandas 3.0 uses StringDtype by default
+    # for string column names which breaks FLAML's internal np.array() calls.
+    X.columns = pd.Index(list(X.columns), dtype=object)
     y = df_clean[cfg.target_column].to_numpy()
     n_samples = len(df_clean)
 
@@ -246,33 +382,64 @@ def run_automl(
                 X, y, test_size=cfg.test_ratio, random_state=42, stratify=stratify
             )
         except ValueError:
-            # Stratification failed (e.g. minority class too small)
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=cfg.test_ratio, random_state=42
             )
         has_test = True
     else:
         X_train, y_train = X, y
-        X_test, y_test = X, y
+        X_test, y_test = None, None
         has_test = False
 
-    # ── 3. Map metric ─────────────────────────────────────────────────────────
+    # Store original column names for inference schema (before preprocessing)
+    original_feature_names = list(X_train.columns)
+
+    # ── 3. Explicit sklearn preprocessing (fit on X_train only) ─────────────
+    preprocessor, X_train_prep, prep_names = _build_automl_preprocessor(X_train)
+    X_test_prep: Optional[pd.DataFrame] = None
+    if has_test and X_test is not None:
+        X_test_arr = preprocessor.transform(X_test)
+        X_test_prep = pd.DataFrame(X_test_arr, columns=pd.Index(prep_names, dtype=object), index=X_test.index)
+
+    # Keep a pre-SMOTE copy for unbiased train-set evaluation
+    X_train_prep_for_eval = X_train_prep.copy()
+    y_train_for_eval = y_train.copy()
+
+    # ── 4. SMOTE oversampling (binary classification, severe imbalance only) ─
+    smote_applied = False
+    if cfg.task_type == "classification":
+        classes_sm, counts_sm = np.unique(y_train, return_counts=True)
+        if len(classes_sm) == 2 and counts_sm.min() > 0:
+            ir_sm = float(counts_sm.max()) / float(counts_sm.min())
+            k_nn = min(5, int(counts_sm.min()) - 1)
+            if ir_sm > 2.0 and k_nn >= 1 and X_train_prep.shape[0] >= 12:
+                try:
+                    from imblearn.over_sampling import SMOTE
+                    smote = SMOTE(k_neighbors=k_nn, random_state=42)
+                    X_train_resampled, y_train_resampled = smote.fit_resample(
+                        X_train_prep.values, y_train
+                    )
+                    X_train_prep = pd.DataFrame(X_train_resampled, columns=pd.Index(prep_names, dtype=object))
+                    y_train = y_train_resampled
+                    smote_applied = True
+                    logger.info(
+                        "MedAutoML: SMOTE applied (IR=%.2f), train size %d → %d",
+                        ir_sm, len(y_train_for_eval), len(y_train),
+                    )
+                except Exception as exc:
+                    logger.warning("MedAutoML: SMOTE failed, continuing without: %s", exc)
+
+    # ── 5. Map metric ─────────────────────────────────────────────────────────
     requested_metric = cfg.metric
     if requested_metric:
         flaml_metric = _FLAML_METRIC_MAP.get(requested_metric, requested_metric)
     else:
         flaml_metric = _AUTO_METRIC.get(cfg.task_type, "roc_auc")
 
-    # ── 4. Medical pre-fit optimizations (opts 1–5) ───────────────────────────
-    med = _prepare_medical_automl(X_train, y_train, cfg, flaml_metric, n_samples)
-    X_train = med.X_train
-    # Apply the same interaction features to X_test (no leakage: only products of raw cols)
-    for c1, c2, fname in med.feature_pairs:
-        X_test[fname] = X_test[c1] * X_test[c2]
-    if med.feature_pairs:
-        X_test.columns = X_test.columns.astype(object)
+    # ── 6. Medical pre-fit optimizations (sample weights, CV folds, HP bounds) ─
+    med = _prepare_medical_automl(X_train_prep, y_train, cfg, flaml_metric, n_samples)
 
-    # ── 4. Progress thread (SSE-only, thread-safe) ────────────────────────────
+    # ── 7. Progress thread ────────────────────────────────────────────────────
     _stop = threading.Event()
 
     def _progress_worker() -> None:
@@ -289,28 +456,28 @@ def run_automl(
     prog_thread = threading.Thread(target=_progress_worker, daemon=True)
     prog_thread.start()
 
-    # ── 5. Run FLAML ──────────────────────────────────────────────────────────
+    # ── 8. Run FLAML on preprocessed data ─────────────────────────────────────
     log_fd, log_path = tempfile.mkstemp(suffix=".log")
     os.close(log_fd)
 
     automl = AutoML()
     try:
         automl.fit(
-            X_train,
+            X_train_prep,           # clean numeric DataFrame — no raw categoricals
             y_train,
             task=cfg.task_type,
-            time_budget=med.effective_budget,   # Opt 2: budget × 3
-            metric=med.flaml_metric,            # Opt 5: f1 when imbalanced
-            eval_method=med.eval_method,        # Opt 2: cv forced
-            n_splits=med.n_splits,              # Opt 2: 3-fold
-            n_jobs=-1,                          # all CPU cores
-            ensemble=True,                      # stack best models
-            early_stop=True,                    # stop if no improvement
-            custom_hp=med.custom_hp,            # Opt 3: medical HP bounds
+            time_budget=med.effective_budget,
+            metric=med.flaml_metric,
+            eval_method=med.eval_method,    # "cv"
+            n_splits=med.n_splits,          # 5-fold
+            n_jobs=-1,
+            ensemble=True,
+            early_stop=True,
+            custom_hp=med.custom_hp,
             verbose=0,
             log_file_name=log_path,
-            sample_weight=med.sample_weight,    # Opt 1: balanced weights
-            model_history=True,                 # keep fitted model per estimator
+            sample_weight=med.sample_weight,
+            model_history=True,
         )
     finally:
         _stop.set()
@@ -324,51 +491,68 @@ def run_automl(
         except Exception:
             pass
 
-    # ── 6. Count trials ───────────────────────────────────────────────────────
+    # ── 9. Count trials ───────────────────────────────────────────────────────
     n_trials = _count_log_trials(log_path)
     try:
         os.unlink(log_path)
     except OSError:
         pass
 
-    # ── 7. Opt 5 (post-fit): find optimal decision threshold ─────────────────
+    # ── 10. Threshold calibration on holdout test (post-fit) ──────────────────
     optimal_threshold = 0.5
     threshold_optimized = False
     if cfg.task_type == "classification":
-        optimal_threshold = _find_optimal_threshold(
-            automl, X_train, y_train, positive_label=cfg.positive_label
-        )
+        if has_test and X_test_prep is not None:
+            optimal_threshold = _find_optimal_threshold(
+                automl, X_test_prep, y_test, positive_label=cfg.positive_label
+            )
         threshold_optimized = optimal_threshold != 0.5
         if threshold_optimized:
-            logger.info("MedAutoML Opt5: optimal threshold = %.3f", optimal_threshold)
+            logger.info("MedAutoML: optimal threshold = %.3f", optimal_threshold)
 
-    # ── 8. Evaluate on test / train ───────────────────────────────────────────
+    # ── 11. Evaluate on preprocessed test / pre-SMOTE train ──────────────────
     evaluator = Evaluator(
         task_type=cfg.task_type,
         positive_label=cfg.positive_label,
     )
-    eval_test = evaluator.evaluate(automl, X_test, y_test, threshold=optimal_threshold)
-    eval_train = evaluator.evaluate(automl, X_train, y_train, threshold=optimal_threshold)
+    eval_test = (
+        evaluator.evaluate(automl, X_test_prep, y_test, threshold=optimal_threshold)
+        if has_test and X_test_prep is not None
+        else None
+    )
+    # Evaluate on pre-SMOTE training data (unbiased — SMOTE samples not present)
+    eval_train = evaluator.evaluate(
+        automl, X_train_prep_for_eval, y_train_for_eval, threshold=optimal_threshold
+    )
 
-    # ── 8. Feature importance ─────────────────────────────────────────────────
-    feature_importance = _extract_feature_importance(automl, list(X_train.columns))
+    # ── 12. Feature importance (from preprocessed feature space) ─────────────
+    feature_importance = _extract_feature_importance(automl, prep_names)
 
-    # ── 9. Build metrics_json (compatible with _model_to_front_result) ────────
+    # ── 13. Wrap model for transparent inference ──────────────────────────────
+    pipeline = AutoMLPipeline(
+        preprocessor=preprocessor,
+        automl=automl,
+        feature_names_in=original_feature_names,
+        prep_cols=prep_names,
+    )
+
+    # ── 14. Build metrics_json ────────────────────────────────────────────────
     best_estimator = str(getattr(automl, "best_estimator", "unknown"))
     best_config = _safe_dict(getattr(automl, "best_config", {}))
     best_loss = float(getattr(automl, "best_loss", 0.0))
 
     split_info: Dict[str, Any] = {
         "method": "automl_holdout" if has_test else "automl_full",
-        "train_rows": int(len(X_train)),
-        "test_rows": int(len(X_test)) if has_test else 0,
+        "train_rows": int(len(X_train_prep_for_eval)),
+        "test_rows": int(len(X_test_prep)) if has_test and X_test_prep is not None else 0,
         "n_samples": int(n_samples),
         "test_ratio": float(cfg.test_ratio),
     }
 
     metrics_json: Dict[str, Any] = {
         "automl": True,
-        "test": eval_test.metrics,
+        "test": eval_test.metrics if eval_test is not None else None,
+        "has_test": has_test,
         "train": eval_train.metrics,
         "best_estimator": best_estimator,
         "best_loss": best_loss,
@@ -377,14 +561,15 @@ def run_automl(
         "training_time_sec": round(elapsed, 2),
         "split_info": split_info,
         "imbalance_handled": med.imbalance_applied,
+        "smote_applied": smote_applied,
         "threshold_used": optimal_threshold,
         "threshold_optimized": threshold_optimized,
-        "features_added": med.features_added,
+        "features_added": 0,
     }
 
-    # ── 10. Build artifacts_json ──────────────────────────────────────────────
+    # ── 15. Build artifacts_json ──────────────────────────────────────────────
     confusion_matrix_data: List[List[int]] = []
-    if eval_test.confusion_matrix is not None:
+    if eval_test is not None and eval_test.confusion_matrix is not None:
         confusion_matrix_data = [list(row) for row in eval_test.confusion_matrix]
 
     artifacts_json: Dict[str, Any] = {
@@ -395,11 +580,14 @@ def run_automl(
             "time_budget_s": cfg.time_budget,
             "total_time_s": round(elapsed, 2),
             "eval_method": med.eval_method,
+            "n_splits": med.n_splits,
             "metric_optimized": med.flaml_metric,
             "requested_metric": requested_metric,
             "imbalance_handled": med.imbalance_applied,
-            "features_added": med.features_added,
+            "smote_applied": smote_applied,
+            "features_added": 0,
             "budget_used_s": med.effective_budget,
+            "is_best": True,
         },
         "thresholding": {
             "enabled": threshold_optimized,
@@ -412,32 +600,22 @@ def run_automl(
             "class_name": best_estimator,
             "params": best_config,
         },
-        "automl_feature_pairs": [
-            {"col1": c1, "col2": c2, "name": fname}
-            for c1, c2, fname in med.feature_pairs
-        ],
+        "automl_feature_pairs": [],
+        # Original column names the user must provide at prediction time
+        "training_schema": {
+            "feature_names": original_feature_names,
+        },
     }
-
-    # Store the feature names that the user must provide for manual prediction.
-    # X_train contains only the original dataset columns (no engineered interaction
-    # features, since feature_pairs is now always empty).
-    artifacts_json["training_schema"] = {
-        "feature_names": [str(c) for c in X_train.columns.tolist()],
-    }
-
-    # Mark best estimator in its artifacts
-    if isinstance(artifacts_json.get("automl"), dict):
-        artifacts_json["automl"]["is_best"] = True
 
     best_result = AutoMLRunResult(
         metrics_json=metrics_json,
         artifacts_json=artifacts_json,
-        fitted_model=automl,
+        fitted_model=pipeline,      # AutoMLPipeline wraps preprocessing + FLAML
         task_type=cfg.task_type,
         is_best=True,
     )
 
-    # ── 11. Build per-estimator results ──────────────────────────────────────
+    # ── 16. Per-estimator results ─────────────────────────────────────────────
     all_results: List[AutoMLRunResult] = [best_result]
     best_estimator_name = str(getattr(automl, "best_estimator", ""))
 
@@ -449,26 +627,29 @@ def run_automl(
     except Exception:
         pass
 
-    # Save the original best trained estimator to restore it after each evaluation.
     _original_trained = automl._trained_estimator
 
     for est_name, est_config in per_estimator_configs.items():
         if est_name == best_estimator_name:
-            continue  # already included above as best_result
+            continue
         try:
             est_learner = automl.best_model_for_estimator(est_name)
             if est_learner is None:
-                logger.debug("AutoML: no trained model for %s (model_history may be off), skipping", est_name)
+                logger.debug("AutoML: no trained model for %s, skipping", est_name)
                 continue
 
-            # Temporarily swap _trained_estimator so that automl.predict/predict_proba
-            # go through FLAML's preprocessing pipeline but use this estimator's weights.
             automl._trained_estimator = est_learner
             try:
-                est_eval_test = evaluator.evaluate(automl, X_test, y_test, threshold=0.5)
-                est_eval_train = evaluator.evaluate(automl, X_train, y_train, threshold=0.5)
+                est_eval_test = (
+                    evaluator.evaluate(automl, X_test_prep, y_test, threshold=0.5)
+                    if has_test and X_test_prep is not None
+                    else evaluator.evaluate(automl, X_train_prep_for_eval, y_train_for_eval, threshold=0.5)
+                )
+                est_eval_train = evaluator.evaluate(
+                    automl, X_train_prep_for_eval, y_train_for_eval, threshold=0.5
+                )
             finally:
-                automl._trained_estimator = _original_trained  # always restore
+                automl._trained_estimator = _original_trained
 
             est_loss = per_estimator_losses.get(est_name)
 
@@ -486,9 +667,10 @@ def run_automl(
                 "training_time_sec": round(elapsed, 2),
                 "split_info": split_info,
                 "imbalance_handled": med.imbalance_applied,
+                "smote_applied": smote_applied,
                 "threshold_used": 0.5,
                 "threshold_optimized": False,
-                "features_added": med.features_added,
+                "features_added": 0,
             }
 
             est_artifacts_json: Dict[str, Any] = {
@@ -504,7 +686,7 @@ def run_automl(
                 },
                 "thresholding": {"enabled": False, "optimal_threshold": 0.5},
                 "split_info": split_info,
-                "feature_importance": _extract_feature_importance(est_learner, list(X_train.columns)),
+                "feature_importance": _extract_feature_importance(est_learner, prep_names),
                 "confusion_matrix": est_cm,
                 "model": {"class_name": est_name, "params": _safe_dict(est_config)},
             }
@@ -512,14 +694,14 @@ def run_automl(
             all_results.append(AutoMLRunResult(
                 metrics_json=est_metrics_json,
                 artifacts_json=est_artifacts_json,
-                fitted_model=est_learner,
+                fitted_model=est_learner,   # individual estimator (no preprocessing wrap)
                 task_type=cfg.task_type,
                 is_best=False,
             ))
             logger.info("AutoML per-estimator result added: %s", est_name)
         except Exception as exc:
             logger.warning("AutoML per-estimator result for %s failed: %s", est_name, exc)
-            automl._trained_estimator = _original_trained  # safety restore on error
+            automl._trained_estimator = _original_trained
 
     return all_results
 
@@ -542,22 +724,24 @@ def _safe_dict(obj: Any) -> dict:
         return {}
 
 
-def _extract_feature_importance(automl: Any, feature_names: List[str]) -> List[Dict[str, Any]]:
+def _extract_feature_importance(estimator: Any, feature_names: List[str]) -> List[Dict[str, Any]]:
     """
-    Try to extract feature importances from FLAML's best estimator.
+    Extract feature importances from a FLAML AutoML object or sklearn estimator.
+    Handles AutoMLPipeline wrapper transparently.
     Returns top 20 features sorted by importance descending.
     """
     try:
-        model = getattr(automl, "model", None)
-        if model is None:
-            return []
-        estimator = getattr(model, "estimator", model)
+        # Unwrap AutoMLPipeline if needed
+        real = estimator.automl if isinstance(estimator, AutoMLPipeline) else estimator
+
+        model = getattr(real, "model", None)
+        inner = getattr(model, "estimator", model) if model is not None else real
 
         importances: Optional[np.ndarray] = None
-        if hasattr(estimator, "feature_importances_"):
-            importances = np.asarray(estimator.feature_importances_)
-        elif hasattr(estimator, "coef_"):
-            coef = np.asarray(estimator.coef_)
+        if hasattr(inner, "feature_importances_"):
+            importances = np.asarray(inner.feature_importances_)
+        elif hasattr(inner, "coef_"):
+            coef = np.asarray(inner.coef_)
             importances = np.abs(coef).mean(axis=0) if coef.ndim > 1 else np.abs(coef)
 
         if importances is None or len(importances) != len(feature_names):

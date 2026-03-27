@@ -33,7 +33,7 @@ def _dedupe(values: list[str]) -> list[str]:
 
 
 def _resolve_smote_k(minority_count: int) -> int:
-    return max(1, min(5, int(minority_count) - 1))
+    return max(1, min(5, int(minority_count) - 2))
 
 
 def resolve(

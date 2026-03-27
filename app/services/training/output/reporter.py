@@ -192,12 +192,39 @@ def summarize_model(model: Any) -> Dict[str, Any]:
     return {"class_name": class_name, "params": params}
 
 
+def _build_column_stats(X: pd.DataFrame) -> Dict[str, Any]:
+    """Compute per-column statistics for drift detection at prediction time."""
+    stats: Dict[str, Any] = {}
+    for col in X.columns:
+        s = X[col].dropna()
+        if len(s) == 0:
+            continue
+        if pd.api.types.is_numeric_dtype(s):
+            stats[str(col)] = {
+                "type": "numeric",
+                "mean": float(s.mean()),
+                "std": float(s.std()) if len(s) > 1 else 0.0,
+                "min": float(s.min()),
+                "max": float(s.max()),
+            }
+        else:
+            unique_vals = s.astype(str).unique().tolist()
+            # Only store categories if cardinality is manageable
+            if len(unique_vals) <= 200:
+                stats[str(col)] = {
+                    "type": "categorical",
+                    "categories": unique_vals,
+                }
+    return stats
+
+
 def build_training_schema(*, X: pd.DataFrame, target: str, preprocessing_config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "feature_names": [str(c) for c in X.columns],
         "dtypes": {str(c): str(dt) for c, dt in X.dtypes.items()},
         "target": str(target),
         "preprocessing_config": preprocessing_config,
+        "column_stats": _build_column_stats(X),
         "created_at": _utc_now_iso(),
     }
 
@@ -215,6 +242,8 @@ class Reporter:
         tuning_artifacts: Dict[str, Any],
         confusion_matrix: Optional[list[list[int]]] = None,
         class_distribution: Optional[Dict[str, Any]] = None,
+        resolved_positive_label: Any = None,
+        curves: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         named_steps = getattr(fitted_pipeline, "named_steps", {}) or {}
         fitted_prep = named_steps.get("prep")
@@ -223,6 +252,27 @@ class Reporter:
         preprocessing_applied: Dict[str, Any] = {}
         if fitted_prep is not None:
             preprocessing_applied = summarize_preprocessing_applied(fitted_prep, split.X_train)
+
+        # Enrich balancing_audit with positive_label info for correct predict-time thresholding
+        enriched_balancing = dict(balancing_audit)
+        if cfg.task_type == "classification":
+            enriched_balancing["positive_label"] = (
+                str(resolved_positive_label) if resolved_positive_label is not None else None
+            )
+            # Compute the index of the positive class within model.classes_
+            pos_idx: Optional[int] = None
+            if resolved_positive_label is not None:
+                try:
+                    model_step = fitted_pipeline.named_steps.get("model")
+                    classes_ = getattr(model_step, "classes_", None)
+                    if classes_ is not None:
+                        classes_list = [str(c) for c in classes_]
+                        lbl = str(resolved_positive_label)
+                        if lbl in classes_list:
+                            pos_idx = int(classes_list.index(lbl))
+                except Exception:
+                    pass
+            enriched_balancing["positive_class_index"] = pos_idx
 
         artifacts: Dict[str, Any] = {
             "split_info": {
@@ -249,7 +299,7 @@ class Reporter:
                 "applied": preprocessing_applied,
             },
             "training_schema": training_schema,
-            "balancing": balancing_audit,
+            "balancing": enriched_balancing,
             "thresholding": {
                 "enabled": bool(balancing_audit.get("apply_threshold", False)),
                 "strategy": balancing_audit.get("threshold_strategy"),
@@ -266,6 +316,8 @@ class Reporter:
             artifacts["confusion_matrix"] = confusion_matrix
         if class_distribution is not None:
             artifacts["class_distribution"] = class_distribution
+        if curves is not None:
+            artifacts["curves"] = curves
 
         return artifacts
 
@@ -286,6 +338,8 @@ class Reporter:
         balancing_audit: Dict[str, Any],
         final_training_schema: Dict[str, Any],
         tuning_artifacts: Dict[str, Any],
+        resolved_positive_label: Any = None,
+        curves: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Build the artifacts dict for a cross-validation run.
@@ -348,6 +402,26 @@ class Reporter:
                 "The refit model is suitable for deployment/prediction."
             )
 
+        # Enrich balancing_audit with positive_label info for correct predict-time thresholding
+        enriched_balancing = dict(balancing_audit)
+        if cfg.task_type == "classification":
+            enriched_balancing["positive_label"] = (
+                str(resolved_positive_label) if resolved_positive_label is not None else None
+            )
+            pos_idx: Optional[int] = None
+            if resolved_positive_label is not None:
+                try:
+                    model_step = fitted_pipeline.named_steps.get("model")
+                    classes_ = getattr(model_step, "classes_", None)
+                    if classes_ is not None:
+                        classes_list = [str(c) for c in classes_]
+                        lbl = str(resolved_positive_label)
+                        if lbl in classes_list:
+                            pos_idx = int(classes_list.index(lbl))
+                except Exception:
+                    pass
+            enriched_balancing["positive_class_index"] = pos_idx
+
         artifacts: Dict[str, Any] = {
             "split_info": {
                 "method": str(cfg.split_method),
@@ -383,7 +457,7 @@ class Reporter:
                 "applied": preprocessing_applied,
             },
             "training_schema": final_training_schema,
-            "balancing": balancing_audit,
+            "balancing": enriched_balancing,
             "balancing_cv": {
                 "strategies_used_in_folds": balancing_strategies_used,
                 "smote_samples_added_per_fold": smote_added_per_fold,
@@ -409,5 +483,8 @@ class Reporter:
             # Fold-level class distributions (classification only)
             "fold_class_distributions": fold_class_distributions if fold_class_distributions else None,
         }
+
+        if curves is not None:
+            artifacts["curves"] = curves
 
         return artifacts

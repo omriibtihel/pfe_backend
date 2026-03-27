@@ -26,7 +26,7 @@ from app.services.training.config.zero_shot import get_zero_shot_hyperparams
 
 @dataclass
 class TrainingRecommendation:
-    mode: str                               # always "intelligent"
+    mode: str                               # always "recommendation"
     recommended_models: list[str]
     recommended_resampling: str | None
     apply_threshold: bool
@@ -243,11 +243,11 @@ class RecommendationEngine:
             "searchType": search_type,
             "balancing": balancing_payload,
             "modelHyperparams": zero_shot_hp,
-            "configMode": "intelligent",
+            "configMode": "manual",
         }
 
         return TrainingRecommendation(
-            mode="intelligent",
+            mode="recommendation",
             recommended_models=models,
             recommended_resampling=resampling,
             apply_threshold=apply_threshold,

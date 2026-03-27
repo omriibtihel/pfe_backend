@@ -10,10 +10,11 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.api.utils.df import read_df 
+from app.api.utils.df import read_df
 from app.core.config import PROJECTS_PATH
 from app.models.project import Project
 from app.models.dataset import Dataset
+from app.models.dataset_version import DatasetVersion
 from app.api.utils.datasets import get_dataset_or_404
 
 from app.schemas.dataset import DatasetOut, DatasetPreviewOut
@@ -128,6 +129,35 @@ async def upload_dataset(
         project.active_dataset_id = dataset.id
         db.add(project)
         db.commit()
+
+    # Créer une version initiale "brute" utilisable directement pour l'entraînement
+    try:
+        versions_dir = PROJECTS_PATH / str(project_id) / "dataset_versions"
+        versions_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_stored_name = f"{uuid4().hex}.csv"
+        raw_path = versions_dir / raw_stored_name
+
+        df_raw = read_df(dst_path, nrows=None)
+        df_raw.to_csv(raw_path, index=False)
+
+        stem = Path(original_name).stem
+        raw_version = DatasetVersion(
+            project_id=project_id,
+            source_dataset_id=dataset.id,
+            name=stem,
+            stored_name=raw_stored_name,
+            file_path=str(raw_path),
+            content_type="text/csv",
+            size_bytes=raw_path.stat().st_size,
+            target_column=None,
+            can_predict=False,
+            operations_json='[{"type": "original"}]',
+        )
+        db.add(raw_version)
+        db.commit()
+    except Exception:
+        pass  # non-fatal : le dataset reste utilisable, juste sans version initiale
 
     return dataset
 

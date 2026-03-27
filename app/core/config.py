@@ -13,9 +13,18 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+    # Email / SMTP
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "noreply@medicalvision.ai"
+    SMTP_FROM_NAME: str = "MedicalVision"
+    FRONTEND_URL: str = "http://localhost:5173"
+
     class Config:
-        env_file = ".env"
-        extra = "ignore"  
+        env_file = Path(__file__).resolve().parent.parent.parent / ".env"
+        extra = "ignore"
 
 
 settings = Settings()

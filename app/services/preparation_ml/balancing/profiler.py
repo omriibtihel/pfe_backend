@@ -138,7 +138,7 @@ def _build_strategies(
     level: ImbalanceLevel,
 ) -> list[AvailableStrategy]:
     recommended_ids = _recommended_ids(level)
-    smote_feasible = bool(binary and minority_count >= 6)
+    smote_feasible = bool(binary and minority_count >= 7)
     undersampling_feasible = bool(minority_count >= 30)
 
     return [
@@ -167,7 +167,7 @@ def _build_strategies(
             impact=StrategyImpact.MEDIUM.value,
             recommended=("smote" in recommended_ids),
             feasible=smote_feasible,
-            infeasible_reason=None if smote_feasible else "requires_binary_target_and_minority_count_at_least_6",
+            infeasible_reason=None if smote_feasible else "requires_binary_target_and_minority_count_at_least_7",
         ),
         AvailableStrategy(
             id="smote_tomek",
@@ -176,7 +176,7 @@ def _build_strategies(
             impact=StrategyImpact.HIGH.value,
             recommended=("smote_tomek" in recommended_ids),
             feasible=smote_feasible,
-            infeasible_reason=None if smote_feasible else "requires_binary_target_and_minority_count_at_least_6",
+            infeasible_reason=None if smote_feasible else "requires_binary_target_and_minority_count_at_least_7",
         ),
         AvailableStrategy(
             id="random_undersampling",

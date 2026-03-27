@@ -46,7 +46,11 @@ class Evaluator:
                 except ValueError:
                     pos_col = 1
             proba = pipeline.predict_proba(X)[:, pos_col]
-            y_pred = (proba >= threshold).astype(int)
+            pos_class = labels[pos_col]
+            # Safety: is_binary guarantees len(labels)==2, so 1-pos_col is always a valid index.
+            assert len(labels) == 2, f"neg_class calculation requires exactly 2 labels, got {labels}"
+            neg_class = labels[1 - pos_col]
+            y_pred = np.where(proba >= threshold, pos_class, neg_class)
         else:
             y_pred = pipeline.predict(X)
         y_proba, y_score = get_proba_or_score(pipeline, X)

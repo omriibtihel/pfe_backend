@@ -4,10 +4,18 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, conint, field_validator
 
-TrainingMode = Literal["intelligent", "manual", "automl"]
+TrainingMode = Literal["manual", "automl"]
 
 TaskType = Literal["classification", "regression"]
-SplitMethod = Literal["holdout", "kfold", "stratified_kfold"]
+SplitMethod = Literal[
+    "holdout",
+    "kfold",
+    "stratified_kfold",
+    "repeated_stratified_kfold",
+    "group_kfold",
+    "stratified_group_kfold",
+    "loo",
+]
 SearchType = Literal["none", "grid", "random"]
 PreviewSubset = Literal["train", "val", "test"]
 PreviewMode = Literal["head", "random"]
@@ -161,6 +169,8 @@ class TrainingConfigIn(BaseModel):
 
     kFolds: conint(ge=2, le=20) = 5
     shuffle: bool = True
+    nRepeats: conint(ge=1, le=20) = 3
+    groupColumn: Optional[str] = None
     metrics: List[MetricType] = Field(default_factory=list)
     positiveLabel: Optional[Any] = None
     debug: bool = False
@@ -173,9 +183,9 @@ class TrainingConfigIn(BaseModel):
     # Stored but never executed server side.
     customCode: str = ""
 
-    # Mode tracking: "intelligent" (system-generated config) | "manual" (user-driven)
+    # Mode tracking: "manual" (with or without auto-recommendations) | "automl" (FLAML)
     configMode: TrainingMode = "manual"
-    # Keys the user has explicitly overridden in intelligent mode
+    # Keys pre-filled by the recommendation engine that the user may have adjusted
     userOverrides: List[str] = Field(default_factory=list)
 
 
@@ -256,7 +266,7 @@ class ActiveModelOut(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dataset profiling & recommendation schemas (intelligent mode)
+# Dataset profiling & recommendation schemas (used by the manual wizard)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class RecommendIn(BaseModel):
@@ -269,7 +279,7 @@ class RecommendIn(BaseModel):
 
 class TrainingRecommendationOut(BaseModel):
     """Output of the /recommend endpoint."""
-    mode: str  # "intelligent"
+    mode: str  # "recommendation"
     recommended_models: List[str]
     recommended_resampling: Optional[str] = None
     apply_threshold: bool

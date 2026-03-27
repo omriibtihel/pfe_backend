@@ -3,7 +3,10 @@
     "allow": [
       "Bash(python -m pytest:*)",
       "Bash(python -c:*)",
-      "Read(//c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-frontend/src/**)"
+      "Read(//c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-frontend/src/**)",
+      "Bash(npx tsc:*)",
+      "Bash(grep -n \"class Dataset\" /c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend/app/models/*.py)",
+      "Bash(grep -n def.*dataset /c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend/app/api/routes/datasets.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\types",

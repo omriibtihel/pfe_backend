@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 
 from app.services.training.config.schema import TrainingConfig
-from app.services.preprocessing.preprocessing import build_preprocessor
+from app.services.preparation_ml.preprocessing import build_preprocessor
 from app.services.training.config.validation import validate_training_config_payload
 
 

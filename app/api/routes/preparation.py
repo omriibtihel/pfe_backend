@@ -24,7 +24,7 @@ from app.schemas.preparation import (
     FeatureTypesOut,
 )
 from app.schemas.training import TrainingConfigIn, TrainingValidateOut
-from app.services.preparation.balancing.profiler import DataProfile, profile_binary_dataset
+from app.services.preparation_ml.balancing.profiler import DataProfile, profile_binary_dataset
 from app.services.training.config.schema import get_training_capabilities
 from app.services.data.loader import load_dataframe, resolve_dataset_path
 from app.services.data.profiler import DatasetProfiler

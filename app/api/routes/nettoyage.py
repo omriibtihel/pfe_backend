@@ -1,7 +1,7 @@
 # app/api/routes/processing.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -602,10 +602,15 @@ def export_cleaned_dataset(
     )
 
 
+class SaveVersionBody(BaseModel):
+    name: str = ""
+
+
 @router.post("/datasets/{dataset_id}/nettoyage/save")
 def save_cleaned_as_version(
     project_id: int,
     dataset_id: int,
+    body: SaveVersionBody = Body(default={}),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -632,7 +637,7 @@ def save_cleaned_as_version(
     versions_dir.mkdir(parents=True, exist_ok=True)
 
     safe_stem = Path(src.original_name).stem or f"dataset_{dataset_id}"
-    version_name = f"{safe_stem}_cleaned"
+    version_name = body.name.strip() if body.name and body.name.strip() else f"{safe_stem}_cleaned"
 
     stored_name = f"{uuid4().hex}.csv"
     dst_path = versions_dir / stored_name

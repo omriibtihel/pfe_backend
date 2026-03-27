@@ -45,7 +45,7 @@ class TrainingRecord:
     resampling_method: str | None
     split_method: str
     search_type: str
-    config_mode: str                   # "intelligent" | "manual"
+    config_mode: str                   # "manual" | "automl"
     user_overrides: dict[str, Any] | None
 
     # Timing

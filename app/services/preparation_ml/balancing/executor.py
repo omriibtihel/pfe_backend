@@ -121,6 +121,9 @@ class BalancingExecutor:
 
         try:
             y_proba = predict_proba(X_val)
+            # Retrieve the class-label order used by the model so the optimizer
+            # can pick the correct proba column for the minority class.
+            model_classes = getattr(model, "classes_", None)
             optimizer = ThresholdOptimizer()
             result = optimizer.optimize(
                 y_true=y_arr,
@@ -132,6 +135,7 @@ class BalancingExecutor:
                     else 0.70
                 ),
                 beta=2.0,
+                classes=model_classes,
             )
             self.last_threshold_result = result
             return float(result.optimal_threshold)

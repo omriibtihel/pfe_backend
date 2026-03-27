@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models.training import BalancingAudit
-from app.services.preparation.balancing import BalancingDecision, DataProfile
+from app.services.preparation_ml.balancing import BalancingDecision, DataProfile
 
 
 def _profile_to_dict(profile: DataProfile) -> dict[str, Any]:

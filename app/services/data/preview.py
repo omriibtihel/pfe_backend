@@ -14,8 +14,8 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 from app.services.training.config.schema import TrainingConfig
-from app.services.preparation.preprocessing.preprocessing import build_preprocessor
-from app.services.training.pipeline.splitters import make_holdout_split
+from app.services.preparation_ml.preprocessing.preprocessing import build_preprocessor
+from app.services.preparation_ml.splitters import make_holdout_split
 
 _CACHE_SPLITS_MAX = 64
 _CACHE_PREP_MAX = 32

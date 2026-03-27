@@ -42,11 +42,24 @@ class ThresholdOptimizer:
         strategy: str,
         min_recall: float = 0.70,
         beta: float = 2.0,
+        classes: np.ndarray | None = None,
     ) -> ThresholdResult:
         y_arr = np.asarray(y_true).reshape(-1)
         proba_arr = np.asarray(y_proba)
         if proba_arr.ndim == 2 and proba_arr.shape[1] >= 2:
-            proba_arr = proba_arr[:, 1]
+            # _as_binary_minority maps the minority class → 1; pick the proba
+            # column that corresponds to that minority class so the optimization
+            # direction is correct even when the minority class is at column 0.
+            minority_col = 1  # default (minority is usually the positive class at index 1)
+            if classes is not None and len(classes) == 2 and y_arr.size > 0:
+                values, counts = np.unique(y_arr, return_counts=True)
+                if len(values) == 2:
+                    minority_label = values[int(np.argmin(counts))]
+                    try:
+                        minority_col = list(classes).index(minority_label)
+                    except ValueError:
+                        minority_col = 1
+            proba_arr = proba_arr[:, minority_col]
         proba_arr = proba_arr.reshape(-1)
 
         if y_arr.size == 0 or proba_arr.size == 0 or y_arr.size != proba_arr.size:

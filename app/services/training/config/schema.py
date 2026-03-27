@@ -7,7 +7,15 @@ from typing import Any, Literal, Mapping, Sequence
 from app.services.training.pipeline.models import MODEL_REGISTRY, list_available_models
 
 TaskType = Literal["classification", "regression"]
-SplitMethod = Literal["holdout", "kfold", "stratified_kfold"]
+SplitMethod = Literal[
+    "holdout",
+    "kfold",
+    "stratified_kfold",
+    "repeated_stratified_kfold",
+    "group_kfold",
+    "stratified_group_kfold",
+    "loo",
+]
 ColumnType = Literal["numeric", "categorical", "ordinal"]
 BalancingStrategy = Literal[
     "none",
@@ -29,7 +37,15 @@ DEFAULT_CATEGORICAL_IMPUTATION = "none"
 DEFAULT_CATEGORICAL_ENCODING = "none"
 DEFAULT_NUMERIC_SCALING = "none"
 
-SUPPORTED_SPLIT_METHODS = ["holdout", "kfold", "stratified_kfold"]
+SUPPORTED_SPLIT_METHODS = [
+    "holdout",
+    "kfold",
+    "stratified_kfold",
+    "repeated_stratified_kfold",
+    "group_kfold",
+    "stratified_group_kfold",
+    "loo",
+]
 CLASSIFICATION_METRICS = [
     "accuracy",
     "precision",
@@ -440,6 +456,17 @@ def get_training_capabilities() -> dict[str, Any]:
         "splitMethodDefaults": {
             "kFolds": 5,
             "shuffle": True,
+            "nRepeats": 3,
+            "groupColumn": None,
+        },
+        "splitMethodMeta": {
+            "holdout": {"requiresGroupColumn": False, "requiresNRepeats": False, "maxSamples": None},
+            "kfold": {"requiresGroupColumn": False, "requiresNRepeats": False, "maxSamples": None},
+            "stratified_kfold": {"requiresGroupColumn": False, "requiresNRepeats": False, "maxSamples": None},
+            "repeated_stratified_kfold": {"requiresGroupColumn": False, "requiresNRepeats": True, "maxSamples": None},
+            "group_kfold": {"requiresGroupColumn": True, "requiresNRepeats": False, "maxSamples": None},
+            "stratified_group_kfold": {"requiresGroupColumn": True, "requiresNRepeats": False, "maxSamples": None},
+            "loo": {"requiresGroupColumn": False, "requiresNRepeats": False, "maxSamples": 500},
         },
         "availableModels": list_available_models(),
         "modelHyperparamsSchema": _build_model_hp_capabilities(),
@@ -1156,6 +1183,9 @@ class TrainingConfig:
     custom_code: str = ""
     search_type: str = "none"          # "none" | "grid" | "random"
     n_iter_random_search: int = 40     # only used when search_type == "random"
+    inner_cv_folds: int = 3            # folds for inner GridSearch in nested CV
+    n_repeats: int = 3                 # only used when split_method == "repeated_stratified_kfold"
+    group_column: str | None = None    # only used when split_method in ("group_kfold", "stratified_group_kfold")
 
     @staticmethod
     def from_front(payload: dict[str, Any]) -> "TrainingConfig":
@@ -1169,10 +1199,14 @@ class TrainingConfig:
             return max(0.0, min(v, 0.99))
 
         split_raw = str(payload.get("splitMethod", "holdout")).strip().lower()
-        if split_raw == "stratified_kfold":
-            split_method: SplitMethod = "stratified_kfold"
-        elif split_raw == "kfold":
-            split_method = "kfold"
+        _CV_METHODS = {
+            "kfold", "stratified_kfold",
+            "repeated_stratified_kfold",
+            "group_kfold", "stratified_group_kfold",
+            "loo",
+        }
+        if split_raw in _CV_METHODS:
+            split_method: SplitMethod = split_raw  # type: ignore[assignment]
         else:
             split_method = "holdout"
         legacy_use_smote = _to_bool(payload.get("useSmote"), default=False)
@@ -1200,6 +1234,7 @@ class TrainingConfig:
             search_type=_parse_search_type(payload),
             use_grid_search=_parse_search_type(payload) != "none",
             n_iter_random_search=int(payload.get("nIterRandomSearch", 40) or 40),
+            inner_cv_folds=int(payload.get("innerCvFolds", 3) or 3),
             use_smote=use_smote,
             shuffle=_to_bool(payload.get("shuffle"), default=True),
             balancing=balancing_cfg,
@@ -1210,6 +1245,8 @@ class TrainingConfig:
             random_state=int(payload.get("randomState", 42) or 42),
             dataset_version_id=_to_optional_int(payload.get("datasetVersionId")),
             custom_code=str(payload.get("customCode", "") or ""),
+            n_repeats=int(payload.get("nRepeats", 3) or 3),
+            group_column=str(payload.get("groupColumn", "") or "").strip() or None,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -1227,6 +1264,7 @@ class TrainingConfig:
             "shuffle": bool(self.shuffle),
             "searchType": self.search_type,
             "nIterRandomSearch": self.n_iter_random_search,
+            "innerCvFolds": self.inner_cv_folds,
             "useGridSearch": bool(self.use_grid_search),  # backward compat
             "useSmote": bool(str(self.balancing.strategy) in {"smote", "smote_tomek"}),
             "balancing": self.balancing.as_dict(),
@@ -1236,4 +1274,6 @@ class TrainingConfig:
             "debug": bool(self.debug),
             "randomState": self.random_state,
             "customCode": self.custom_code,
+            "nRepeats": self.n_repeats,
+            "groupColumn": self.group_column,
         }
