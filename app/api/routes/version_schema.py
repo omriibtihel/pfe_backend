@@ -2,57 +2,18 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+import numpy as np
 import pandas as pd
-from pathlib import Path
 
 from app.api.deps import get_current_user, get_db, ensure_project_owner
-from app.models.dataset_version import DatasetVersion
 from app.api.utils.datasets import get_dataset_or_404
 from app.api.utils.nettoyage_df import load_current_df
-
+from app.api.utils.versions import load_version_df
 from app.services.column_inference import infer_kind_for_series
 from app.crud import version_column_schema as crud_schema
 from app.schemas.version_column_schema import ColumnsMetaOut, ColumnKindsIn
 
-from app.core.config import PROJECTS_PATH
-
 router = APIRouter()
-
-
-def _resolve_version_path(project_id: int, version: DatasetVersion) -> Path:
-    # adapte selon tes champs réels: file_path / stored_name / path ...
-    raw = getattr(version, "file_path", None) or getattr(version, "path", None) or getattr(version, "stored_name", None)
-    if not raw:
-        raise HTTPException(status_code=400, detail="Version file path missing")
-
-    p = Path(str(raw))
-    if p.is_absolute():
-        return p
-
-    # cas le plus courant: stored_name dans /projects/{id}/dataset_versions/
-    candidate = PROJECTS_PATH / str(project_id) / "dataset_versions" / p.name
-    return candidate
-
-
-def _load_version_df(db: Session, project_id: int, version_id: int) -> pd.DataFrame:
-    v = (
-        db.query(DatasetVersion)
-        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
-        .one_or_none()
-    )
-    if not v:
-        raise HTTPException(status_code=404, detail="Version not found")
-
-    path = _resolve_version_path(project_id, v)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"Version file not found: {path}")
-
-    try:
-        if path.suffix.lower() == ".parquet":
-            return pd.read_parquet(path)
-        return pd.read_csv(path)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot read version file: {e}")
 
 
 def _build_columns_meta(df: pd.DataFrame, schema_map: dict) -> dict:
@@ -106,7 +67,7 @@ def get_version_columns_meta(
         ds = get_dataset_or_404(db, project_id, workspace_dataset_id)
         df = load_current_df(ds.file_path, workspace_dataset_id)
     else:
-        df = _load_version_df(db, project_id, version_id)
+        df = load_version_df(db, project_id, version_id)
 
     # 2) infer for each col (num/cat/text/binary/...)
     inferred = {}
@@ -137,7 +98,7 @@ def get_version_column_values(
 ):
     """Return sorted unique non-null values for a specific column (used for positive label selector)."""
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     if column not in df.columns:
         raise HTTPException(status_code=404, detail=f"Column '{column}' not found")
     unique_vals = sorted(
@@ -161,7 +122,7 @@ def get_version_column_distribution(
     - Numeric/high-cardinality: histogram with max_bins buckets.
     """
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     if column not in df.columns:
         raise HTTPException(status_code=404, detail=f"Column '{column}' not found")
 
@@ -176,7 +137,6 @@ def get_version_column_distribution(
         return {"type": "categorical", "column": column, "total": total, "bars": bars}
 
     # Numeric / high-cardinality: histogram
-    import numpy as np
     counts, edges = np.histogram(series.astype(float).dropna(), bins=max_bins)
     bars = [
         {

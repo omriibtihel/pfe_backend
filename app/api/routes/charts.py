@@ -254,6 +254,39 @@ def sample_rows(
 
 
 # -------------------------
+# PEARSON CORRELATION (two columns, full dataset)
+# -------------------------
+@router.get("/{dataset_id}/charts/pearson")
+def pearson_correlation(
+    project_id: int,
+    dataset_id: int,
+    x: str = Query(..., description="First numeric column"),
+    y: str = Query(..., description="Second numeric column"),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+    ds = get_dataset_or_404(db, project_id, dataset_id)
+
+    fp = Path(ds.file_path)
+    df = read_df(fp, usecols=[x, y])
+    df.columns = df.columns.astype(str)
+    _ensure_cols_exist(df, [x, y])
+
+    sx = _to_numeric(df[x]).dropna()
+    sy = _to_numeric(df[y]).dropna()
+    common = sx.index.intersection(sy.index)
+    sx, sy = sx.loc[common], sy.loc[common]
+
+    n = len(sx)
+    if n < 3:
+        return {"x": x, "y": y, "r": None, "n": n}
+
+    r, _ = stats.pearsonr(sx.to_numpy(dtype=float), sy.to_numpy(dtype=float))
+    return {"x": x, "y": y, "r": float(r) if np.isfinite(r) else None, "n": n}
+
+
+# -------------------------
 # NORMALITY TEST
 # -------------------------
 class NormalityTestIn(BaseModel):

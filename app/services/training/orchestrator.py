@@ -23,9 +23,14 @@ from app.services.preparation_ml.balancing import (
     resolve,
 )
 from app.services.training.config.schema import TrainingConfig, normalize_model_hyperparams
+from app.services.training.pipeline.confidence import compute_bootstrap_cis
 from app.services.training.pipeline.evaluator import Evaluator
-from app.services.training.pipeline.metrics import get_class_labels
+from app.services.training.pipeline.importance import compute_permutation_importance
+from app.services.training.pipeline.learning_curves import compute_learning_curve
+from app.services.training.pipeline.metrics import get_class_labels, get_proba_or_score
+from app.services.training.pipeline.residuals import compute_residuals
 from app.services.training.pipeline.models import build_model, get_model_capabilities
+from app.services.shap import compute_global_shap
 from app.services.preparation_ml.preprocessing.preprocessing import build_preprocessor
 from app.services.training.output.reporter import Reporter, build_training_schema
 from app.services.preparation_ml.splitters import (
@@ -413,9 +418,13 @@ def _run_holdout(
             model_supports_sample_weight=capabilities["supports_sample_weight"],
             random_state=cfg.random_state,
         )
-        # Threshold optimization is binary-only: disable it silently for multiclass.
+        # Threshold optimization is binary-only: disable it for multiclass with explicit warning.
+        _multiclass_threshold_disabled = False
         if decision.apply_threshold and len(np.unique(np.asarray(split.y_train))) > 2:
             decision.apply_threshold = False
+            _multiclass_threshold_disabled = True
+    else:
+        _multiclass_threshold_disabled = False
 
     executor = BalancingExecutor()
     X_f = X_train_prepared
@@ -549,6 +558,12 @@ def _run_holdout(
             r = executor.last_threshold_result
             threshold_source = "disabled" if r.strategy_used == "disabled" else _threshold_source_raw
 
+        # Surface informational warnings that the frontend can display.
+        if _multiclass_threshold_disabled:
+            executor.postfit_warnings.append("threshold_optimization_disabled_multiclass")
+        if threshold_source == "train_fallback" and optimal_threshold != 0.5:
+            executor.postfit_warnings.append("threshold_calibrated_on_train_data_may_be_optimistic")
+
     # Build and persist the audit record in a single commit after all pipeline stages complete.
     balancing_audit: dict[str, Any] = {}
     if profile is not None:
@@ -668,12 +683,88 @@ def _run_holdout(
             hyperparams_artifacts["best"] = dict(best_params)
     artifacts["hyperparams"] = hyperparams_artifacts
 
+    # Bootstrap confidence intervals on the test set (skipped if test set < 10 samples)
+    _ci_y_proba, _ci_y_score = get_proba_or_score(fitted_pipe, split.X_test)
+    _ci_score_vec: Optional[np.ndarray] = None
+    if _ci_y_proba is not None and _ci_y_proba.ndim == 2 and _ci_y_proba.shape[1] == 2:
+        _ci_score_vec = _ci_y_proba[:, 1]
+    elif _ci_y_score is not None and _ci_y_score.ndim == 1:
+        _ci_score_vec = _ci_y_score
+    bootstrap_cis = compute_bootstrap_cis(
+        split.y_test,
+        test_eval.predictions,
+        y_score=_ci_score_vec,
+        task_type=cfg.task_type,
+    )
+
+    # Learning curves on preprocessed training data (fresh model, no SMOTE).
+    # Skipped when training time is slow (search_type != "none") to avoid doubling runtime.
+    _lc_result: Optional[Dict[str, Any]] = None
+    if cfg.search_type == "none" and len(np.asarray(split.y_train)) >= 30:
+        try:
+            _lc_model = build_model(model_type_norm, cfg.task_type, estimator_hyperparams)
+            _lc_result = compute_learning_curve(
+                _lc_model,
+                X_train_prepared,
+                np.asarray(split.y_train),
+                task_type=cfg.task_type,
+            )
+        except Exception:
+            _lc_result = None
+
+    if _lc_result is not None:
+        artifacts["learning_curves"] = _lc_result
+
+    # Permutation importance + residual analysis on the test set.
+    # Only computed when the test set is large enough to be meaningful.
+    if len(np.asarray(split.y_test)) >= 20:
+        try:
+            _pi_result = compute_permutation_importance(
+                fitted_pipe,
+                split.X_test,
+                np.asarray(split.y_test),
+                task_type=cfg.task_type,
+                feature_names=list(split.X_test.columns),
+            )
+            if _pi_result is not None:
+                artifacts["permutation_importance"] = _pi_result
+        except Exception:
+            pass
+
+        try:
+            _ra_result = compute_residuals(
+                np.asarray(split.y_test),
+                np.asarray(test_eval.predictions),
+                task_type=cfg.task_type,
+            )
+            if _ra_result is not None:
+                artifacts["residual_analysis"] = _ra_result
+        except Exception:
+            pass
+
+        # Global SHAP — computed after permutation importance.
+        # KernelExplainer can be slow; skipped for search_type != "none"
+        # (already slow from hyperparameter tuning).
+        _shap_allowed = cfg.search_type == "none"
+        try:
+            _shap_result = compute_global_shap(
+                fitted_pipe,
+                split.X_test,
+                task_type=cfg.task_type,
+                feature_names=list(split.X_test.columns),
+            ) if _shap_allowed else None
+            if _shap_result is not None:
+                artifacts["shap"] = _shap_result
+        except Exception:
+            pass
+
     metrics_json: Dict[str, Any] = {
         "train": train_eval.metrics,
         "test": test_eval.metrics,
         "training_time_sec": float(time.perf_counter() - t0),
         "threshold_used": optimal_threshold,
         "threshold_source": threshold_source,
+        "confidence_intervals": bootstrap_cis,
     }
     if val_metrics is not None:
         metrics_json["val"] = val_metrics
@@ -1225,14 +1316,18 @@ def _run_kfold_cv(
     optimal_threshold = 0.5
     threshold_f1_gain: Optional[float] = None
     if cfg.task_type == "classification":
-        # Threshold optimization is binary-only: disable it silently for multiclass.
+        # Threshold optimization is binary-only: disable it for multiclass with explicit warning.
+        _cv_multiclass_threshold_disabled = False
         if final_decision.apply_threshold and len(np.unique(np.asarray(y_refit))) > 2:
             final_decision.apply_threshold = False
+            _cv_multiclass_threshold_disabled = True
         optimal_threshold = final_executor.apply_postfit(
             fitted_pipe, X_refit, y_refit, final_decision
         )
         if final_executor.last_threshold_result is not None:
             threshold_f1_gain = float(final_executor.last_threshold_result.improvement_delta)
+        if _cv_multiclass_threshold_disabled:
+            final_executor.postfit_warnings.append("threshold_optimization_disabled_multiclass")
         if final_profile is not None:
             balancing_audit = build_and_persist_audit(
                 profile=final_profile,

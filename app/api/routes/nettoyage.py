@@ -8,12 +8,12 @@ from sqlalchemy.orm import Session
 import pandas as pd
 import numpy as np
 import json
-import warnings
 
 from pathlib import Path
 from uuid import uuid4
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
+from app.services.column_inference import infer_kind_for_series
 from app.api.utils.datasets import get_dataset_or_404
 from app.api.utils.nettoyage_df import load_current_df
 from app.schemas.nettoyage import OperationIn, OperationOut
@@ -52,177 +52,8 @@ def df_preview_payload(df: pd.DataFrame, page: int, page_size: int):
 
 
 # -----------------------------
-# Columns meta (robust, no name hints)
+# Columns meta
 # -----------------------------
-def _safe_to_datetime(sample: pd.Series) -> pd.Series:
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r"Could not infer format.*",
-            category=UserWarning,
-        )
-        try:
-            return pd.to_datetime(sample, errors="coerce", format="mixed", cache=True)
-        except TypeError:
-            return pd.to_datetime(sample, errors="coerce", cache=True)
-
-
-def _is_binary_like(non_null: pd.Series) -> bool:
-    try:
-        vals = non_null.dropna()
-        if vals.empty:
-            return False
-
-        if pd.api.types.is_bool_dtype(vals):
-            return True
-
-        if pd.api.types.is_numeric_dtype(vals):
-            u = set(pd.to_numeric(vals, errors="coerce").dropna().unique().tolist())
-            return u.issubset({0, 1})
-
-        s = vals.astype(str).str.strip().str.lower()
-        u = set(s.unique().tolist())
-        return (
-            u.issubset({"0", "1"})
-            or u.issubset({"true", "false"})
-            or u.issubset({"yes", "no"})
-            or u.issubset({"y", "n"})
-        )
-    except Exception:
-        return False
-
-
-def _numeric_parse_ratio(non_null: pd.Series) -> tuple[float, pd.Series]:
-    x = pd.to_numeric(non_null, errors="coerce")
-    if len(non_null) == 0:
-        return 0.0, x
-    return float(x.notna().mean()), x
-
-
-def _is_int_like_numeric(x: pd.Series) -> bool:
-    x = x.dropna()
-    if x.empty:
-        return False
-    vals = x.astype(float).to_numpy()
-    return np.all(np.isfinite(vals)) and np.all(np.abs(vals - np.round(vals)) < 1e-9)
-
-
-def _datetime_parse_ratio(non_null: pd.Series, max_sample: int = 300) -> float:
-    sample = non_null.astype(str).str.strip().head(max_sample)
-    if len(sample) == 0:
-        return 0.0
-    parsed = _safe_to_datetime(sample)
-    return float(parsed.notna().mean())
-
-
-def _looks_like_text(non_null: pd.Series) -> bool:
-    try:
-        s = non_null.astype(str).str.strip()
-        if s.empty:
-            return False
-        sample = s.head(500)
-        avg_len = float(sample.map(len).mean()) if len(sample) else 0.0
-        nunique = int(sample.nunique(dropna=True))
-        n = int(len(sample))
-        uniq_ratio = nunique / max(1, n)
-        return (avg_len >= 30 and uniq_ratio >= 0.3) or (avg_len >= 45)
-    except Exception:
-        return False
-
-
-def _looks_like_id_int(non_null: pd.Series) -> bool:
-    try:
-        x = pd.to_numeric(non_null, errors="coerce").dropna()
-        if x.empty:
-            return False
-        nunique = int(x.nunique())
-        n = int(len(x))
-        uniq_ratio = nunique / max(1, n)
-        return (uniq_ratio >= 0.995 and nunique >= 50)
-    except Exception:
-        return False
-
-
-def _looks_like_coded_category_int(non_null: pd.Series) -> bool:
-    try:
-        x = pd.to_numeric(non_null, errors="coerce").dropna()
-        if x.empty:
-            return False
-
-        if not _is_int_like_numeric(x):
-            return False
-
-        u = np.array(sorted(set(x.astype(int).tolist())), dtype=int)
-        nunique = int(u.size)
-        if nunique <= 1:
-            return False
-
-        umin, umax = int(u[0]), int(u[-1])
-        span = int(umax - umin)
-
-        consecutive = (span == nunique - 1) and np.all(np.diff(u) == 1)
-        compact = span <= 2 * (nunique - 1)
-        small_range = umax <= 30 and umin >= 0
-
-        if consecutive and umax <= 50 and umin in (0, 1):
-            return True
-
-        if small_range and nunique <= 8 and compact and umax <= 30:
-            return True
-
-        return False
-    except Exception:
-        return False
-
-
-def _infer_kind(series: pd.Series) -> str:
-    s = series.replace([np.inf, -np.inf], np.nan)
-    non_null = s.dropna()
-    if non_null.empty:
-        return "other"
-
-    if _is_binary_like(non_null):
-        return "binary"
-
-    try:
-        if pd.api.types.is_datetime64_any_dtype(s):
-            return "datetime"
-    except Exception:
-        pass
-
-    try:
-        if pd.api.types.is_numeric_dtype(s):
-            x = pd.to_numeric(non_null, errors="coerce").dropna()
-            if x.empty:
-                return "other"
-            if _looks_like_id_int(x):
-                return "id"
-            if _looks_like_coded_category_int(x):
-                return "categorical"
-            return "numeric"
-    except Exception:
-        pass
-
-    str_vals = non_null.astype(str).str.strip()
-    num_ratio, xnum = _numeric_parse_ratio(str_vals)
-    if num_ratio >= 0.98:
-        x = xnum.dropna()
-        if x.empty:
-            return "other"
-        if _looks_like_id_int(x):
-            return "id"
-        if _looks_like_coded_category_int(x):
-            return "categorical"
-        return "numeric"
-
-    dt_ratio = _datetime_parse_ratio(str_vals)
-    if dt_ratio >= 0.85:
-        return "datetime"
-
-    if _looks_like_text(str_vals):
-        return "text"
-
-    return "categorical"
 
 
 def _columns_meta_payload(df: pd.DataFrame):
@@ -248,7 +79,7 @@ def _columns_meta_payload(df: pd.DataFrame):
         non_null = s2.dropna()
         unique = int(non_null.nunique(dropna=True))
 
-        inferred = _infer_kind(s2)
+        inferred, _ = infer_kind_for_series(c, s2)
         kind = inferred if inferred in counts else "other"
         counts[kind] += 1
 

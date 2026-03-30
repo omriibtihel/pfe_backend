@@ -121,25 +121,137 @@ def _level_from_ir(imbalance_ratio: float) -> ImbalanceLevel:
     return ImbalanceLevel.CRITICAL
 
 
-def _recommended_ids(level: ImbalanceLevel) -> set[str]:
+def _resolve_smote_k(minority_count: int, n_samples: int = 0) -> int:
+    """Return a safe k_neighbors for SMOTE given dataset context.
+
+    k must be strictly less than minority_count.  On tiny datasets we use
+    fewer neighbours to reduce the risk of creating nearly identical synthetics.
+    """
+    k_max = max(1, int(minority_count) - 1)  # sklearn requires k < n_minority
+    if n_samples > 0 and n_samples < 200:
+        return min(3, k_max)  # conservative on tiny datasets
+    return min(5, k_max)
+
+
+def _smote_feasibility(
+    binary: bool,
+    minority_count: int,
+    n_samples: int,
+) -> tuple[bool, str | None]:
+    """Return (feasible, reason) for SMOTE.
+
+    Checks beyond the sklearn minimum (k < n_minority):
+    - Tiny datasets: SMOTE with very few minority samples creates synthetic-data
+      dominated training sets, inflating apparent performance.
+    - High synthetic ratio: when IR > 10 and minority is small, >90 % of minority
+      class after SMOTE would be synthetic → unreliable generalisation.
+    """
+    if not binary:
+        return False, "requires_binary_target"
+    if minority_count < 6:
+        return False, f"requires_at_least_6_minority_samples (got {minority_count})"
+
+    # On tiny datasets require at least 20 minority samples to keep synthesis meaningful
+    if n_samples < 200 and minority_count < 20:
+        return False, (
+            f"tiny_dataset_smote_unstable: minority={minority_count}/{n_samples} — "
+            "risk of synthetic-data dominance after equalisation"
+        )
+
+    # Synthetic ratio check: SMOTE (default strategy='auto') equalises classes.
+    # It generates majority_count - minority_count new synthetic minority samples.
+    # When that exceeds 10× the original minority count, the minority class becomes
+    # mostly synthetic and the model learns the SMOTE manifold rather than real data.
+    majority_estimate = n_samples - minority_count
+    synthetic_to_generate = max(0, majority_estimate - minority_count)
+    if minority_count > 0:
+        synthetic_ratio = synthetic_to_generate / minority_count
+        if synthetic_ratio > 10:
+            return False, (
+                f"synthetic_ratio_too_high ({synthetic_ratio:.1f}×): "
+                "SMOTE would generate more than 10× the original minority count — "
+                "use class_weight or threshold optimisation instead"
+            )
+
+    return True, None
+
+
+def _undersampling_feasibility(
+    minority_count: int,
+    n_samples: int,
+) -> tuple[bool, str | None]:
+    """Return (feasible, reason) for random undersampling.
+
+    Post-undersampling the dataset contains 2 × minority_count rows.
+    We require that result to be at least 40 samples and that the dataset
+    is not already tiny (losing majority data on a tiny dataset makes things worse).
+    """
+    if minority_count < 20:
+        return False, f"requires_at_least_20_minority_samples (got {minority_count})"
+
+    post_size = 2 * minority_count
+    if post_size < 40:
+        return False, f"post_undersampling_dataset_too_small ({post_size} samples)"
+
+    # On tiny datasets undersampling discards too much of an already scarce majority
+    if n_samples < 200:
+        return False, (
+            f"undersampling_not_recommended_on_tiny_dataset (n={n_samples}): "
+            f"would reduce to {post_size} samples"
+        )
+
+    return True, None
+
+
+def _recommended_ids(level: ImbalanceLevel, scale: DatasetScale) -> set[str]:
+    """Return the set of strategy IDs that are recommended for this situation.
+
+    Scale matters because resampling on tiny datasets risks worse outcomes
+    than lightweight reweighting / threshold tuning.
+    """
     if level == ImbalanceLevel.BALANCED:
         return {"none"}
+
+    if scale == DatasetScale.TINY:
+        # Tiny datasets: synthetic generation is fragile, prefer reweighting.
+        if level == ImbalanceLevel.MILD:
+            return {"class_weight"}
+        # Moderate / Severe / Critical: add threshold optimisation for extra robustness
+        return {"class_weight", "threshold_optimization"}
+
+    # SMALL / MEDIUM / LARGE
     if level == ImbalanceLevel.MILD:
         return {"class_weight", "threshold_optimization"}
     if level == ImbalanceLevel.MODERATE:
         return {"smote", "class_weight", "threshold_optimization"}
+    # SEVERE / CRITICAL
     return {"smote_tomek", "smote", "class_weight", "threshold_optimization"}
+
+
+def _default_priority(level: ImbalanceLevel, scale: DatasetScale) -> list[str]:
+    """Strategy IDs in descending priority for the default recommendation."""
+    if scale == DatasetScale.TINY:
+        return ["class_weight", "threshold_optimization", "smote", "random_undersampling"]
+    if level == ImbalanceLevel.MILD:
+        return ["class_weight", "threshold_optimization"]
+    if level == ImbalanceLevel.MODERATE:
+        return ["smote", "class_weight", "threshold_optimization", "random_undersampling"]
+    # SEVERE / CRITICAL
+    return ["smote_tomek", "smote", "class_weight", "threshold_optimization", "random_undersampling"]
 
 
 def _build_strategies(
     *,
     binary: bool,
     minority_count: int,
+    n_samples: int,
     level: ImbalanceLevel,
 ) -> list[AvailableStrategy]:
-    recommended_ids = _recommended_ids(level)
-    smote_feasible = bool(binary and minority_count >= 7)
-    undersampling_feasible = bool(minority_count >= 30)
+    scale = _infer_scale(n_samples)
+    recommended_ids = _recommended_ids(level, scale)
+
+    smote_ok, smote_reason = _smote_feasibility(binary, minority_count, n_samples)
+    undersample_ok, undersample_reason = _undersampling_feasibility(minority_count, n_samples)
 
     return [
         AvailableStrategy(
@@ -165,27 +277,27 @@ def _build_strategies(
             label="SMOTE",
             description="Create synthetic minority samples before model fitting.",
             impact=StrategyImpact.MEDIUM.value,
-            recommended=("smote" in recommended_ids),
-            feasible=smote_feasible,
-            infeasible_reason=None if smote_feasible else "requires_binary_target_and_minority_count_at_least_7",
+            recommended=("smote" in recommended_ids) and smote_ok,
+            feasible=smote_ok,
+            infeasible_reason=smote_reason,
         ),
         AvailableStrategy(
             id="smote_tomek",
             label="SMOTE + Tomek",
             description="SMOTE oversampling followed by Tomek links cleanup.",
             impact=StrategyImpact.HIGH.value,
-            recommended=("smote_tomek" in recommended_ids),
-            feasible=smote_feasible,
-            infeasible_reason=None if smote_feasible else "requires_binary_target_and_minority_count_at_least_7",
+            recommended=("smote_tomek" in recommended_ids) and smote_ok,
+            feasible=smote_ok,
+            infeasible_reason=smote_reason,
         ),
         AvailableStrategy(
             id="random_undersampling",
             label="Random undersampling",
             description="Downsample majority class to match minority class size.",
             impact=StrategyImpact.HIGH.value,
-            recommended=("random_undersampling" in recommended_ids),
-            feasible=undersampling_feasible,
-            infeasible_reason=None if undersampling_feasible else "requires_minority_count_at_least_30",
+            recommended=("random_undersampling" in recommended_ids) and undersample_ok,
+            feasible=undersample_ok,
+            infeasible_reason=undersample_reason,
         ),
         AvailableStrategy(
             id="threshold_optimization",
@@ -199,14 +311,28 @@ def _build_strategies(
     ]
 
 
-def _default_recommendation(level: ImbalanceLevel, strategies: list[AvailableStrategy]) -> str:
+def _default_recommendation(
+    level: ImbalanceLevel,
+    strategies: list[AvailableStrategy],
+    scale: DatasetScale,
+) -> str:
     if level == ImbalanceLevel.BALANCED:
         return "none"
-    for strategy in strategies:
-        if strategy.id == "none":
-            continue
-        if strategy.recommended and strategy.feasible:
-            return strategy.id
+
+    strategy_map = {s.id: s for s in strategies}
+
+    # First pass: recommended AND feasible, in priority order
+    for sid in _default_priority(level, scale):
+        s = strategy_map.get(sid)
+        if s is not None and s.feasible and s.recommended:
+            return sid
+
+    # Second pass: any feasible (non-none) strategy in priority order
+    for sid in _default_priority(level, scale):
+        s = strategy_map.get(sid)
+        if s is not None and s.feasible and sid != "none":
+            return sid
+
     return "class_weight"
 
 
@@ -230,7 +356,7 @@ def profile_binary_dataset(y: np.ndarray, X_shape: tuple[Any, ...]) -> DataProfi
 
     n_samples = int(len(y_arr))
     n_features = int(X_shape[1]) if len(X_shape) >= 2 else 0
-    scale = _infer_scale(n_samples).value
+    scale = _infer_scale(n_samples)
 
     warnings: list[str] = []
     if len(values) < 2:
@@ -265,21 +391,28 @@ def profile_binary_dataset(y: np.ndarray, X_shape: tuple[Any, ...]) -> DataProfi
     if not needs_balancing:
         warnings.append("dataset_is_already_balanced")
 
-    if minority_count < 6:
-        warnings.append("smote_requires_minority_count_at_least_6")
-    if minority_count < 30:
-        warnings.append("random_undersampling_requires_minority_count_at_least_30")
-    if level in {ImbalanceLevel.SEVERE, ImbalanceLevel.CRITICAL}:
-        warnings.append("severe_imbalance_detected")
+    # Scale-aware warnings
     if n_samples < 200:
         warnings.append("tiny_dataset_high_variance_risk")
+
+    smote_ok, smote_reason = _smote_feasibility(len(values) == 2, int(minority_count), n_samples)
+    if not smote_ok and needs_balancing:
+        warnings.append(f"smote_infeasible: {smote_reason}")
+
+    undersample_ok, undersample_reason = _undersampling_feasibility(int(minority_count), n_samples)
+    if not undersample_ok and needs_balancing:
+        warnings.append(f"random_undersampling_infeasible: {undersample_reason}")
+
+    if level in {ImbalanceLevel.SEVERE, ImbalanceLevel.CRITICAL}:
+        warnings.append("severe_imbalance_detected")
 
     strategies = _build_strategies(
         binary=(len(values) == 2),
         minority_count=int(minority_count),
+        n_samples=n_samples,
         level=level,
     )
-    default_recommendation = _default_recommendation(level, strategies)
+    default_rec = _default_recommendation(level, strategies, scale)
 
     if needs_balancing:
         summary_message = (
@@ -295,7 +428,7 @@ def profile_binary_dataset(y: np.ndarray, X_shape: tuple[Any, ...]) -> DataProfi
     return DataProfile(
         n_samples=n_samples,
         n_features=n_features,
-        scale=scale,
+        scale=scale.value,
         majority=BinaryClassProfile(
             label=majority_label,
             count=int(majority_count),
@@ -313,7 +446,7 @@ def profile_binary_dataset(y: np.ndarray, X_shape: tuple[Any, ...]) -> DataProfi
         imbalance_level=level,
         needs_balancing=needs_balancing,
         available_strategies=strategies,
-        default_recommendation=default_recommendation,
+        default_recommendation=default_rec,
         summary_message=summary_message,
         warnings=warnings,
         metric_advice=_build_metric_advice(level, needs_balancing),

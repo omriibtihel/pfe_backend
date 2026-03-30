@@ -18,7 +18,6 @@ import numpy as np
 
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.models.project import Project
 from app.models.dataset import Dataset
 from app.schemas.database import (
     DatasetOverviewOut,
@@ -30,8 +29,6 @@ from app.schemas.database import (
 )
 
 router = APIRouter()
-
-ALLOWED_EXTS = {".csv", ".xlsx", ".xls"}
 
 
 
@@ -149,6 +146,13 @@ def dataset_profile(
 
     df = read_df(Path(dataset.file_path))
 
+    def _getf(desc, k):
+        v = desc.get(k)
+        try:
+            return float(v) if pd.notna(v) else None
+        except Exception:
+            return None
+
     shape = {"rows": int(df.shape[0]), "cols": int(df.shape[1])}
     profiles = []
     n_rows = len(df)
@@ -171,23 +175,15 @@ def dataset_profile(
         if pd.api.types.is_numeric_dtype(s):
             kind = "numeric"
             desc = s.describe(percentiles=[0.25, 0.5, 0.75])
-
-            def getf(k):
-                v = desc.get(k)
-                try:
-                    return float(v) if pd.notna(v) else None
-                except Exception:
-                    return None
-
             numeric = {
                 "count": int(desc.get("count", 0) or 0),
-                "mean": getf("mean"),
-                "std": getf("std"),
-                "min": getf("min"),
-                "p25": getf("25%"),
-                "p50": getf("50%"),
-                "p75": getf("75%"),
-                "max": getf("max"),
+                "mean": _getf(desc, "mean"),
+                "std": _getf(desc, "std"),
+                "min": _getf(desc, "min"),
+                "p25": _getf(desc, "25%"),
+                "p50": _getf(desc, "50%"),
+                "p75": _getf(desc, "75%"),
+                "max": _getf(desc, "max"),
             }
 
         elif pd.api.types.is_datetime64_any_dtype(s):
@@ -199,15 +195,13 @@ def dataset_profile(
                 .head(top_k)
             )
             categorical = {
-                "unique": nunique,
+                "unique": unique,
                 "top_values": [{"value": str(idx), "count": int(cnt)} for idx, cnt in vc.items()],
             }
 
         else:
-            nunique = unique  # déjà calculé
-            ratio = (nunique / max(1, n_rows)) if n_rows else 0
+            ratio = (unique / max(1, n_rows)) if n_rows else 0
             kind = "categorical" if ratio < 0.5 else "text"
-
             vc = (
                 s.astype(str)
                 .fillna("")
@@ -216,7 +210,7 @@ def dataset_profile(
                 .head(top_k)
             )
             categorical = {
-                "unique": nunique,
+                "unique": unique,
                 "top_values": [{"value": str(idx), "count": int(cnt)} for idx, cnt in vc.items()],
             }
 

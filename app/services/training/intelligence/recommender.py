@@ -190,7 +190,16 @@ class RecommendationEngine:
         k_folds = _recommend_k_folds(profile)
         cv = profile.recommended_cv_strategy
 
-        imbalance_rec = recommend_imbalance_strategy(profile)
+        # Compute minority_count from profile for precise SMOTE feasibility checks
+        _minority_count: int | None = None
+        if profile.minority_ratio is not None and profile.n_samples > 0:
+            _minority_count = max(1, int(round(profile.minority_ratio * profile.n_samples)))
+
+        imbalance_rec = recommend_imbalance_strategy(
+            profile,
+            minority_count=_minority_count,
+            n_samples=profile.n_samples,
+        )
         resampling = imbalance_rec.strategy
         apply_threshold = imbalance_rec.apply_threshold
 
@@ -222,12 +231,24 @@ class RecommendationEngine:
                 "Very small dataset: results may have high variance. "
                 "Prefer cross-validation over a simple train/test split."
             )
+        # Surface any SMOTE/undersampling feasibility notes from imbalance handler
+        for note in imbalance_rec.feasibility_notes:
+            warnings.append(note)
+
+        # Choose threshold strategy based on imbalance severity.
+        # For severe/critical imbalance, maximize_f2 (beta=2) penalises false negatives more
+        # heavily than false positives — i.e., it prioritises not missing minority cases.
+        # For mild/moderate we default to maximize_f1 (balanced precision/recall).
+        if imbalance_rec.severity in {"severe", "critical"} and apply_threshold:
+            threshold_strategy = "maximize_f2"
+        else:
+            threshold_strategy = "maximize_f1"
 
         # Build the unified payload dict (ready for TrainingConfig.from_front)
         balancing_payload: dict[str, Any] = {
             "strategy": resampling or "none",
             "apply_threshold": apply_threshold,
-            "threshold_strategy": "maximize_f1",
+            "threshold_strategy": threshold_strategy,
         }
 
         payload: dict[str, Any] = {

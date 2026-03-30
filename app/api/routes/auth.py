@@ -15,6 +15,20 @@ os.makedirs(PROFILES_DIR, exist_ok=True)
 
 router = APIRouter()
 
+_ALLOWED_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+
+async def _save_profile_photo(file: UploadFile) -> str:
+    ext = os.path.splitext(file.filename or "")[-1].lower()
+    if ext not in _ALLOWED_PHOTO_EXTS:
+        raise HTTPException(status_code=400, detail="Format de photo non supporté")
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest = os.path.join(PROFILES_DIR, filename)
+    content = await file.read()
+    with open(dest, "wb") as f:
+        f.write(content)
+    return f"/static/profiles/{filename}"
+
 
 # -------------------------
 # SIGNUP
@@ -41,15 +55,7 @@ async def signup(
 
     photo_path: str | None = None
     if profile_photo and profile_photo.filename:
-        ext = os.path.splitext(profile_photo.filename)[-1].lower()
-        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
-            raise HTTPException(status_code=400, detail="Format de photo non supporté")
-        filename = f"{uuid.uuid4().hex}{ext}"
-        dest = os.path.join(PROFILES_DIR, filename)
-        content = await profile_photo.read()
-        with open(dest, "wb") as f:
-            f.write(content)
-        photo_path = f"/static/profiles/{filename}"
+        photo_path = await _save_profile_photo(profile_photo)
 
     user = User(
         full_name=full_name,
@@ -133,15 +139,7 @@ async def update_me(
         current_user.hospital = hospital or None
 
     if profile_photo and profile_photo.filename:
-        ext = os.path.splitext(profile_photo.filename)[-1].lower()
-        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
-            raise HTTPException(status_code=400, detail="Format de photo non supporté")
-        filename = f"{uuid.uuid4().hex}{ext}"
-        dest = os.path.join(PROFILES_DIR, filename)
-        content = await profile_photo.read()
-        with open(dest, "wb") as f:
-            f.write(content)
-        current_user.profile_photo = f"/static/profiles/{filename}"
+        current_user.profile_photo = await _save_profile_photo(profile_photo)
 
     db.commit()
     db.refresh(current_user)

@@ -3,10 +3,12 @@
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
+from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     balanced_accuracy_score,
+    brier_score_loss,
     confusion_matrix,
     mean_absolute_error,
     mean_squared_error,
@@ -417,6 +419,35 @@ def compute_roc_pr_curves(
         return None
 
 
+def compute_calibration_curve(
+    y_true_bin: np.ndarray,
+    y_proba: np.ndarray,
+    *,
+    n_bins: int = 10,
+) -> Optional[Dict[str, Any]]:
+    """
+    Compute a calibration (reliability) curve and Brier score for binary classification.
+
+    Returns a dict with:
+      "points":       [[mean_predicted_prob, fraction_of_positives], ...]
+      "brier_score":  float  (lower is better; perfect calibration → 0)
+      "n_bins":       int
+    or None if computation fails.
+    """
+    try:
+        fraction_of_positives, mean_predicted_value = calibration_curve(
+            y_true_bin, y_proba, n_bins=n_bins, strategy="uniform"
+        )
+        brier = float(brier_score_loss(y_true_bin, y_proba))
+        points = [
+            [float(mp), float(fp)]
+            for mp, fp in zip(mean_predicted_value.tolist(), fraction_of_positives.tolist())
+        ]
+        return {"points": points, "brier_score": brier, "n_bins": n_bins}
+    except Exception:
+        return None
+
+
 def compute_classification_metrics(
     y_true,
     y_pred,
@@ -666,6 +697,10 @@ def compute_classification_metrics(
                     global_metrics["pr_auc"] = float(average_precision_score(y_true_bin, score_vector))
                 except Exception as exc:
                     warnings.append(f"PR-AUC unavailable for binary classification: {exc}")
+                try:
+                    global_metrics["brier_score"] = float(brier_score_loss(y_true_bin, score_vector))
+                except Exception as exc:
+                    warnings.append(f"Brier score unavailable: {exc}")
 
     if classification_type == "multiclass":
         roc_auc, pr_auc = _compute_multiclass_auc(
@@ -687,6 +722,7 @@ def compute_classification_metrics(
             "f1": binary_block.get("f1_pos"),
             "roc_auc": global_metrics.get("roc_auc"),
             "pr_auc": global_metrics.get("pr_auc"),
+            "brier_score": global_metrics.get("brier_score"),
             "precision_pos": binary_block.get("precision_pos"),
             "recall_pos": binary_block.get("recall_pos"),
             "f1_pos": binary_block.get("f1_pos"),
@@ -755,11 +791,30 @@ def compute_classification_metrics(
     }
     if classification_type == "binary":
         out["binary"] = binary_block
-        # Compute ROC/PR curves (stored so orchestrator can copy them into artifacts_json)
+        # Compute ROC/PR + calibration curves (stored so orchestrator can copy into artifacts_json)
         if pos_label is not None and score_vector is not None:
             _y_true_bin = np.asarray(y_true_arr == pos_label, dtype=int)
             if int(np.unique(_y_true_bin).size) == 2:
-                out["curves"] = compute_roc_pr_curves(_y_true_bin, score_vector)
+                curves = compute_roc_pr_curves(_y_true_bin, score_vector) or {}
+                # Use proba for calibration when available (more accurate); fall back to score_vector
+                _proba_for_cal = None
+                if proba is not None:
+                    try:
+                        _proba_for_cal = _extract_binary_score(
+                            y_score=None,
+                            proba=proba,
+                            score_labels=score_labels,
+                            positive_label=pos_label,
+                            estimator=None,
+                            warnings=[],
+                        )[0]
+                    except Exception:
+                        pass
+                cal_proba = _proba_for_cal if _proba_for_cal is not None else score_vector
+                cal_result = compute_calibration_curve(_y_true_bin, cal_proba)
+                if cal_result is not None:
+                    curves["calibration"] = cal_result
+                out["curves"] = curves if curves else None
 
     out.update(legacy_flat)
     return out

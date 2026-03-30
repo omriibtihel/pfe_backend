@@ -13,6 +13,7 @@ from app.api.routes.nettoyage import router as nettoyage_router
 from app.api.routes.versions import router as versions_router
 from app.api.routes.preparation import router as preparation_router
 from app.api.routes.training import router as training_router
+from app.api.routes.prediction import router as prediction_router
 from app.api.routes.versions_workspace import router as versions_workspace_router
 from app.api.routes.version_schema import router as version_schema_router
 
@@ -56,6 +57,7 @@ app.include_router(nettoyage_router, prefix="/api/projects/{project_id}", tags=[
 app.include_router(versions_router, prefix="/api/projects/{project_id}/versions", tags=["versions"])
 app.include_router(preparation_router, prefix="/api/projects/{project_id}/training", tags=["preparation"])
 app.include_router(training_router, prefix="/api/projects/{project_id}/training", tags=["training"])
+app.include_router(prediction_router, prefix="/api/projects/{project_id}/training", tags=["prediction"])
 app.include_router(versions_workspace_router,prefix="/api/projects/{project_id}/versions",tags=["versions-workspace"],)
 app.include_router(version_schema_router,prefix="/api/projects/{project_id}/versions",tags=["versions-schema"],)
 

@@ -14,8 +14,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_current_user
-from app.models.project import Project
+from app.api.deps import ensure_project_owner, get_current_user, get_db
 from app.schemas.preparation import (
     BalanceAnalysisIn,
     BalanceAnalysisResponse,
@@ -40,14 +39,6 @@ router = APIRouter()
 # ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _get_owned_project(db: Session, project_id: int, user_id: int) -> Project:
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if project.owner_id != user_id:
-        raise HTTPException(status_code=403, detail="Not allowed")
-    return project
 
 
 def _build_binary_profile(df, target_column: str) -> DataProfile:
@@ -135,7 +126,7 @@ def get_capabilities(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    ensure_project_owner(db, project_id, current_user.id)
     return get_training_capabilities()
 
 
@@ -146,7 +137,7 @@ def validate_training(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    ensure_project_owner(db, project_id, current_user.id)
 
     version_id = payload.datasetVersionId
     if version_id is None:
@@ -192,7 +183,7 @@ def analyze_balance(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user.id)
+    ensure_project_owner(db, project_id, current_user.id)
 
     try:
         dataset_path, _ = resolve_dataset_path(db, project_id, payload.version_id)
@@ -216,7 +207,7 @@ def profile_dataset(
     Returns a DatasetProfile describing size, task type, imbalance,
     missing values, feature types, and initial recommendations.
     """
-    _get_owned_project(db, project_id, current_user.id)
+    ensure_project_owner(db, project_id, current_user.id)
     try:
         dataset_path, _ = resolve_dataset_path(db, project_id, payload.version_id)
         df = load_dataframe(dataset_path)

@@ -456,6 +456,82 @@ def predict_with_trained_model(
     }
 
 
+def predict_with_shap(
+    trained_model: TrainedModel,
+    raw_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """
+    Run inference and attach per-row local SHAP explanations.
+
+    Delegates to predict_with_trained_model for the core prediction, then
+    adds a "shap" key to each row containing the local SHAP values.
+
+    Falls back gracefully: if SHAP computation fails, rows are returned
+    without the "shap" key (no exception raised to the caller).
+    """
+    # Core prediction — raises on failure (pkl missing, inference error, etc.)
+    result = predict_with_trained_model(trained_model, raw_df)
+
+    # SHAP enrichment — best-effort, never breaks prediction
+    try:
+        from app.services.shap import compute_local_shap
+
+        artifacts = trained_model.artifacts_json or {}
+        task_type = str(trained_model.task_type or "classification").lower()
+        training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
+        feature_names: List[str] = training_schema.get("feature_names") or []
+
+        pkl_path_str = artifacts.get("model_pkl")
+        if not pkl_path_str:
+            return result
+
+        from pathlib import Path
+        pkl_path = Path(str(pkl_path_str))
+        if not pkl_path.exists():
+            return result
+
+        from app.services.training.output.persistence import load_pipeline
+        pipeline = load_pipeline(pkl_path)
+
+        # Reload the background data saved at training time (in artifacts["shap"]).
+        # This avoids the all-zeros bug where background == input row.
+        background: Optional[np.ndarray] = None
+        shap_artifacts = artifacts.get("shap") or {}
+        raw_bg = shap_artifacts.get("background_data")
+        if raw_bg:
+            try:
+                background = np.array(raw_bg, dtype=float)
+            except Exception:
+                background = None
+
+        # Normalize input dtypes the same way predict_with_trained_model does,
+        # then align to feature_names before passing to SHAP
+        df_aligned = _normalize_input_dtypes(raw_df.copy(), pipeline)
+        if feature_names:
+            for col in feature_names:
+                if col not in df_aligned.columns:
+                    df_aligned[col] = np.nan
+            df_aligned = df_aligned[feature_names]
+
+        # Compute local SHAP for each row individually
+        for i, row_result in enumerate(result["rows"]):
+            row_df = df_aligned.iloc[[i]]
+            shap_items = compute_local_shap(
+                pipeline,
+                row_df,
+                task_type=task_type,
+                background=background,
+                feature_names=feature_names if feature_names else None,
+            )
+            if shap_items is not None:
+                row_result["shap"] = shap_items
+
+    except Exception as exc:
+        logger.warning("predict_with_shap: SHAP enrichment failed (model_id=%s): %s", trained_model.id, exc)
+
+    return result
+
+
 def predict_rows_json(
     trained_model: TrainedModel,
     rows: List[Dict[str, Any]],

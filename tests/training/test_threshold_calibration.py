@@ -85,10 +85,10 @@ def _cfg(
 def test_threshold_fallback_to_train_when_no_val_set():
     """
     Quand apply_threshold=True mais val_ratio=0 :
-    - le seuil est calibré sur X_train (fallback)
-    - threshold_source contient "train_fallback"
-    - optimal_threshold != 0.5 (l'optimizer trouve un seuil utile)
-    - threshold_used dans metrics_json reflète ce seuil
+    - le seuil est calibré sur X_train (fallback) → threshold_source contient "train_fallback"
+    - threshold_used est un float valide dans [0, 1]
+    - NOTE: le seuil peut rester à 0.5 si l'optimizer ne trouve pas d'amélioration
+      (comportement correct depuis le fix "revert if no improvement").
     """
     df = _make_imbalanced_df()
     cfg = _cfg(apply_threshold=True, strategy="smote", val_ratio=0)
@@ -96,16 +96,14 @@ def test_threshold_fallback_to_train_when_no_val_set():
     res = orchestrator.run_one_model(df, cfg, model_type="randomforest")
 
     threshold_source = res.metrics_json.get("threshold_source", "")
-    threshold_used   = float(res.metrics_json.get("threshold_used", 0.5))
+    threshold_used   = float(res.metrics_json.get("threshold_used", -1.0))
 
     assert "train_fallback" in threshold_source, (
         f"Attendu 'train_fallback' dans threshold_source, obtenu: {threshold_source!r}. "
         "Le fallback sur X_train n'a pas été déclenché."
     )
-    assert threshold_used != 0.5, (
-        f"optimal_threshold={threshold_used} — le threshold optimizer n'a pas trouvé de seuil "
-        "différent de 0.5, ce qui suggère que le fallback n'a pas fonctionné ou que les "
-        "probabilités RF sont constantes."
+    assert 0.0 <= threshold_used <= 1.0, (
+        f"threshold_used={threshold_used} hors plage [0, 1]"
     )
 
 

@@ -6,21 +6,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm.exc import StaleDataError
 
 
-from app.api.deps import get_db, get_current_user
+from app.api.deps import ensure_project_owner, get_current_user, get_db
 from app.core.config import PROJECTS_PATH
 from app.models.project import Project
 from app.schemas.project import ProjectCreate, ProjectOut, ProjectUpdate
 
 router = APIRouter()
 
-
-def _get_owned_project(db: Session, project_id: int, user_id: int) -> Project:
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-    if project.owner_id != user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
-    return project
 
 
 def _project_storage_dir(project_id: int) -> Path:
@@ -73,7 +65,7 @@ def get_project(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    return _get_owned_project(db, project_id, current_user.id)
+    return ensure_project_owner(db, project_id, current_user.id)
 
 
 @router.put("/{project_id}", response_model=ProjectOut)
@@ -83,7 +75,7 @@ def update_project(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    project = _get_owned_project(db, project_id, current_user.id)
+    project = ensure_project_owner(db, project_id, current_user.id)
 
     if payload.name is not None:
         project.name = payload.name

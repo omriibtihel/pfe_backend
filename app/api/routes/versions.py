@@ -15,7 +15,7 @@ from starlette.responses import FileResponse
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
 from app.models.dataset_version import DatasetVersion
-from app.api.routes.version_schema import _load_version_df
+from app.api.utils.versions import load_version_df
 
 router = APIRouter()
 
@@ -237,7 +237,7 @@ def version_overview(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     shape = {"rows": int(df.shape[0]), "cols": int(df.shape[1])}
     columns = [str(c) for c in df.columns]
     dtypes = {str(col): str(dtype) for col, dtype in df.dtypes.items()}
@@ -256,7 +256,7 @@ def version_profile(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
 
     shape = {"rows": int(df.shape[0]), "cols": int(df.shape[1])}
     n_rows = len(df)
@@ -336,7 +336,7 @@ def version_correlation(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     df.columns = df.columns.astype(str)
     cols = [str(c) for c in columns]
 
@@ -367,7 +367,7 @@ def version_value_counts(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     df.columns = df.columns.astype(str)
     _ensure_cols(df, [col])
 
@@ -401,7 +401,7 @@ def version_aggregate(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     df.columns = df.columns.astype(str)
 
     if agg is None:
@@ -454,7 +454,7 @@ def version_histogram(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     df.columns = df.columns.astype(str)
     _ensure_cols(df, [col])
 
@@ -486,7 +486,7 @@ def version_sample(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     df.columns = df.columns.astype(str)
     if not cols:
         raise HTTPException(status_code=400, detail="Parameter 'cols' is required.")
@@ -499,6 +499,33 @@ def version_sample(
     k = min(n, len(sub))
     sampled = sub.sample(n=k, random_state=0) if len(sub) > k else sub
     return {"cols": cols, "rows": sampled.replace({np.nan: None}).to_dict(orient="records")}
+
+
+@router.get("/{version_id}/charts/pearson")
+def version_pearson_correlation(
+    project_id: int,
+    version_id: int,
+    x: str = Query(...),
+    y: str = Query(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+    df = load_version_df(db, project_id, version_id)
+    df.columns = df.columns.astype(str)
+    _ensure_cols(df, [x, y])
+
+    sx = pd.to_numeric(df[x], errors="coerce").dropna()
+    sy = pd.to_numeric(df[y], errors="coerce").dropna()
+    common = sx.index.intersection(sy.index)
+    sx, sy = sx.loc[common], sy.loc[common]
+
+    n = len(sx)
+    if n < 3:
+        return {"x": x, "y": y, "r": None, "n": n}
+
+    r, _ = stats.pearsonr(sx.to_numpy(dtype=float), sy.to_numpy(dtype=float))
+    return {"x": x, "y": y, "r": float(r) if np.isfinite(r) else None, "n": n}
 
 
 class VersionNormalityTestIn(BaseModel):
@@ -517,7 +544,7 @@ def version_normality_test(
     if not body.columns:
         raise HTTPException(status_code=400, detail="At least one column is required.")
 
-    df = _load_version_df(db, project_id, version_id)
+    df = load_version_df(db, project_id, version_id)
     df.columns = df.columns.astype(str)
     _ensure_cols(df, body.columns)
 

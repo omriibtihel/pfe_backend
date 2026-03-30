@@ -11,6 +11,7 @@ from app.api.utils.workspaces import get_or_create_workspace_for_version
 from app.crud import nettoyage as crud_nettoyage
 from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion
+from app.models.processing_operation import ProcessingOperation
 from app.core.config import PROJECTS_PATH
 
 router = APIRouter()
@@ -115,9 +116,7 @@ def commit_workspace(
     db.add(version)
     db.commit()
 
-    # 7) 🧹 Nettoyage workspace (recommandé)
-    from app.models.processing_operation import ProcessingOperation
-
+    # 7) 🧹 Nettoyage workspace
     db.query(ProcessingOperation).filter(
         ProcessingOperation.project_id == project_id,
         ProcessingOperation.dataset_id == ws.id,

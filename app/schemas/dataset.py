@@ -33,3 +33,11 @@ class DatasetPreviewOut(BaseModel):
     page: int = 1
     page_size: int = 50
     total_rows: int = 0
+
+
+class DatasetTargetIn(BaseModel):
+    target_column: str | None = None
+
+
+class DatasetTargetOut(BaseModel):
+    target_column: str | None = None

@@ -12,27 +12,12 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, get_current_user, ensure_project_owner
 from app.api.utils.df import read_df
 from app.core.config import PROJECTS_PATH
-from app.models.project import Project
 from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion
 from app.api.utils.datasets import get_dataset_or_404
 
-from app.schemas.dataset import DatasetOut, DatasetPreviewOut
-
-# active dataset schemas
+from app.schemas.dataset import DatasetOut, DatasetPreviewOut, DatasetTargetIn, DatasetTargetOut
 from app.schemas.dataset_active import ActiveDatasetIn, ActiveDatasetOut
-
-# ✅ schemas target dataset (à créer si tu ne les as pas)
-# si tu préfères, je te donne après les fichiers schema
-from pydantic import BaseModel
-
-
-class DatasetTargetIn(BaseModel):
-    target_column: str | None = None
-
-
-class DatasetTargetOut(BaseModel):
-    target_column: str | None = None
 
 
 router = APIRouter()

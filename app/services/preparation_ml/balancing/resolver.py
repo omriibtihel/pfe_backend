@@ -32,8 +32,12 @@ def _dedupe(values: list[str]) -> list[str]:
     return out
 
 
-def _resolve_smote_k(minority_count: int) -> int:
-    return max(1, min(5, int(minority_count) - 2))
+def _resolve_smote_k(minority_count: int, n_samples: int = 0) -> int:
+    """Return a safe k_neighbors for SMOTE.  Mirrors profiler._resolve_smote_k."""
+    k_max = max(1, int(minority_count) - 1)
+    if n_samples > 0 and n_samples < 200:
+        return min(3, k_max)
+    return min(5, k_max)
 
 
 def resolve(
@@ -120,7 +124,7 @@ def resolve(
             )
             strategy = "none"
     elif requested_strategy == "smote":
-        smote_k_neighbors = _resolve_smote_k(profile.minority.count)
+        smote_k_neighbors = _resolve_smote_k(profile.minority.count, profile.n_samples)
         flags.extend(["smote", f"smote_k_neighbors_{smote_k_neighbors}"])
         rationale = (
             "User selected SMOTE; synthetic minority oversampling is applied on the training split "
@@ -128,7 +132,7 @@ def resolve(
         )
         strategy = "smote"
     elif requested_strategy == "smote_tomek":
-        smote_k_neighbors = _resolve_smote_k(profile.minority.count)
+        smote_k_neighbors = _resolve_smote_k(profile.minority.count, profile.n_samples)
         flags.extend(["smote_tomek", f"smote_k_neighbors_{smote_k_neighbors}"])
         rationale = (
             "User selected SMOTE+Tomek; training data is oversampled then cleaned "

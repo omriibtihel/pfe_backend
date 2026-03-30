@@ -137,6 +137,21 @@ class BalancingExecutor:
                 beta=2.0,
                 classes=model_classes,
             )
+            # Revert to 0.5 if the optimized threshold brings no improvement or degrades F1.
+            if result.improvement_delta <= 0.0:
+                self.postfit_warnings.append(
+                    f"threshold_reverted_no_improvement (delta={result.improvement_delta:.4f})"
+                )
+                self.last_threshold_result = ThresholdResult(
+                    optimal_threshold=0.5,
+                    strategy_used=result.strategy_used,
+                    f1_at_threshold=result.default_threshold_f1,
+                    precision_at_threshold=result.precision_at_threshold,
+                    recall_at_threshold=result.recall_at_threshold,
+                    default_threshold_f1=result.default_threshold_f1,
+                    improvement_delta=result.improvement_delta,
+                )
+                return 0.5
             self.last_threshold_result = result
             return float(result.optimal_threshold)
         except Exception as exc:
