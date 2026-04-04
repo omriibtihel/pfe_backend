@@ -145,14 +145,28 @@ def extract_tuning_fields(artifacts: dict) -> tuple[dict, Any]:
     _raw = gs.get("cv_results_summary")
     cv_results_summary: Optional[list] = None
     if isinstance(_raw, list) and _raw:
-        cv_results_summary = [
-            {
+        _mapped = []
+        for row in _raw:
+            if not isinstance(row, dict):
+                continue
+            entry: dict = {
                 "params": dict(row.get("params") or {}),
                 "mean_score": float(row.get("mean_score") or row.get("mean_test_score") or 0.0),
             }
-            for row in _raw
-            if isinstance(row, dict)
-        ]
+            # Optional enrichment fields — present only when available
+            if row.get("mean_train_score") is not None:
+                entry["mean_train_score"] = float(row["mean_train_score"])
+            if row.get("overfit_gap") is not None:
+                entry["overfit_gap"] = float(row["overfit_gap"])
+            if row.get("mean_fit_time_s") is not None:
+                entry["mean_fit_time_s"] = float(row["mean_fit_time_s"])
+            # HalvingRandomSearchCV-specific
+            if row.get("halving_iter") is not None:
+                entry["halving_iter"] = int(row["halving_iter"])
+            if row.get("n_resources") is not None:
+                entry["n_resources"] = int(row["n_resources"])
+            _mapped.append(entry)
+        cv_results_summary = _mapped or None
 
     grid_search_block = {
         "enabled": bool(gs.get("enabled", False)),
@@ -292,6 +306,9 @@ def model_to_front_result(
             "recall_pos": mget("recall_pos"),
             "f1_pos": mget("f1_pos"),
             "f1_macro": mget("f1_macro"),
+            "specificity": mget("specificity"),
+            "npv": mget("npv"),
+            "mcc": mget("mcc"),
             "mse": mget("mse"),
             "rmse": mget("rmse"),
             "mae": mget("mae"),

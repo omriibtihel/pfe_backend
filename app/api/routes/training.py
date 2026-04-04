@@ -8,7 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse as _StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import ensure_project_owner, get_current_user, get_db
+from app.api.deps import ensure_project_owner, get_current_user, get_current_user_sse, get_db
 from app.crud import training as crud_training
 from app.models.training import TrainingSession
 from app.schemas.training import (
@@ -108,7 +108,7 @@ async def stream_training_events(
     session_id: int,
     last_seq: int = -1,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_user_sse),
 ):
     ensure_project_owner(db, project_id, current_user.id)
 

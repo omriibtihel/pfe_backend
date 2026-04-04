@@ -20,6 +20,7 @@ redis==5.0.8
 email-validator==2.2.0
 xgboost
 lightgbm
+catboost
 imbalanced-learn
 
 scikit-learn==1.3.2
@@ -27,3 +28,13 @@ pandas==2.2.3
 numpy==1.26.4
 
 flaml[automl]>=2.1.0
+
+# ── Pipeline imagerie (deep learning) ────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+albumentations>=1.3.1
+opencv-python-headless>=4.8.0
+Pillow>=10.0.0
+# Phase 2 (segmentation) :
+# segmentation-models-pytorch>=0.3.3
+# pydicom>=2.4.0

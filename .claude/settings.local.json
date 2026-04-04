@@ -6,7 +6,11 @@
       "Read(//c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-frontend/src/**)",
       "Bash(npx tsc:*)",
       "Bash(grep -n \"class Dataset\" /c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend/app/models/*.py)",
-      "Bash(grep -n def.*dataset /c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend/app/api/routes/datasets.py)"
+      "Bash(grep -n def.*dataset /c/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend/app/api/routes/datasets.py)",
+      "Bash(.venv/Scripts/python.exe -c \"from app.services.training.pipeline.trainer import Trainer, _choose_refit_metric; from app.services.training.pipeline.models import get_adaptive_model_grid; print\\(''OK''\\)\")",
+      "Bash(find c:/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-frontend/src/types/ -name *.ts)",
+      "Bash(.venv/Scripts/python.exe -c \":*)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/training/test_threshold_calibration.py tests/training/test_cv_kfold.py -x -q)"
     ],
     "additionalDirectories": [
       "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\types",

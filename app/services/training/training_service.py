@@ -43,6 +43,13 @@ def _update_session(db: Session, s: TrainingSession, **fields):
     db.refresh(s)
 
 
+def _rollback_quietly(db: Session) -> None:
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+
 def _append_session_message(db: Session, s: TrainingSession, msg: str):
     current = (s.error_message or "").strip()
     msg = msg.strip()
@@ -162,6 +169,7 @@ def run_training_session(session_id: int) -> None:
                 _log_event("training.session.model.success", session_id=session_id, model_type=model_type)
 
             except Exception as e:
+                _rollback_quietly(db)
                 _append_session_message(db, s, f"[{model_type}] {str(e)}")
                 _log_event(
                     "training.session.model.error",
@@ -203,6 +211,7 @@ def run_training_session(session_id: int) -> None:
         _log_event("training.session.end", session_id=session_id, status=final_status, success_count=success_count)
 
     except Exception as e:
+        _rollback_quietly(db)
         s2 = db.query(TrainingSession).filter(TrainingSession.id == session_id).first()
         if s2:
             _update_session(
@@ -351,6 +360,7 @@ def run_automl_session(session_id: int) -> None:
         _log_event("training.automl.end", session_id=session_id, best_estimator=best_estimator, n_estimators=success_count)
 
     except Exception as e:
+        _rollback_quietly(db)
         s2 = db.query(TrainingSession).filter(TrainingSession.id == session_id).first()
         if s2:
             _update_session(

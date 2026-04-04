@@ -1,0 +1,71 @@
+Collecting torch
+  Downloading torch-2.11.0-cp312-cp312-win_amd64.whl.metadata (29 kB)
+Collecting torchvision
+  Downloading torchvision-0.26.0-cp312-cp312-win_amd64.whl.metadata (5.5 kB)
+Collecting albumentations
+  Downloading albumentations-2.0.8-py3-none-any.whl.metadata (43 kB)
+Collecting opencv-python-headless
+  Downloading opencv_python_headless-4.13.0.92-cp37-abi3-win_amd64.whl.metadata (20 kB)
+Requirement already satisfied: Pillow in .\.venv\Lib\site-packages (12.1.1)
+Collecting filelock (from torch)
+  Downloading filelock-3.25.2-py3-none-any.whl.metadata (2.0 kB)
+Requirement already satisfied: typing-extensions>=4.10.0 in .\.venv\Lib\site-packages (from torch) (4.15.0)
+Requirement already satisfied: setuptools<82 in .\.venv\Lib\site-packages (from torch) (80.10.2)
+Collecting sympy>=1.13.3 (from torch)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch)
+  Using cached jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch)
+  Downloading fsspec-2026.3.0-py3-none-any.whl.metadata (10 kB)
+Requirement already satisfied: numpy in .\.venv\Lib\site-packages (from torchvision) (2.4.2)
+Requirement already satisfied: scipy>=1.10.0 in .\.venv\Lib\site-packages (from albumentations) (1.17.0)
+Requirement already satisfied: PyYAML in .\.venv\Lib\site-packages (from albumentations) (6.0.3)
+Collecting pydantic>=2.9.2 (from albumentations)
+  Using cached pydantic-2.12.5-py3-none-any.whl.metadata (90 kB)
+Collecting albucore==0.0.24 (from albumentations)
+  Downloading albucore-0.0.24-py3-none-any.whl.metadata (5.3 kB)
+Collecting stringzilla>=3.10.4 (from albucore==0.0.24->albumentations)
+  Downloading stringzilla-4.6.0-cp312-cp312-win_amd64.whl.metadata (124 kB)
+Collecting simsimd>=5.9.2 (from albucore==0.0.24->albumentations)
+  Downloading simsimd-6.5.16-cp312-cp312-win_amd64.whl.metadata (71 kB)
+Requirement already satisfied: annotated-types>=0.6.0 in .\.venv\Lib\site-packages (from pydantic>=2.9.2->albumentations) (0.7.0)
+Collecting pydantic-core==2.41.5 (from pydantic>=2.9.2->albumentations)
+  Using cached pydantic_core-2.41.5-cp312-cp312-win_amd64.whl.metadata (7.4 kB)
+Requirement already satisfied: typing-inspection>=0.4.2 in .\.venv\Lib\site-packages (from pydantic>=2.9.2->albumentations) (0.4.2)
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch)
+  Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Requirement already satisfied: MarkupSafe>=2.0 in .\.venv\Lib\site-packages (from jinja2->torch) (3.0.3)
+Downloading torch-2.11.0-cp312-cp312-win_amd64.whl (114.6 MB)
+   ---------------------------------------- 114.6/114.6 MB 70.2 kB/s  0:11:30
+Downloading torchvision-0.26.0-cp312-cp312-win_amd64.whl (4.3 MB)
+   ---------------------------------------- 4.3/4.3 MB 93.8 kB/s  0:00:48
+Downloading albumentations-2.0.8-py3-none-any.whl (369 kB)
+Downloading albucore-0.0.24-py3-none-any.whl (15 kB)
+Downloading opencv_python_headless-4.13.0.92-cp37-abi3-win_amd64.whl (40.1 MB)
+   ---------------------------------------- 40.1/40.1 MB 165.6 kB/s  0:06:30
+Downloading fsspec-2026.3.0-py3-none-any.whl (202 kB)
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ---------------------------------------- 2.1/2.1 MB 89.3 kB/s  0:00:22
+Using cached pydantic-2.12.5-py3-none-any.whl (463 kB)
+Using cached pydantic_core-2.41.5-cp312-cp312-win_amd64.whl (2.0 MB)
+Downloading simsimd-6.5.16-cp312-cp312-win_amd64.whl (87 kB)
+Downloading stringzilla-4.6.0-cp312-cp312-win_amd64.whl (162 kB)
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ---------------------------------------- 6.3/6.3 MB 62.9 kB/s  0:01:28
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ---------------------------------------- 536.2/536.2 kB 99.7 kB/s  0:00:15
+Downloading filelock-3.25.2-py3-none-any.whl (26 kB)
+Using cached jinja2-3.1.6-py3-none-any.whl (134 kB)
+Installing collected packages: simsimd, mpmath, sympy, stringzilla, pydantic-core, opencv-python-headless, networkx, jinja2, fsspec, filelock, torch, pydantic, albucore, torchvision, albumentations
+  Attempting uninstall: pydantic-core
+    Found existing installation: pydantic_core 2.20.1
+    Uninstalling pydantic_core-2.20.1:
+      Successfully uninstalled pydantic_core-2.20.1
+  Attempting uninstall: pydantic
+    Found existing installation: pydantic 2.8.2
+    Uninstalling pydantic-2.8.2:
+      Successfully uninstalled pydantic-2.8.2
+
+Successfully installed albucore-0.0.24 albumentations-2.0.8 filelock-3.25.2 fsspec-2026.3.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 opencv-python-headless-4.13.0.92 pydantic-2.12.5 pydantic-core-2.41.5 simsimd-6.5.16 stringzilla-4.6.0 sympy-1.14.0 torch-2.11.0 torchvision-0.26.0

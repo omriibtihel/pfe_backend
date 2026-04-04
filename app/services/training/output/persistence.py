@@ -7,6 +7,7 @@ import joblib
 from sqlalchemy.orm import Session
 
 from app.models.training import TrainedModel
+from app.services.training.utils import sanitize_json_payload
 
 
 def save_pipeline(pipeline: Any, out_dir: Path, model_type: str) -> Path:
@@ -35,10 +36,14 @@ def persist_trained_model(
         project_id=project_id,
         model_type=model_type,
         task_type=task_type,
-        metrics_json=metrics_json,
-        artifacts_json=artifacts_json,
+        metrics_json=sanitize_json_payload(metrics_json),
+        artifacts_json=sanitize_json_payload(artifacts_json),
     )
     db.add(obj)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(obj)
     return obj

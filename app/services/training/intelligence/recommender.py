@@ -83,9 +83,9 @@ def _recommend_search_type(profile: DatasetProfile) -> tuple[str, int | None]:
     if size == "tiny":
         return "grid", None
     if size == "small":
-        return "random", None
+        return "halving_random", None
     if size == "medium":
-        return "random", None
+        return "halving_random", None
     # large → no HPO by default (too slow), user can activate
     return "none", None
 
@@ -146,6 +146,7 @@ def _build_reasoning(
         "none": "No HPO (dataset is large; use Random or Grid search if time allows).",
         "grid": "Grid search (small dataset, exhaustive search is feasible).",
         "random": "Randomised search (balanced speed/quality tradeoff).",
+        "halving_random": "Successive Halving (explores many candidates, eliminates poor ones early — 3–10× faster than random search).",
     }.get(search_type, search_type)
 
     return {

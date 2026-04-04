@@ -10,6 +10,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     brier_score_loss,
     confusion_matrix,
+    matthews_corrcoef,
     mean_absolute_error,
     mean_squared_error,
     multilabel_confusion_matrix,
@@ -669,8 +670,12 @@ def compute_classification_metrics(
         if len(cm_matrix) == 2 and len(cm_matrix[0]) == 2:
             tn = float(cm_matrix[0][0])
             fp = float(cm_matrix[0][1])
-            denom = tn + fp
-            global_metrics["specificity"] = float(tn / denom) if denom > 0 else None
+            fn = float(cm_matrix[1][0])
+            denom_spec = tn + fp
+            global_metrics["specificity"] = float(tn / denom_spec) if denom_spec > 0 else None
+            # NPV — "among patients declared healthy, how many truly are?" Critical for medical.
+            denom_npv = tn + fn
+            global_metrics["npv"] = float(tn / denom_npv) if denom_npv > 0 else None
 
         score_vector, auc_score_source, auc_pos_index, threshold_used = _extract_binary_score(
             y_score=y_score,
@@ -701,6 +706,10 @@ def compute_classification_metrics(
                     global_metrics["brier_score"] = float(brier_score_loss(y_true_bin, score_vector))
                 except Exception as exc:
                     warnings.append(f"Brier score unavailable: {exc}")
+        try:
+            global_metrics["mcc"] = float(matthews_corrcoef(y_true_arr, y_pred_arr))
+        except Exception as exc:
+            warnings.append(f"MCC unavailable: {exc}")
 
     if classification_type == "multiclass":
         roc_auc, pr_auc = _compute_multiclass_auc(
@@ -713,6 +722,10 @@ def compute_classification_metrics(
         )
         global_metrics["roc_auc"] = roc_auc
         global_metrics["pr_auc"] = pr_auc
+        try:
+            global_metrics["mcc"] = float(matthews_corrcoef(y_true_arr, y_pred_arr))
+        except Exception as exc:
+            warnings.append(f"MCC unavailable: {exc}")
 
     if classification_type == "binary":
         legacy_flat: Dict[str, Any] = {
@@ -737,6 +750,8 @@ def compute_classification_metrics(
             "f1_micro": averaged["micro"].get("f1"),
             "balanced_accuracy": global_metrics.get("balanced_accuracy"),
             "specificity": global_metrics.get("specificity"),
+            "npv": global_metrics.get("npv"),
+            "mcc": global_metrics.get("mcc"),
         }
     else:
         source_average = averaged.get(averaging_primary) or averaged.get("macro", {})
@@ -758,6 +773,8 @@ def compute_classification_metrics(
             "f1_micro": averaged["micro"].get("f1"),
             "balanced_accuracy": global_metrics.get("balanced_accuracy"),
             "specificity": None,
+            "npv": None,
+            "mcc": global_metrics.get("mcc"),
         }
 
     out = {

@@ -25,7 +25,7 @@ BalancingStrategy = Literal[
     "random_undersampling",
     "threshold_optimization",
 ]
-ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance"]
+ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance", "youden"]
 
 NUMERIC_IMPUTATION_METHODS = ["none", "median", "mean", "most_frequent", "constant", "knn"]
 CATEGORICAL_IMPUTATION_METHODS = ["none", "most_frequent", "constant"]
@@ -74,7 +74,7 @@ BALANCING_STRATEGIES = [
     "random_undersampling",
     "threshold_optimization",
 ]
-THRESHOLD_STRATEGIES = ["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance"]
+THRESHOLD_STRATEGIES = ["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance", "youden"]
 
 # Canonical frontend contract for Step3.
 PREPROCESSING_CAPABILITIES = {
@@ -108,6 +108,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 200,
             "min": 10,
             "max": 2000,
+            "grid_values": [50, 100, 200, 300, 500],
             "help": "Number of trees in the forest.",
         },
         "max_depth": {
@@ -115,6 +116,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": None,
             "min": 1,
             "max": 200,
+            "grid_values": [3, 5, 8, 10, 15, 20, None],
             "help": "Maximum depth of each tree. null means unlimited.",
         },
         "max_features": {
@@ -136,6 +138,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "float",
             "default": 1.0,
             "gt": 0.0,
+            "grid_values": [0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
             "help": "Inverse of regularization strength; must be > 0.",
         },
         "solver": {
@@ -149,6 +152,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 0.0,
             "ge": 0.0,
             "le": 1.0,
+            "grid_values": [0.0, 0.15, 0.5, 0.85, 1.0],
             "help": "Regularization mix: 0 = pure L2 (Ridge), 1 = pure L1 (Lasso). Replaces deprecated 'penalty' in sklearn ≥ 1.8.",
         },
         "max_iter": {
@@ -156,6 +160,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 4000,
             "min": 100,
             "max": 20000,
+            "grid_values": [500, 1000, 2000, 4000],
             "help": "Maximum number of iterations.",
         },
         "class_weight": {
@@ -171,6 +176,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "float",
             "default": 1.0,
             "gt": 0.0,
+            "grid_values": [0.01, 0.1, 1.0, 10.0, 100.0],
             "help": "Regularization strength; must be > 0.",
         },
         "kernel": {
@@ -184,6 +190,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "enum": ["scale", "auto"],
             "default": "scale",
             "gt": 0.0,
+            "grid_values": ["scale", "auto", 0.001, 0.01, 0.1],
             "help": "Kernel coefficient. Ignored when kernel='linear'.",
         },
         "class_weight": {
@@ -200,6 +207,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 5,
             "min": 1,
             "max": 500,
+            "grid_values": [3, 5, 7, 10, 15, 20],
             "help": "Number of neighbors.",
         },
         "weights": {
@@ -220,6 +228,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 1e-9,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4],
             "help": "Portion of largest variance added to variances for stability.",
         },
     },
@@ -229,6 +238,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": None,
             "min": 1,
             "max": 200,
+            "grid_values": [3, 5, 8, 10, 15, 20, None],
             "help": "Maximum depth of the tree. null means unlimited.",
         },
         "criterion": {
@@ -251,6 +261,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 300,
             "min": 50,
             "max": 5000,
+            "grid_values": [100, 200, 300, 400, 500],
             "help": "Number of boosting rounds.",
         },
         "learning_rate": {
@@ -258,6 +269,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 0.1,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.01, 0.05, 0.1, 0.15, 0.3],
             "help": "Step size shrinkage in each boosting step.",
         },
         "max_depth": {
@@ -265,6 +277,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 6,
             "min": 1,
             "max": 20,
+            "grid_values": [3, 4, 6, 8, 10],
             "help": "Maximum tree depth.",
         },
         "subsample": {
@@ -272,6 +285,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 1.0,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.6, 0.8, 0.9, 1.0],
             "help": "Subsample ratio of the training instances.",
         },
         "colsample_bytree": {
@@ -279,6 +293,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 1.0,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.5, 0.7, 0.9, 1.0],
             "help": "Subsample ratio of columns when constructing each tree.",
         },
     },
@@ -288,6 +303,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 500,
             "min": 50,
             "max": 5000,
+            "grid_values": [100, 200, 300, 500],
             "help": "Number of boosted trees.",
         },
         "learning_rate": {
@@ -295,6 +311,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 0.05,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.01, 0.05, 0.1, 0.2],
             "help": "Boosting learning rate.",
         },
         "num_leaves": {
@@ -302,6 +319,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 31,
             "min": 2,
             "max": 2048,
+            "grid_values": [15, 31, 63, 127],
             "help": "Maximum number of leaves in one tree.",
         },
         "feature_fraction": {
@@ -309,6 +327,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 0.9,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.7, 0.8, 0.9, 1.0],
             "help": "Fraction of features used for each iteration.",
         },
         "bagging_fraction": {
@@ -316,6 +335,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 0.9,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.7, 0.8, 0.9, 1.0],
             "help": "Fraction of data sampled per tree (requires bagging_freq > 0, set automatically).",
         },
     },
@@ -325,6 +345,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 200,
             "min": 10,
             "max": 2000,
+            "grid_values": [50, 100, 200, 300, 500],
             "help": "Number of trees in the forest.",
         },
         "max_depth": {
@@ -332,6 +353,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": None,
             "min": 1,
             "max": 200,
+            "grid_values": [5, 10, 20, None],
             "help": "Maximum depth of each tree. null means unlimited.",
         },
         "max_features": {
@@ -345,6 +367,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 1,
             "min": 1,
             "max": 100,
+            "grid_values": [1, 2, 5, 10],
             "help": "Minimum number of samples required to be at a leaf node.",
         },
         "class_weight": {
@@ -361,6 +384,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 200,
             "min": 50,
             "max": 2000,
+            "grid_values": [100, 200, 300, 500],
             "help": "Number of boosting stages.",
         },
         "learning_rate": {
@@ -368,6 +392,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 0.1,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.01, 0.05, 0.1, 0.2],
             "help": "Step size shrinkage in each boosting stage.",
         },
         "max_depth": {
@@ -375,6 +400,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 3,
             "min": 1,
             "max": 20,
+            "grid_values": [3, 5, 8, 10],
             "help": "Maximum depth of the individual estimators.",
         },
         "subsample": {
@@ -382,6 +408,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 0.8,
             "gt": 0.0,
             "max": 1.0,
+            "grid_values": [0.6, 0.7, 0.8, 1.0],
             "help": "Fraction of samples used for fitting each tree. < 1 enables stochastic gradient boosting.",
         },
         "min_samples_leaf": {
@@ -389,6 +416,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "default": 1,
             "min": 1,
             "max": 100,
+            "grid_values": [1, 5, 10, 20],
             "help": "Minimum number of samples required to be at a leaf node.",
         },
         "max_features": {
@@ -396,6 +424,39 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "enum": ["sqrt", "log2"],
             "default": None,
             "help": "Features considered at each split. null = all features (default). 'sqrt'/'log2' reduce overfitting.",
+        },
+    },
+    "catboost": {
+        "iterations": {
+            "type": "int",
+            "default": 500,
+            "min": 50,
+            "max": 5000,
+            "grid_values": [100, 200, 300, 500],
+            "help": "Number of boosting iterations.",
+        },
+        "learning_rate": {
+            "type": "float",
+            "default": 0.05,
+            "gt": 0.0,
+            "max": 1.0,
+            "grid_values": [0.01, 0.03, 0.05, 0.1, 0.2],
+            "help": "Step size shrinkage in each boosting step.",
+        },
+        "depth": {
+            "type": "int",
+            "default": 6,
+            "min": 1,
+            "max": 16,
+            "grid_values": [4, 6, 8, 10],
+            "help": "Depth of the trees. Typical range: 4–10.",
+        },
+        "l2_leaf_reg": {
+            "type": "float",
+            "default": 3.0,
+            "gt": 0.0,
+            "grid_values": [1.0, 3.0, 5.0, 10.0],
+            "help": "L2 regularization coefficient. Higher values reduce overfitting.",
         },
     },
 }
@@ -901,6 +962,11 @@ def _copy_column_overrides(columns: dict[str, dict[str, Any]]) -> dict[str, dict
 class PreprocessingConfig:
     defaults: PreprocessingDefaults = field(default_factory=PreprocessingDefaults)
     columns: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Advanced params — exposed to frontend so nothing is hardcoded silently
+    knn_n_neighbors: int = 5
+    constant_fill_numeric: float = 0.0
+    constant_fill_categorical: str = "__missing__"
+    variance_threshold: float = 0.01
 
     @staticmethod
     def from_front(payload: dict[str, Any]) -> "PreprocessingConfig":
@@ -1011,18 +1077,51 @@ class PreprocessingConfig:
                 if order is not None:
                     out["ordinalOrder"] = order
 
+            # Per-column advanced params — override globals when explicitly set
+            if "knnNeighbors" in cfg_col:
+                try:
+                    out["knnNeighbors"] = max(1, min(50, int(cfg_col["knnNeighbors"])))
+                except (TypeError, ValueError):
+                    pass
+            if "constantFillNumeric" in cfg_col and cfg_col["constantFillNumeric"] is not None:
+                try:
+                    out["constantFillNumeric"] = float(cfg_col["constantFillNumeric"])
+                except (TypeError, ValueError):
+                    pass
+            if "constantFillCategorical" in cfg_col:
+                raw_cat = str(cfg_col["constantFillCategorical"] or "").strip()
+                if raw_cat:
+                    out["constantFillCategorical"] = raw_cat
+
             if out:
                 normalized_columns[col] = out
+
+        adv = _as_dict(pp.get("advancedParams"))
+        knn_n_neighbors = max(1, min(50, int(adv.get("knnNeighbors") or 5)))
+        constant_fill_numeric = float(adv.get("constantFillNumeric") if adv.get("constantFillNumeric") is not None else 0.0)
+        raw_cat_fill = str(adv.get("constantFillCategorical") or "").strip()
+        constant_fill_categorical = raw_cat_fill if raw_cat_fill else "__missing__"
+        variance_threshold = max(0.0, min(1.0, float(adv.get("varianceThreshold") or 0.01)))
 
         return PreprocessingConfig(
             defaults=resolved_defaults,
             columns=normalized_columns,
+            knn_n_neighbors=knn_n_neighbors,
+            constant_fill_numeric=constant_fill_numeric,
+            constant_fill_categorical=constant_fill_categorical,
+            variance_threshold=variance_threshold,
         )
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "defaults": self.defaults.as_dict(),
             "columns": _copy_column_overrides(self.columns),
+            "advancedParams": {
+                "knnNeighbors": self.knn_n_neighbors,
+                "constantFillNumeric": self.constant_fill_numeric,
+                "constantFillCategorical": self.constant_fill_categorical,
+                "varianceThreshold": self.variance_threshold,
+            },
         }
 
     @property
@@ -1086,6 +1185,12 @@ class PreprocessingConfig:
             order = _to_optional_str_list(cfg.get("ordinalOrder"))
             if order is not None:
                 resolved["ordinalOrder"] = order
+
+        # Per-column advanced params (fall back to global defaults when absent)
+        resolved["knnNeighbors"] = int(cfg["knnNeighbors"]) if "knnNeighbors" in cfg else self.knn_n_neighbors
+        resolved["constantFillNumeric"] = float(cfg["constantFillNumeric"]) if "constantFillNumeric" in cfg else self.constant_fill_numeric
+        resolved["constantFillCategorical"] = str(cfg["constantFillCategorical"]) if "constantFillCategorical" in cfg else self.constant_fill_categorical
+
         return resolved
 
     def defaults_dict(self) -> dict[str, str]:
@@ -1148,10 +1253,13 @@ class BalancingConfig:
         }
 
 
+_VALID_SEARCH_TYPES = {"none", "grid", "random", "halving_random"}
+
+
 def _parse_search_type(payload: dict[str, Any]) -> str:
     """Parse search_type from payload with backward-compat fallback from useGridSearch."""
     raw = str(payload.get("searchType", "")).strip().lower()
-    if raw in {"none", "grid", "random"}:
+    if raw in _VALID_SEARCH_TYPES:
         return raw
     # Legacy fallback: useGridSearch=true → "grid"
     return "grid" if _to_bool(payload.get("useGridSearch"), default=False) else "none"

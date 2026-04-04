@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
@@ -33,6 +34,34 @@ def to_python_scalar(v: Any) -> Any:
     if isinstance(v, float) and (v != v or v == float("inf") or v == float("-inf")):
         return None
     return v
+
+
+def sanitize_json_payload(value: Any) -> Any:
+    """Recursively convert *value* into a JSON-safe payload."""
+    value = to_python_scalar(value)
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, dict):
+        return {str(k): sanitize_json_payload(v) for k, v in value.items()}
+
+    if isinstance(value, np.ndarray):
+        return sanitize_json_payload(value.tolist())
+
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_json_payload(v) for v in value]
+
+    if hasattr(value, "tolist") and not isinstance(value, (bytes, bytearray)):
+        try:
+            return sanitize_json_payload(value.tolist())
+        except Exception:
+            pass
+
+    return str(value)
 
 
 def safe_json_value(

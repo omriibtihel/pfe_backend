@@ -77,13 +77,13 @@ def infer_columns(X: pd.DataFrame, numeric_threshold: float = 0.85) -> Tuple[Lis
     return num_cols, cat_cols
 
 
-def _build_numeric_imputer(method: str):
+def _build_numeric_imputer(method: str, knn_n_neighbors: int = 5, constant_fill: float = 0.0):
     if method == "none":
         return "passthrough"
     if method == "knn":
-        return KNNImputer(n_neighbors=5)
+        return KNNImputer(n_neighbors=knn_n_neighbors)
     if method == "constant":
-        return SimpleImputer(strategy="constant", fill_value=0.0)
+        return SimpleImputer(strategy="constant", fill_value=constant_fill)
     return SimpleImputer(strategy=method)
 
 
@@ -101,11 +101,11 @@ def _build_numeric_scaler(method: str):
     return StandardScaler(with_mean=True, with_std=True)
 
 
-def _build_categorical_imputer(method: str):
+def _build_categorical_imputer(method: str, constant_fill: str = "__missing__"):
     if method == "none":
         return "passthrough"
     if method == "constant":
-        return SimpleImputer(strategy="constant", fill_value="__missing__")
+        return SimpleImputer(strategy="constant", fill_value=constant_fill)
     return SimpleImputer(strategy=method)
 
 
@@ -195,8 +195,10 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
             "Set at least one column to use=true."
         )
 
-    numeric_groups: dict[tuple[str, str], list[str]] = {}
-    categorical_groups: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+    # Keys include per-column advanced params so columns with different
+    # k / fill_value get separate Pipeline instances.
+    numeric_groups: dict[tuple[str, str, int, float], list[str]] = {}
+    categorical_groups: dict[tuple[str, str, tuple[str, ...], str], list[str]] = {}
     passthrough_cols: list[str] = []
 
     for col in X.columns:
@@ -215,6 +217,8 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
             key_num = (
                 str(cfg.get("numericImputation", prep_cfg.numeric_imputation)),
                 str(cfg.get("numericScaling", prep_cfg.numeric_scaling)),
+                int(cfg.get("knnNeighbors", prep_cfg.knn_n_neighbors)),
+                float(cfg.get("constantFillNumeric", prep_cfg.constant_fill_numeric)),
             )
             numeric_groups.setdefault(key_num, []).append(col_name)
             continue
@@ -229,25 +233,33 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
             str(cfg.get("categoricalImputation", prep_cfg.categorical_imputation)),
             str(cfg.get("categoricalEncoding", prep_cfg.categorical_encoding)),
             order_tuple,
+            str(cfg.get("constantFillCategorical", prep_cfg.constant_fill_categorical)),
         )
         categorical_groups.setdefault(key_cat, []).append(col_name)
 
     transformers: list[tuple[str, Any, list[str]]] = []
 
-    for idx, ((num_imp, num_scale), cols) in enumerate(numeric_groups.items()):
+    for idx, ((num_imp, num_scale, knn_k, const_fill_num), cols) in enumerate(numeric_groups.items()):
         steps: list[tuple[str, Any]] = []
         if num_imp != "none":
-            steps.append(("imputer", _build_numeric_imputer(num_imp)))
+            steps.append(("imputer", _build_numeric_imputer(
+                num_imp,
+                knn_n_neighbors=knn_k,
+                constant_fill=const_fill_num,
+            )))
         if num_scale != "none":
             steps.append(("scaler", _build_numeric_scaler(num_scale)))
         if steps:
             name = "num" if idx == 0 else f"num_{idx}"
             transformers.append((name, Pipeline(steps=steps), cols))
 
-    for idx, ((cat_imp, cat_enc, order_tuple), cols) in enumerate(categorical_groups.items()):
+    for idx, ((cat_imp, cat_enc, order_tuple, const_fill_cat), cols) in enumerate(categorical_groups.items()):
         steps: list[tuple[str, Any]] = []
         if cat_imp != "none":
-            steps.append(("imputer", _build_categorical_imputer(cat_imp)))
+            steps.append(("imputer", _build_categorical_imputer(
+                cat_imp,
+                constant_fill=const_fill_cat,
+            )))
         if cat_enc != "none":
             steps.append(
                 (
@@ -283,5 +295,5 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
         effective_by_column=effective.effective_by_column,
         dropped_columns=effective.dropped_columns,
         column_types=effective.column_types,
-        feature_selector=VarianceThreshold(threshold=0.0),
+        feature_selector=VarianceThreshold(threshold=prep_cfg.variance_threshold),
     )

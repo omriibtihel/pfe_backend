@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from sklearn.metrics import f1_score, precision_recall_curve
+from sklearn.metrics import f1_score, precision_recall_curve, roc_curve
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,36 @@ class ThresholdOptimizer:
             distance = np.abs(precision - recall)
             selected_idx = int(np.nanargmin(distance))
             strategy_used = "precision_recall_balance"
+        elif strategy_norm == "youden":
+            # Youden Index J = sensitivity + specificity - 1 = TPR - FPR
+            # Standard in medical diagnosis — maximises the distance from random guessing
+            try:
+                fpr_arr, tpr_arr, roc_thresholds = roc_curve(y_bin, proba_arr)
+                j_scores = tpr_arr - fpr_arr
+                best_roc_idx = int(np.nanargmax(j_scores))
+                optimal_threshold = float(roc_thresholds[best_roc_idx])
+                # Recompute F1/precision/recall at this threshold for reporting
+                y_pred_youden = (proba_arr >= optimal_threshold).astype(int)
+                f1_youden = float(f1_score(y_bin, y_pred_youden, zero_division=0))
+                prec_youden = float(precision[selected_idx]) if len(precision) > 0 else 0.0
+                rec_youden = float(recall[selected_idx]) if len(recall) > 0 else 0.0
+                # Align precision/recall to the found threshold via PR curve
+                thresh_diffs = np.abs(thresholds - optimal_threshold)
+                pr_idx = int(np.argmin(thresh_diffs))
+                prec_youden = float(precision[pr_idx])
+                rec_youden = float(recall[pr_idx])
+                return ThresholdResult(
+                    optimal_threshold=optimal_threshold,
+                    strategy_used="youden",
+                    f1_at_threshold=f1_youden,
+                    precision_at_threshold=prec_youden,
+                    recall_at_threshold=rec_youden,
+                    default_threshold_f1=default_f1,
+                    improvement_delta=float(f1_youden - default_f1),
+                )
+            except Exception:
+                selected_idx = int(np.nanargmax(f1_scores))
+                strategy_used = "maximize_f1"
         else:
             selected_idx = int(np.nanargmax(f1_scores))
             strategy_used = "maximize_f1"

@@ -38,6 +38,7 @@ def create_project(
     project = Project(
         name=payload.name,
         description=payload.description,
+        project_type=payload.project_type,
         owner_id=current_user.id,
     )
 

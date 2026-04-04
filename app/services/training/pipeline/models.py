@@ -28,6 +28,12 @@ except Exception:
     LGBMClassifier = None
     LGBMRegressor = None
 
+try:
+    from catboost import CatBoostClassifier, CatBoostRegressor
+except Exception:
+    CatBoostClassifier = None
+    CatBoostRegressor = None
+
 
 # ---------------------------------------------------------------------------
 # Log-uniform discrete distribution (for n_estimators etc.)
@@ -165,6 +171,16 @@ def _ridge_factory(task_type: str, params: Dict[str, Any]) -> Any:
     return Ridge(**params)
 
 
+def _catboost_factory(task_type: str, params: Dict[str, Any]) -> Any:
+    if task_type == "classification":
+        if CatBoostClassifier is None:
+            raise RuntimeError("catboost is not installed")
+        return CatBoostClassifier(**params)
+    if CatBoostRegressor is None:
+        raise RuntimeError("catboost is not installed")
+    return CatBoostRegressor(**params)
+
+
 # ---------------------------------------------------------------------------
 # ModelRegistry
 # ---------------------------------------------------------------------------
@@ -234,6 +250,7 @@ class ModelRegistry:
                         "min_samples_split": randint(2, 20),
                         "min_samples_leaf":  randint(1, 15),
                         "max_features":      ["sqrt", "log2", 0.3, 0.5, 0.7],
+                        "bootstrap":         [True, False],
                         "class_weight":      ["balanced", "balanced_subsample", None],
                     },
                     "regression": {
@@ -242,6 +259,7 @@ class ModelRegistry:
                         "min_samples_split": randint(2, 20),
                         "min_samples_leaf":  randint(1, 15),
                         "max_features":      ["sqrt", "log2", 0.3, 0.5, 0.7],
+                        "bootstrap":         [True, False],
                     },
                 },
                 estimator_factory=_rf_factory,
@@ -623,6 +641,7 @@ class ModelRegistry:
                         "reg_alpha":         loguniform(1e-3, 10),
                         "reg_lambda":        loguniform(1e-3, 10),
                         "min_child_samples": randint(5, 50),
+                        "min_split_gain":    loguniform(1e-4, 1.0),
                     },
                     "regression": {
                         "n_estimators":      log_randint(50, 500),
@@ -634,6 +653,7 @@ class ModelRegistry:
                         "reg_alpha":         loguniform(1e-3, 10),
                         "reg_lambda":        loguniform(1e-3, 10),
                         "min_child_samples": randint(5, 50),
+                        "min_split_gain":    loguniform(1e-4, 1.0),
                     },
                 },
                 estimator_factory=_lgbm_factory,
@@ -694,6 +714,7 @@ class ModelRegistry:
                         "min_samples_split": randint(2, 20),
                         "min_samples_leaf":  randint(1, 15),
                         "max_features":      ["sqrt", "log2", 0.3, 0.5, 0.7],
+                        "bootstrap":         [True, False],
                         "class_weight":      ["balanced", "balanced_subsample", None],
                     },
                     "regression": {
@@ -702,6 +723,7 @@ class ModelRegistry:
                         "min_samples_split": randint(2, 20),
                         "min_samples_leaf":  randint(1, 15),
                         "max_features":      ["sqrt", "log2", 0.3, 0.5, 0.7],
+                        "bootstrap":         [True, False],
                     },
                 },
                 estimator_factory=_extratrees_factory,
@@ -776,6 +798,73 @@ class ModelRegistry:
                     },
                 },
                 estimator_factory=_gradientboosting_factory,
+            )
+        )
+        # ---------------------------------------------------------------
+        # CatBoost
+        # ---------------------------------------------------------------
+        self._register(
+            ModelSpec(
+                name="catboost",
+                aliases=("cat", "cb"),
+                supports_classification=True,
+                supports_regression=True,
+                supports_class_weight=False,   # CatBoost uses auto_class_weights
+                supports_predict_proba=True,
+                supports_sample_weight=True,
+                default_params={
+                    "classification": {
+                        "iterations": 500,
+                        "learning_rate": 0.05,
+                        "depth": 6,
+                        "l2_leaf_reg": 3.0,
+                        "random_state": 42,
+                        "verbose": 0,
+                        "allow_writing_files": False,
+                    },
+                    "regression": {
+                        "iterations": 500,
+                        "learning_rate": 0.05,
+                        "depth": 6,
+                        "l2_leaf_reg": 3.0,
+                        "random_state": 42,
+                        "verbose": 0,
+                        "allow_writing_files": False,
+                    },
+                },
+                param_grid={
+                    "classification": {
+                        "iterations":     [200, 400],
+                        "learning_rate":  [0.03, 0.05, 0.1],
+                        "depth":          [4, 6, 8],
+                        "l2_leaf_reg":    [1.0, 3.0, 10.0],
+                    },
+                    "regression": {
+                        "iterations":     [200, 400],
+                        "learning_rate":  [0.03, 0.05, 0.1],
+                        "depth":          [4, 6, 8],
+                        "l2_leaf_reg":    [1.0, 3.0, 10.0],
+                    },
+                },
+                param_distributions={
+                    "classification": {
+                        "iterations":    log_randint(100, 500),
+                        "learning_rate": loguniform(0.01, 0.3),
+                        "depth":         randint(4, 10),
+                        "l2_leaf_reg":   loguniform(1.0, 10.0),
+                        "subsample":     uniform(0.6, 0.4),
+                        "colsample_bylevel": uniform(0.6, 0.4),
+                    },
+                    "regression": {
+                        "iterations":    log_randint(100, 500),
+                        "learning_rate": loguniform(0.01, 0.3),
+                        "depth":         randint(4, 10),
+                        "l2_leaf_reg":   loguniform(1.0, 10.0),
+                        "subsample":     uniform(0.6, 0.4),
+                        "colsample_bylevel": uniform(0.6, 0.4),
+                    },
+                },
+                estimator_factory=_catboost_factory,
             )
         )
         # ---------------------------------------------------------------
@@ -861,23 +950,36 @@ MODEL_REGISTRY = ModelRegistry()
 
 _ADAPTIVE_GRIDS: Dict[str, Dict[str, Dict[str, Dict[str, list]]]] = {
     # model → task → size_cat → {param: [values]}
+    # Combo budget: micro ≤ 6, tiny ≤ 20, small ≤ 80, medium ≤ 100, large ≤ 20
+    # micro (<100 lignes): régularisation forte obligatoire, pas de max_depth=None,
+    #   n_estimators fixe (variance trop haute pour explorer), ≤ 6 combos
     "randomforest": {
         "classification": {
+            # 2×2=4 — max_depth limité à 3/5 (pas de None → interdit sur <100 lignes)
+            "micro":  {"max_depth": [3, 5], "min_samples_leaf": [4, 8]},
+            # 2×2=4
             "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
+            # 2×3×2=12
             "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
-            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [1, 4], "max_features": ["sqrt", "log2"]},
+            # 2×3×2×2×2=48 — min_samples_split added for regularisation
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [1, 4], "min_samples_split": [2, 5], "max_features": ["sqrt", "log2"]},
             "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
         },
         "regression": {
+            "micro":  {"max_depth": [3, 5], "min_samples_leaf": [4, 8]},
             "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
             "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
-            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [2, 5], "max_features": ["sqrt", "log2"]},
+            # 2×3×2×2×2=48
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [2, 5], "min_samples_split": [2, 5], "max_features": ["sqrt", "log2"]},
             "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
         },
     },
     "logisticregression": {
         "classification": {
-            "tiny":   {"C": [0.1, 1.0, 10.0]},
+            # 3×2=6 — forte régularisation (C petit), pénalité explicite
+            "micro":  {"C": [0.01, 0.1, 1.0], "l1_ratio": [0, 1]},
+            # 3×2=6 — l1_ratio added even for tiny (pénalité mixte L1/L2)
+            "tiny":   {"C": [0.1, 1.0, 10.0], "l1_ratio": [0, 1]},
             "small":  {"C": [0.01, 0.1, 1.0, 10.0], "solver": ["liblinear", "saga"]},
             "medium": {"C": [0.01, 0.1, 1.0, 10.0], "solver": ["liblinear", "saga"], "l1_ratio": [0, 1]},
             "large":  {"C": [0.1, 1.0, 10.0]},
@@ -885,26 +987,32 @@ _ADAPTIVE_GRIDS: Dict[str, Dict[str, Dict[str, Dict[str, list]]]] = {
     },
     "svm": {
         "classification": {
+            # 3 combos — C petit obligatoire sur <100 lignes, kernel fixe rbf
+            "micro":  {"C": [0.01, 0.1, 1.0]},
             "tiny":   {"C": [0.1, 1.0, 10.0]},
-            "small":  {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"]},
-            "medium": {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"], "kernel": ["rbf", "linear"]},
-            "large":  {"C": [0.1, 1.0]},
+            "small":  {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"], "gamma": ["scale", "auto"]},
+            "medium": {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"], "gamma": ["scale", "auto"]},
+            "large":  {"C": [0.1, 1.0], "kernel": ["rbf", "linear"]},
         },
         "regression": {
+            "micro":  {"C": [0.01, 0.1, 1.0]},
             "tiny":   {"C": [0.1, 1.0, 10.0]},
-            "small":  {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"]},
-            "medium": {"C": [0.1, 1.0, 10.0], "gamma": ["scale", "auto"], "epsilon": [0.01, 0.1, 0.5]},
-            "large":  {"C": [0.1, 1.0], "epsilon": [0.1, 0.5]},
+            "small":  {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"], "gamma": ["scale", "auto"]},
+            "medium": {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"], "gamma": ["scale", "auto"], "epsilon": [0.01, 0.1, 0.5]},
+            "large":  {"C": [0.1, 1.0], "kernel": ["rbf", "linear"], "epsilon": [0.1, 0.5]},
         },
     },
     "knn": {
         "classification": {
+            # n_neighbors limité à sqrt(n_train) ≈ 8-9 pour 80 samples — on reste < 7
+            "micro":  {"n_neighbors": [3, 5, 7]},
             "tiny":   {"n_neighbors": [3, 5, 9]},
             "small":  {"n_neighbors": [3, 5, 9, 15], "weights": ["uniform", "distance"]},
             "medium": {"n_neighbors": [3, 5, 9, 15, 21], "weights": ["uniform", "distance"]},
             "large":  {"n_neighbors": [5, 9, 15]},
         },
         "regression": {
+            "micro":  {"n_neighbors": [3, 5, 7]},
             "tiny":   {"n_neighbors": [3, 5, 9]},
             "small":  {"n_neighbors": [3, 5, 9, 15], "weights": ["uniform", "distance"]},
             "medium": {"n_neighbors": [3, 5, 9, 15, 21], "weights": ["uniform", "distance"]},
@@ -913,6 +1021,8 @@ _ADAPTIVE_GRIDS: Dict[str, Dict[str, Dict[str, Dict[str, list]]]] = {
     },
     "naivebayes": {
         "classification": {
+            # var_smoothing élevé = plus de lissage = moins d'overfitting sur <100 lignes
+            "micro":  {"var_smoothing": [1e-9, 1e-7, 1e-5]},
             "tiny":   {"var_smoothing": [1e-11, 1e-9, 1e-7, 1e-5]},
             "small":  {"var_smoothing": [1e-11, 1e-9, 1e-7, 1e-5]},
             "medium": {"var_smoothing": [1e-11, 1e-9, 1e-7, 1e-5]},
@@ -921,12 +1031,15 @@ _ADAPTIVE_GRIDS: Dict[str, Dict[str, Dict[str, Dict[str, list]]]] = {
     },
     "decisiontree": {
         "classification": {
+            # max_depth [2,3] seulement — arbre profond sur <100 lignes = mémorisation pure
+            "micro":  {"max_depth": [2, 3], "min_samples_leaf": [4, 8]},
             "tiny":   {"max_depth": [3, 7, None]},
             "small":  {"max_depth": [3, 7, 15, None], "min_samples_leaf": [1, 4]},
             "medium": {"max_depth": [3, 7, 15, None], "min_samples_leaf": [1, 4, 10], "criterion": ["gini", "entropy"]},
             "large":  {"max_depth": [3, 7, None], "min_samples_leaf": [1, 4]},
         },
         "regression": {
+            "micro":  {"max_depth": [2, 3], "min_samples_leaf": [4, 8]},
             "tiny":   {"max_depth": [3, 7, None]},
             "small":  {"max_depth": [3, 7, 15, None], "min_samples_leaf": [2, 5]},
             "medium": {"max_depth": [3, 7, 15, None], "min_samples_leaf": [2, 5, 10]},
@@ -936,62 +1049,111 @@ _ADAPTIVE_GRIDS: Dict[str, Dict[str, Dict[str, Dict[str, list]]]] = {
     # XGBoost: old static grid had 972 combos — replaced by size-aware compact grids
     "xgboost": {
         "classification": {
+            # 2×2=4 — max_depth=2/3, learning_rate élevé car peu d'arbres
+            # n_estimators fixe à default (300) — trop peu de data pour l'explorer
+            "micro":  {"learning_rate": [0.05, 0.1], "max_depth": [2, 3]},
+            # 2×2×2=8
             "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]},
-            "small":  {"n_estimators": [200, 400], "learning_rate": [0.03, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0]},
-            "medium": {"n_estimators": [200, 400], "learning_rate": [0.05, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0]},
-            "large":  {"n_estimators": [200, 400], "learning_rate": [0.1, 0.2], "max_depth": [3, 6]},
+            # 2×2×3×2×2×2=96 — colsample_bytree added (anti-overfitting sur petits datasets)
+            "small":  {"n_estimators": [200, 400], "learning_rate": [0.03, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0], "min_child_weight": [1, 3]},
+            # 2×2×3×2×2×2×2=96 — reg_alpha ajouté (L1, important pour features médicales)
+            "medium": {"n_estimators": [200, 400], "learning_rate": [0.05, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0], "min_child_weight": [1, 3], "reg_alpha": [0, 0.1, 1.0]},
+            "large":  {"n_estimators": [200, 400], "learning_rate": [0.1, 0.2], "max_depth": [3, 6], "min_child_weight": [1, 5]},
         },
         "regression": {
+            "micro":  {"learning_rate": [0.05, 0.1], "max_depth": [2, 3]},
             "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]},
-            "small":  {"n_estimators": [200, 400], "learning_rate": [0.03, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0]},
-            "medium": {"n_estimators": [200, 400], "learning_rate": [0.05, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0]},
-            "large":  {"n_estimators": [200, 400], "learning_rate": [0.1, 0.2], "max_depth": [3, 6]},
+            "small":  {"n_estimators": [200, 400], "learning_rate": [0.03, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0], "min_child_weight": [1, 3]},
+            "medium": {"n_estimators": [200, 400], "learning_rate": [0.05, 0.1], "max_depth": [3, 5, 8], "subsample": [0.8, 1.0], "colsample_bytree": [0.7, 1.0], "min_child_weight": [1, 3], "reg_alpha": [0, 0.1, 1.0]},
+            "large":  {"n_estimators": [200, 400], "learning_rate": [0.1, 0.2], "max_depth": [3, 6], "min_child_weight": [1, 5]},
         },
     },
     "lightgbm": {
         "classification": {
-            "tiny":   {"n_estimators": [200, 300], "learning_rate": [0.05, 0.1], "num_leaves": [15, 31]},
-            "small":  {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63]},
-            "medium": {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63, 127], "min_child_samples": [10, 30]},
-            "large":  {"n_estimators": [300, 500], "learning_rate": [0.05, 0.1], "num_leaves": [31, 63]},
+            # 2×2=4 — num_leaves très bas (7/15) pour éviter surapprentissage sur <100 lignes
+            "micro":  {"learning_rate": [0.05, 0.1], "num_leaves": [7, 15]},
+            # 2×2×2×2=16 — reg_lambda ajouté (régularisation L2, absente avant)
+            "tiny":   {"n_estimators": [200, 300], "learning_rate": [0.05, 0.1], "num_leaves": [15, 31], "reg_lambda": [0.1, 1.0]},
+            # 2×3×2×2=24 — reg_lambda ajouté
+            "small":  {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63], "reg_lambda": [0.1, 1.0]},
+            # 2×3×3×2×2=72 — reg_alpha + reg_lambda ajoutés
+            "medium": {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63, 127], "min_child_samples": [10, 30], "reg_alpha": [0, 0.1], "reg_lambda": [0.1, 1.0]},
+            # 2×2×2×2=16
+            "large":  {"n_estimators": [300, 500], "learning_rate": [0.05, 0.1], "num_leaves": [31, 63], "reg_lambda": [0.1, 1.0]},
         },
         "regression": {
-            "tiny":   {"n_estimators": [200, 300], "learning_rate": [0.05, 0.1], "num_leaves": [15, 31]},
-            "small":  {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63]},
-            "medium": {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63, 127], "min_child_samples": [10, 30]},
-            "large":  {"n_estimators": [300, 500], "learning_rate": [0.05, 0.1], "num_leaves": [31, 63]},
+            "micro":  {"learning_rate": [0.05, 0.1], "num_leaves": [7, 15]},
+            "tiny":   {"n_estimators": [200, 300], "learning_rate": [0.05, 0.1], "num_leaves": [15, 31], "reg_lambda": [0.1, 1.0]},
+            "small":  {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63], "reg_lambda": [0.1, 1.0]},
+            "medium": {"n_estimators": [300, 500], "learning_rate": [0.02, 0.05, 0.1], "num_leaves": [31, 63, 127], "min_child_samples": [10, 30], "reg_alpha": [0, 0.1], "reg_lambda": [0.1, 1.0]},
+            "large":  {"n_estimators": [300, 500], "learning_rate": [0.05, 0.1], "num_leaves": [31, 63], "reg_lambda": [0.1, 1.0]},
         },
     },
     "extratrees": {
         "classification": {
+            "micro":  {"max_depth": [3, 5], "min_samples_leaf": [4, 8]},
             "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
             "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
-            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [1, 4], "max_features": ["sqrt", "log2"]},
+            # 2×3×2×2×2=48 — min_samples_split ajouté (même logique que RF)
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [1, 4], "min_samples_split": [2, 5], "max_features": ["sqrt", "log2"]},
             "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
         },
         "regression": {
+            "micro":  {"max_depth": [3, 5], "min_samples_leaf": [4, 8]},
             "tiny":   {"n_estimators": [100, 200], "max_depth": [5, None]},
             "small":  {"n_estimators": [100, 200], "max_depth": [5, 10, None], "max_features": ["sqrt", "log2"]},
-            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [2, 5], "max_features": ["sqrt", "log2"]},
+            # 2×3×2×2×2=48
+            "medium": {"n_estimators": [100, 300], "max_depth": [5, 10, None], "min_samples_leaf": [2, 5], "min_samples_split": [2, 5], "max_features": ["sqrt", "log2"]},
             "large":  {"n_estimators": [100, 300], "max_depth": [5, 10]},
         },
     },
     "gradientboosting": {
         "classification": {
-            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1]},
-            "small":  {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5]},
-            "medium": {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "subsample": [0.7, 1.0]},
-            "large":  {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1], "max_depth": [3]},
+            # 2×2=4 — learning_rate modéré + forte feuille min pour régulariser
+            "micro":  {"learning_rate": [0.05, 0.1], "min_samples_leaf": [8, 16]},
+            # 2×2×2=8 — min_samples_leaf ajouté (anti-overfitting fort)
+            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "min_samples_leaf": [1, 4]},
+            # 2×3×2×2=24
+            "small":  {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "min_samples_leaf": [1, 4]},
+            # 2×3×2×2×2=48
+            "medium": {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "subsample": [0.7, 1.0], "min_samples_leaf": [1, 4]},
+            # 2×2×2=8
+            "large":  {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1], "max_depth": [3], "min_samples_leaf": [1, 4]},
         },
         "regression": {
-            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1]},
-            "small":  {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5]},
-            "medium": {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "subsample": [0.7, 1.0]},
-            "large":  {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1], "max_depth": [3]},
+            "micro":  {"learning_rate": [0.05, 0.1], "min_samples_leaf": [8, 16]},
+            "tiny":   {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "min_samples_leaf": [1, 4]},
+            "small":  {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "min_samples_leaf": [1, 4]},
+            "medium": {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1, 0.2], "max_depth": [3, 5], "subsample": [0.7, 1.0], "min_samples_leaf": [1, 4]},
+            "large":  {"n_estimators": [100, 300], "learning_rate": [0.05, 0.1], "max_depth": [3], "min_samples_leaf": [1, 4]},
+        },
+    },
+    # CatBoost: taille-aware — sans ça le fallback statique donne 54 combos pour tous
+    "catboost": {
+        "classification": {
+            # 2×2=4 — iterations bas + l2 fort pour régulariser sur très peu de données
+            "micro":  {"learning_rate": [0.05, 0.1], "l2_leaf_reg": [3.0, 10.0]},
+            # 2×2=4
+            "tiny":   {"iterations": [200, 400], "learning_rate": [0.05, 0.1]},
+            # 2×3×2=12
+            "small":  {"iterations": [200, 400], "learning_rate": [0.03, 0.05, 0.1], "depth": [4, 6]},
+            # 2×3×3×2=36
+            "medium": {"iterations": [200, 500], "learning_rate": [0.03, 0.05, 0.1], "depth": [4, 6, 8], "l2_leaf_reg": [1.0, 3.0, 10.0]},
+            # 2×2=4
+            "large":  {"iterations": [300, 500], "learning_rate": [0.05, 0.1]},
+        },
+        "regression": {
+            "micro":  {"learning_rate": [0.05, 0.1], "l2_leaf_reg": [3.0, 10.0]},
+            "tiny":   {"iterations": [200, 400], "learning_rate": [0.05, 0.1]},
+            "small":  {"iterations": [200, 400], "learning_rate": [0.03, 0.05, 0.1], "depth": [4, 6]},
+            "medium": {"iterations": [200, 500], "learning_rate": [0.03, 0.05, 0.1], "depth": [4, 6, 8], "l2_leaf_reg": [1.0, 3.0, 10.0]},
+            "large":  {"iterations": [300, 500], "learning_rate": [0.05, 0.1]},
         },
     },
     "ridge": {
         "regression": {
+            # alpha élevé = forte régularisation = indispensable sur <100 lignes
+            "micro":  {"alpha": [1.0, 10.0, 100.0]},
             "tiny":   {"alpha": [0.1, 1.0, 10.0]},
             "small":  {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
             "medium": {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
@@ -1005,14 +1167,32 @@ _CLASS_WEIGHT_MODELS = frozenset({"randomforest", "logisticregression", "svm", "
 
 # n_iter budget for RandomizedSearchCV per dataset size
 _RANDOM_SEARCH_N_ITER: Dict[str, int] = {
-    "tiny":   20,
-    "small":  30,
-    "medium": 50,
-    "large":  60,
+    "micro":  10,   # < 100 samples: budget minimal, variance élevée → peu de candidats
+    "tiny":   25,
+    "small":  40,
+    "medium": 60,
+    "large":  80,
+}
+
+# Initial candidate count for HalvingRandomSearchCV per dataset size.
+# factor=3 elimination schedule:
+#   micro:  15 → 5 → 1  (21 total fits — budget minimal pour éviter le surapprentissage du search)
+#   tiny:   30 → 10 → 3  (43 total fits, vs 25 for random)
+#   small:  60 → 20 → 7 → 2  (89 total fits, vs 40 for random)
+#   medium: 100 → 33 → 11 → 4  (148 total fits, vs 60 for random)
+#   large:  50 → 17 → 6  (73 total fits, vs 80 for random — conservative for slow models)
+_HALVING_N_CANDIDATES: Dict[str, int] = {
+    "micro":  15,
+    "tiny":   30,
+    "small":  60,
+    "medium": 100,
+    "large":  50,
 }
 
 
 def _n_samples_to_size_cat(n_samples: int) -> str:
+    if n_samples < 100:
+        return "micro"
     if n_samples < 500:
         return "tiny"
     if n_samples < 2_000:
@@ -1069,6 +1249,11 @@ def get_adaptive_model_grid(
 def get_adaptive_n_iter(n_samples: int) -> int:
     """Return a sensible ``n_iter`` for RandomizedSearchCV based on dataset size."""
     return _RANDOM_SEARCH_N_ITER[_n_samples_to_size_cat(n_samples)]
+
+
+def get_halving_n_candidates(n_samples: int) -> int:
+    """Return the initial candidate count for HalvingRandomSearchCV based on dataset size."""
+    return _HALVING_N_CANDIDATES[_n_samples_to_size_cat(n_samples)]
 
 
 # ---------------------------------------------------------------------------

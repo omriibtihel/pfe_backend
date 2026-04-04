@@ -104,6 +104,20 @@ def _ensure_dense_matrix(X: Any) -> Any:
     return X.toarray() if hasattr(X, "toarray") else X
 
 
+def _log_variance_threshold(model_type: str, n_before: int, n_after: int, threshold: float) -> None:
+    n_removed = n_before - n_after
+    if n_removed > 0:
+        logger.info(
+            "VarianceThreshold(thr=%.4f) model=%s: %d/%d features supprimées (variance < seuil).",
+            threshold, model_type, n_removed, n_before,
+        )
+    else:
+        logger.debug(
+            "VarianceThreshold(thr=%.4f) model=%s: aucune feature supprimée (%d features conservées).",
+            threshold, model_type, n_before,
+        )
+
+
 def _build_inference_pipeline(
     aligner: ColumnAligner,
     preprocessor: Any,
@@ -391,8 +405,10 @@ def _run_holdout(
 
     # Fit VarianceThreshold on prepared train data, then apply to remove zero-variance features.
     if spec.feature_selector is not None:
+        _vt_n_before = X_train_prepared.shape[1] if hasattr(X_train_prepared, "shape") else 0
         spec.feature_selector.fit(X_train_prepared)
         X_train_prepared = spec.feature_selector.transform(X_train_prepared)
+        _log_variance_threshold(model_type_norm, _vt_n_before, X_train_prepared.shape[1], cfg.preprocessing.variance_threshold)
         if X_train_prepared.shape[1] == 0:
             raise RuntimeError(
                 f"Preprocessing a supprimé toutes les features pour le modèle '{model_type_norm}'. "
@@ -1054,9 +1070,11 @@ def _run_kfold_cv(
 
             # ② b) Fit VarianceThreshold on train_fold ONLY, then apply to both (no leakage)
             if fold_spec.feature_selector is not None:
+                _vt_n_before = X_train_prep.shape[1] if hasattr(X_train_prep, "shape") else 0
                 fold_spec.feature_selector.fit(X_train_prep)
                 X_train_prep = fold_spec.feature_selector.transform(X_train_prep)
                 X_val_prep = fold_spec.feature_selector.transform(X_val_prep)
+                _log_variance_threshold(model_type_norm, _vt_n_before, X_train_prep.shape[1], cfg.preprocessing.variance_threshold)
                 if X_train_prep.shape[1] == 0:
                     raise RuntimeError(
                         f"Preprocessing a supprimé toutes les features pour le modèle '{model_type_norm}'. "
@@ -1231,8 +1249,10 @@ def _run_kfold_cv(
 
     # Fit VarianceThreshold on refit data, then apply (anti-leakage: test set transforms later via pipeline)
     if final_spec.feature_selector is not None:
+        _vt_n_before = X_refit_prep.shape[1] if hasattr(X_refit_prep, "shape") else 0
         final_spec.feature_selector.fit(X_refit_prep)
         X_refit_prep = final_spec.feature_selector.transform(X_refit_prep)
+        _log_variance_threshold(model_type_norm, _vt_n_before, X_refit_prep.shape[1], cfg.preprocessing.variance_threshold)
 
     if model_type_norm in _DENSE_REQUIRED_MODELS:
         X_refit_prep = _ensure_dense_matrix(X_refit_prep)
@@ -1561,9 +1581,11 @@ def _run_loo(
             X_val_prep = fold_spec.preprocessor.transform(X_val_aligned)
 
             if fold_spec.feature_selector is not None:
+                _vt_n_before = X_train_prep.shape[1] if hasattr(X_train_prep, "shape") else 0
                 fold_spec.feature_selector.fit(X_train_prep)
                 X_train_prep = fold_spec.feature_selector.transform(X_train_prep)
                 X_val_prep = fold_spec.feature_selector.transform(X_val_prep)
+                _log_variance_threshold(model_type_norm, _vt_n_before, X_train_prep.shape[1], cfg.preprocessing.variance_threshold)
 
             if model_type_norm in _DENSE_REQUIRED_MODELS:
                 X_train_prep = _ensure_dense_matrix(X_train_prep)
@@ -1722,8 +1744,10 @@ def _run_loo(
     X_refit_aligned = final_aligner.fit_transform(X_all)
     X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_aligned, y_all)
     if final_spec.feature_selector is not None:
+        _vt_n_before = X_refit_prep.shape[1] if hasattr(X_refit_prep, "shape") else 0
         final_spec.feature_selector.fit(X_refit_prep)
         X_refit_prep = final_spec.feature_selector.transform(X_refit_prep)
+        _log_variance_threshold(model_type_norm, _vt_n_before, X_refit_prep.shape[1], cfg.preprocessing.variance_threshold)
     if model_type_norm in _DENSE_REQUIRED_MODELS:
         X_refit_prep = _ensure_dense_matrix(X_refit_prep)
 

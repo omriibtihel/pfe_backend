@@ -14,6 +14,7 @@ class Project(Base):
 
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    project_type: Mapped[str] = mapped_column(String(32), nullable=False, default="tabular", server_default="tabular")
 
     owner_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"),

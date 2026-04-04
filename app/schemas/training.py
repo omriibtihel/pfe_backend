@@ -16,7 +16,7 @@ SplitMethod = Literal[
     "stratified_group_kfold",
     "loo",
 ]
-SearchType = Literal["none", "grid", "random"]
+SearchType = Literal["none", "grid", "random", "halving_random"]
 PreviewSubset = Literal["train", "val", "test"]
 PreviewMode = Literal["head", "random"]
 NumericImputationMethod = Literal["none", "median", "mean", "most_frequent", "constant", "knn"]
