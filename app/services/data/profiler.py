@@ -35,6 +35,12 @@ class DatasetProfile:
     recommended_resampling: str | None    # None | one of BalancingStrategy values
     recommended_metric: str               # primary metric key
     meta_features: dict[str, Any] = field(default_factory=dict)
+    # Distribution analysis — populated by _distribution_stats
+    non_normal_ratio: float = 0.0         # fraction of numeric cols that failed normality test (p ≤ 0.05)
+    avg_skewness: float = 0.0             # mean |skewness| across tested numeric cols
+    highly_skewed_count: int = 0          # number of cols with |skewness| ≥ 1.5
+    # Per-column distribution stats: {col: {is_normal, skewness, abs_skewness, n, test_used, p_value, has_missing}}
+    column_distribution: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -161,6 +167,87 @@ def _missing_stats(df: pd.DataFrame) -> tuple[bool, float]:
     return bool(missing > 0), float(ratio)
 
 
+def _distribution_stats(df: pd.DataFrame, target_col: str) -> dict[str, Any]:
+    """
+    Normality analysis across numeric feature columns — mirrors /normality-test exactly.
+
+    Per-column decision (same as charts page):
+    - Shapiro-Wilk       when column n ≤ 5 000
+    - D'Agostino-Pearson when column n > 5 000
+
+    Caps at 50 columns for performance.
+
+    Returns:
+        non_normal_ratio    : fraction of tested cols that failed normality (p ≤ 0.05)
+        avg_skewness        : mean |skewness| across tested cols
+        highly_skewed_count : cols with |skewness| ≥ 1.5
+        columns             : per-column stats dict used for individual recommendations
+    """
+    from scipy import stats as _stats  # lazy import — scipy may be heavy in some envs
+
+    features = df.drop(columns=[target_col], errors="ignore")
+    num_cols = features.select_dtypes(include=[np.number]).columns.tolist()
+
+    if not num_cols:
+        return {
+            "non_normal_ratio": 0.0, "avg_skewness": 0.0,
+            "highly_skewed_count": 0, "columns": {},
+        }
+
+    num_cols = num_cols[:50]  # cap for performance
+    col_stats: dict[str, dict[str, Any]] = {}
+    non_normal = 0
+    skewness_vals: list[float] = []
+    highly_skewed = 0
+
+    for col in num_cols:
+        series = features[col]
+        has_missing = bool(series.isnull().any())
+        data = series.dropna().to_numpy(dtype=float)
+        n = len(data)
+        if n < 8:  # too few values to test reliably
+            continue
+
+        sk = float(_stats.skew(data))
+        abs_sk = abs(sk)
+        skewness_vals.append(abs_sk)
+        if abs_sk >= 1.5:
+            highly_skewed += 1
+
+        if n <= 5_000:
+            _, p = _stats.shapiro(data)
+            test_used = "shapiro"
+        else:
+            _, p = _stats.normaltest(data)
+            test_used = "dagostino"
+
+        is_normal = bool(float(p) > 0.05)
+        if not is_normal:
+            non_normal += 1
+
+        # Box-Cox requires strictly positive values — flag columns that violate this
+        has_negative = bool(float(data.min()) <= 0)
+
+        col_stats[col] = {
+            "is_normal": is_normal,
+            "skewness": sk,
+            "abs_skewness": abs_sk,
+            "n": n,
+            "test_used": test_used,
+            "p_value": float(p),
+            "has_missing": has_missing,
+            "has_negative": has_negative,
+        }
+
+    tested = len(skewness_vals)
+    return {
+        "non_normal_ratio": non_normal / tested if tested > 0 else 0.0,
+        "avg_skewness": float(np.mean(skewness_vals)) if skewness_vals else 0.0,
+        "highly_skewed_count": highly_skewed,
+        "columns": col_stats,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
@@ -196,6 +283,7 @@ class DatasetProfiler:
         cv_strategy = _recommended_cv(size_cat, task_type, n_samples, ir)
         resampling = _recommended_resampling(task_type, ir, mr)
         metric = _recommended_metric(task_type, ir)
+        dist = _distribution_stats(df_clean, target_column)
 
         meta: dict[str, Any] = {
             "class_distribution": (
@@ -225,4 +313,8 @@ class DatasetProfiler:
             recommended_resampling=resampling,
             recommended_metric=metric,
             meta_features=meta,
+            non_normal_ratio=dist["non_normal_ratio"],
+            avg_skewness=dist["avg_skewness"],
+            highly_skewed_count=dist["highly_skewed_count"],
+            column_distribution=dist["columns"],
         )

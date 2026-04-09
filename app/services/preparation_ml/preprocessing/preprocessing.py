@@ -13,6 +13,7 @@ from sklearn.preprocessing import (
     MinMaxScaler,
     OneHotEncoder,
     OrdinalEncoder,
+    PowerTransformer,
     RobustScaler,
     StandardScaler,
 )
@@ -88,16 +89,18 @@ def _build_numeric_imputer(method: str, knn_n_neighbors: int = 5, constant_fill:
 
 
 def _build_numeric_scaler(method: str):
+    """Build a sklearn linear scaler. Power transforms are handled separately in build_preprocessor."""
     if method == "none":
         return "passthrough"
+    if method == "standard":
+        return StandardScaler(with_mean=True, with_std=True)
     if method == "minmax":
         return MinMaxScaler()
     if method == "robust":
         return RobustScaler(with_centering=True, with_scaling=True)
     if method == "maxabs":
         return MaxAbsScaler()
-    # standard (default): z-score with centering for numeric columns.
-    # Numeric branches run on dense dataframe subsets, so centering is expected.
+    # fallback → standard z-score
     return StandardScaler(with_mean=True, with_std=True)
 
 
@@ -157,6 +160,7 @@ def resolve_effective_preprocessing_by_column(X: pd.DataFrame, prep_cfg: Preproc
                 active_numeric_columns.append(str(col))
                 passthrough = (
                     str(resolved.get("numericImputation", "none")) == "none"
+                    and str(resolved.get("numericPowerTransform", "none")) == "none"
                     and str(resolved.get("numericScaling", "none")) == "none"
                 )
             else:
@@ -197,7 +201,7 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
 
     # Keys include per-column advanced params so columns with different
     # k / fill_value get separate Pipeline instances.
-    numeric_groups: dict[tuple[str, str, int, float], list[str]] = {}
+    numeric_groups: dict[tuple[str, str, str, int, float], list[str]] = {}
     categorical_groups: dict[tuple[str, str, tuple[str, ...], str], list[str]] = {}
     passthrough_cols: list[str] = []
 
@@ -216,6 +220,7 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
                 continue
             key_num = (
                 str(cfg.get("numericImputation", prep_cfg.numeric_imputation)),
+                str(cfg.get("numericPowerTransform", prep_cfg.numeric_power_transform)),
                 str(cfg.get("numericScaling", prep_cfg.numeric_scaling)),
                 int(cfg.get("knnNeighbors", prep_cfg.knn_n_neighbors)),
                 float(cfg.get("constantFillNumeric", prep_cfg.constant_fill_numeric)),
@@ -239,7 +244,7 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
 
     transformers: list[tuple[str, Any, list[str]]] = []
 
-    for idx, ((num_imp, num_scale, knn_k, const_fill_num), cols) in enumerate(numeric_groups.items()):
+    for idx, ((num_imp, num_power, num_scale, knn_k, const_fill_num), cols) in enumerate(numeric_groups.items()):
         steps: list[tuple[str, Any]] = []
         if num_imp != "none":
             steps.append(("imputer", _build_numeric_imputer(
@@ -247,6 +252,11 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
                 knn_n_neighbors=knn_k,
                 constant_fill=const_fill_num,
             )))
+        if num_power != "none":
+            # standardize=False when a linear scaler follows; True when used standalone
+            standardize = num_scale == "none"
+            method = "yeo-johnson" if num_power == "yeo_johnson" else "box-cox"
+            steps.append(("power", PowerTransformer(method=method, standardize=standardize)))
         if num_scale != "none":
             steps.append(("scaler", _build_numeric_scaler(num_scale)))
         if steps:

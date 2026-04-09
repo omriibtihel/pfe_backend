@@ -26,6 +26,7 @@ from app.schemas.training import TrainingConfigIn, TrainingValidateOut
 from app.services.preparation_ml.balancing.profiler import DataProfile, profile_binary_dataset
 from app.services.training.config.schema import get_training_capabilities
 from app.services.data.loader import load_dataframe, resolve_dataset_path
+from app.api.utils.versions import load_version_df
 from app.services.data.profiler import DatasetProfiler
 from app.services.data.preview import PreviewValidationError, build_validation_preview
 from app.services.training.utils import to_python_scalar
@@ -209,8 +210,7 @@ def profile_dataset(
     """
     ensure_project_owner(db, project_id, current_user.id)
     try:
-        dataset_path, _ = resolve_dataset_path(db, project_id, payload.version_id)
-        df = load_dataframe(dataset_path)
+        df = load_version_df(db, project_id, payload.version_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -236,4 +236,8 @@ def profile_dataset(
         recommended_resampling=prof.recommended_resampling,
         recommended_metric=prof.recommended_metric,
         meta_features=prof.meta_features,
+        non_normal_ratio=prof.non_normal_ratio,
+        avg_skewness=prof.avg_skewness,
+        highly_skewed_count=prof.highly_skewed_count,
+        column_distribution=prof.column_distribution,
     )

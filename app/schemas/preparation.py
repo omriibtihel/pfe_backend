@@ -92,3 +92,9 @@ class DatasetProfileOut(BaseModel):
     recommended_resampling: Optional[str] = None
     recommended_metric: str
     meta_features: Dict[str, Any] = Field(default_factory=dict)
+    # Distribution analysis fields
+    non_normal_ratio: float = 0.0
+    avg_skewness: float = 0.0
+    highly_skewed_count: int = 0
+    # Per-column: {colName: {is_normal, skewness, abs_skewness, n, test_used, p_value, has_missing}}
+    column_distribution: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

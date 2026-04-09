@@ -2,12 +2,6 @@
 RecommendationEngine — Phase 2
 Transforms a DatasetProfile into a TrainingRecommendation that can be
 sent to the frontend and/or directly executed via TrainingConfigBuilder.
-
-All decisions follow the product rules:
-  - Prudent, fast, robust defaults.
-  - At most 3–4 models recommended.
-  - Explanations are human-readable and frontend-ready.
-  - No side effects.
 """
 from __future__ import annotations
 
@@ -26,26 +20,34 @@ from app.services.training.config.zero_shot import get_zero_shot_hyperparams
 
 @dataclass
 class TrainingRecommendation:
-    mode: str                               # always "recommendation"
+    mode: str
     recommended_models: list[str]
     recommended_resampling: str | None
     apply_threshold: bool
     recommended_metric: str
     secondary_metrics: list[str]
-    recommended_cv_strategy: str           # "holdout" | "kfold" | "stratified_kfold"
-    recommended_k_folds: int               # only relevant when cv != holdout
-    recommended_search_type: str           # "none" | "grid" | "random"
+    recommended_cv_strategy: str
+    recommended_k_folds: int
+    recommended_search_type: str
     recommended_time_budget_s: int | None
     recommended_class_weight: str | None
-    recommended_split: dict[str, int]      # {trainRatio, valRatio, testRatio} in %
-    reasoning: dict[str, str]              # label → explanation (frontend-ready)
-    training_config_payload: dict[str, Any]  # ready to pass to TrainingConfig.from_front()
+    recommended_split: dict[str, int]
+    reasoning: dict[str, str]
+    training_config_payload: dict[str, Any]
+    recommended_power_transform: str = "none"
+    recommended_scaling: str = "none"
+    recommended_preprocessing: dict[str, Any] = field(default_factory=dict)
+    recommended_column_configs: dict[str, dict[str, str]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _map_task_type(full_task: str) -> str:
+    return "regression" if full_task == "regression" else "classification"
+
 
 def _recommend_models(profile: DatasetProfile) -> list[str]:
     task = profile.task_type
@@ -59,65 +61,112 @@ def _recommend_models(profile: DatasetProfile) -> list[str]:
             return ["ridge", "randomforest", "lightgbm"]
         return ["ridge", "randomforest", "lightgbm", "xgboost"]
 
-    # Classification
     if size == "large":
-        # Prioritise fast models
         return ["lightgbm", "logisticregression"]
-
     if size in {"tiny", "small"}:
         if ir > 5.0:
             return ["logisticregression", "lightgbm", "randomforest"]
         return ["logisticregression", "randomforest", "lightgbm"]
-
-    # medium
     if ir > 5.0:
         return ["lightgbm", "randomforest", "logisticregression"]
     return ["logisticregression", "randomforest", "lightgbm", "xgboost"]
 
 
 def _recommend_search_type(profile: DatasetProfile) -> tuple[str, int | None]:
-    """Returns (search_type, time_budget_s_or_None)."""
     size = profile.dataset_size_category
-    speed = profile.estimated_training_speed
-
     if size == "tiny":
         return "grid", None
-    if size == "small":
+    if size in {"small", "medium"}:
         return "halving_random", None
-    if size == "medium":
-        return "halving_random", None
-    # large → no HPO by default (too slow), user can activate
     return "none", None
 
 
 def _recommend_split(profile: DatasetProfile) -> dict[str, int]:
-    size = profile.dataset_size_category
-    cv = profile.recommended_cv_strategy
-
-    if cv != "holdout":
-        # CV mode: no holdout test split by default
+    if profile.recommended_cv_strategy != "holdout":
         return {"trainRatio": 80, "valRatio": 0, "testRatio": 0}
-    if size in {"tiny", "small"}:
-        return {"trainRatio": 70, "valRatio": 15, "testRatio": 15}
     return {"trainRatio": 70, "valRatio": 15, "testRatio": 15}
 
 
 def _recommend_k_folds(profile: DatasetProfile) -> int:
-    if profile.dataset_size_category in {"tiny", "small"}:
-        return 10
-    return 5
+    return 10 if profile.dataset_size_category in {"tiny", "small"} else 5
+
+
+def _col_power_transform(col_stat: dict[str, Any]) -> str:
+    """Non-normal → yeo_johnson. Normal → none. Box-Cox never auto-recommended (requires X > 0)."""
+    return "none" if col_stat["is_normal"] else "yeo_johnson"
+
+
+def _col_scaling(col_stat: dict[str, Any]) -> str:
+    """
+    After yeo_johnson the distribution is ~Gaussian → standard is optimal.
+    For already-normal data: robust if |sk| ≥ 1.0 (outliers), else standard.
+    """
+    if not col_stat["is_normal"]:
+        return "standard"          # post-transform data is ~Gaussian
+    if col_stat["abs_skewness"] >= 1.0:
+        return "robust"            # normal but with notable outlier influence
+    return "standard"
+
+
+def _col_imputation(col_stat: dict[str, Any]) -> str:
+    if not col_stat["has_missing"]:
+        return "none"
+    return "median" if col_stat["abs_skewness"] >= 0.75 else "mean"
+
+
+def _recommend_transforms(profile: DatasetProfile) -> tuple[str, str]:
+    """
+    Returns (power_transform, scaling) global defaults via majority vote.
+    - power_transform : "none" | "yeo_johnson"
+    - scaling         : "none" | "standard" | "robust" | "minmax" | "maxabs"
+    """
+    if profile.column_distribution:
+        pt_counts: dict[str, int] = {}
+        sc_counts: dict[str, int] = {}
+        for stat in profile.column_distribution.values():
+            p = _col_power_transform(stat)
+            s = _col_scaling(stat)
+            pt_counts[p] = pt_counts.get(p, 0) + 1
+            sc_counts[s] = sc_counts.get(s, 0) + 1
+        power = max(pt_counts, key=lambda k: pt_counts[k])
+        scaling = max(sc_counts, key=lambda k: sc_counts[k])
+        return power, scaling
+
+    nnr, sk = profile.non_normal_ratio, profile.avg_skewness
+    if nnr == 0.0 and sk == 0.0:
+        return "none", "none"
+    if nnr > 0:                       # non-normal columns present
+        return "yeo_johnson", "standard"
+    if sk >= 1.0:                     # normal but outlier-prone
+        return "none", "robust"
+    return "none", "standard"
+
+
+def _recommend_imputation(profile: DatasetProfile) -> tuple[str, str]:
+    """(numeric_imputation, categorical_imputation) — majority vote; none if no missing values."""
+    if not profile.has_missing_values:
+        return "none", "none"
+
+    if profile.column_distribution:
+        counts: dict[str, int] = {}
+        for stat in profile.column_distribution.values():
+            if stat["has_missing"]:
+                s = _col_imputation(stat)
+                counts[s] = counts.get(s, 0) + 1
+        numeric = max(counts, key=lambda k: counts[k]) if counts else "mean"
+    else:
+        numeric = "median" if profile.avg_skewness >= 0.75 else "mean"
+
+    return numeric, "most_frequent"
 
 
 def _recommend_class_weight(profile: DatasetProfile, resampling: str | None) -> str | None:
-    """Recommend class_weight only when resampling is none/threshold."""
     if profile.task_type == "regression":
         return None
     ir = profile.imbalance_ratio or 1.0
     if ir <= 1.5:
         return None
-    if resampling in {None, "threshold_optimization"}:
-        return "balanced"
-    return None
+    return "balanced" if resampling in {None, "threshold_optimization"} else None
 
 
 def _build_reasoning(
@@ -127,46 +176,77 @@ def _build_reasoning(
     metric: str,
     cv: str,
     search_type: str,
+    power_transform: str,
+    scaling: str,
+    num_imputation: str,
 ) -> dict[str, str]:
     size_label = {
-        "tiny": "very small (< 500 rows)",
-        "small": "small (500–2 000 rows)",
+        "tiny":   "very small (< 500 rows)",
+        "small":  "small (500–2 000 rows)",
         "medium": "medium (2 000–50 000 rows)",
-        "large": "large (> 50 000 rows)",
+        "large":  "large (> 50 000 rows)",
     }.get(profile.dataset_size_category, profile.dataset_size_category)
 
     ir = profile.imbalance_ratio
     ir_msg = (
-        "dataset is balanced"
-        if ir is None or ir <= 1.5
+        "dataset is balanced" if ir is None or ir <= 1.5
         else f"imbalance ratio={ir:.1f}"
     )
 
     search_msg = {
-        "none": "No HPO (dataset is large; use Random or Grid search if time allows).",
-        "grid": "Grid search (small dataset, exhaustive search is feasible).",
-        "random": "Randomised search (balanced speed/quality tradeoff).",
-        "halving_random": "Successive Halving (explores many candidates, eliminates poor ones early — 3–10× faster than random search).",
+        "none":          "No HPO (dataset is large; activate Random or Grid search if time allows).",
+        "grid":          "Grid search (small dataset, exhaustive search is feasible).",
+        "random":        "Randomised search (balanced speed/quality tradeoff).",
+        "halving_random":"Successive Halving (explores many candidates, eliminates poor ones early — 3–10× faster than random search).",
     }.get(search_type, search_type)
+
+    pt_msg = {
+        "yeo_johnson": (
+            f"Yeo-Johnson power transform — {profile.non_normal_ratio:.0%} non-normal features "
+            f"(mean |skewness|={profile.avg_skewness:.2f}). "
+            "Finds optimal λ per feature to achieve normality."
+        ),
+        "box_cox": (
+            "Box-Cox power transform — requires strictly positive values (X > 0). "
+            "Yeo-Johnson is safer unless all features are strictly positive."
+        ),
+        "none": "No power transform — distribution is mostly Gaussian.",
+    }.get(power_transform, f"Power transform: {power_transform}.")
+
+    scaling_msg = {
+        "standard": (
+            f"Standard (z-score) — mean |skewness|={profile.avg_skewness:.2f}. "
+            "Optimal after power transform or for already-Gaussian data."
+        ),
+        "robust": (
+            f"Robust (IQR) — mean |skewness|={profile.avg_skewness:.2f}. "
+            "Normal distribution but with notable outliers; IQR is resistant to their influence."
+        ),
+        "minmax": "MinMax — bounds features to [0, 1].",
+        "maxabs": "MaxAbs — scales to [-1, 1] without centring.",
+        "none":   "No linear scaler.",
+    }.get(scaling, f"Scaling: {scaling}.")
+
+    if num_imputation == "none":
+        imputation_msg = "No imputation needed (no missing values)."
+    elif num_imputation == "median":
+        imputation_msg = "Numeric imputation: median — skewed distribution makes mean less robust."
+    else:
+        imputation_msg = "Numeric imputation: mean — distribution is approximately symmetric."
 
     return {
         "dataset_size": f"Dataset is {size_label} — {profile.n_samples} samples, {profile.n_features} features.",
-        "task_type": f"Detected task: {profile.task_type.replace('_', ' ')}.",
-        "imbalance": f"Class balance: {ir_msg}.",
-        "models": (
-            f"Recommended {', '.join(models)} — diverse mix of linear and ensemble "
-            f"methods suited to this dataset size."
-        ),
-        "resampling": (
-            f"Recommended resampling: {resampling or 'none'} "
-            f"({'needed for imbalanced data' if resampling else 'data is balanced, none needed'})."
-        ),
-        "metric": f"Primary metric: {metric} — chosen based on task type and class balance.",
-        "cv_strategy": (
+        "task_type":    f"Detected task: {profile.task_type.replace('_', ' ')}.",
+        "imbalance":    f"Class balance: {ir_msg}.",
+        "models":       f"Recommended {', '.join(models)} — diverse mix suited to this dataset size.",
+        "resampling":   f"Resampling: {resampling or 'none'} ({'needed for imbalanced data' if resampling else 'data is balanced'}).",
+        "metric":       f"Primary metric: {metric} — chosen based on task type and class balance.",
+        "cv_strategy":  (
             f"Validation: {cv.replace('_', ' ')} "
-            f"{'— best for small datasets to maximise data usage.' if cv != 'holdout' else '— efficient for large datasets.'}"
+            f"{'— best for small datasets.' if cv != 'holdout' else '— efficient for large datasets.'}"
         ),
-        "search": search_msg,
+        "search":       search_msg,
+        "preprocessing": f"{pt_msg} {scaling_msg} {imputation_msg}",
     }
 
 
@@ -185,29 +265,29 @@ class RecommendationEngine:
     """
 
     def recommend(self, profile: DatasetProfile) -> TrainingRecommendation:
-        models = _recommend_models(profile)
+        models       = _recommend_models(profile)
         search_type, time_budget = _recommend_search_type(profile)
-        split = _recommend_split(profile)
-        k_folds = _recommend_k_folds(profile)
-        cv = profile.recommended_cv_strategy
+        split        = _recommend_split(profile)
+        k_folds      = _recommend_k_folds(profile)
+        cv           = profile.recommended_cv_strategy
 
-        # Compute minority_count from profile for precise SMOTE feasibility checks
-        _minority_count: int | None = None
+        minority_count: int | None = None
         if profile.minority_ratio is not None and profile.n_samples > 0:
-            _minority_count = max(1, int(round(profile.minority_ratio * profile.n_samples)))
+            minority_count = max(1, int(round(profile.minority_ratio * profile.n_samples)))
 
-        imbalance_rec = recommend_imbalance_strategy(
-            profile,
-            minority_count=_minority_count,
-            n_samples=profile.n_samples,
-        )
-        resampling = imbalance_rec.strategy
+        imbalance_rec  = recommend_imbalance_strategy(profile, minority_count=minority_count, n_samples=profile.n_samples)
+        resampling     = imbalance_rec.strategy
         apply_threshold = imbalance_rec.apply_threshold
 
-        class_weight = _recommend_class_weight(profile, resampling)
+        power_transform, scaling   = _recommend_transforms(profile)
+        num_imputation, cat_imputation = _recommend_imputation(profile)
+        class_weight               = _recommend_class_weight(profile, resampling)
+        metrics                    = select_metrics(profile)
 
-        metrics = select_metrics(profile)
-        reasoning = _build_reasoning(profile, models, resampling, metrics.primary, cv, search_type)
+        reasoning = _build_reasoning(
+            profile, models, resampling, metrics.primary, cv, search_type,
+            power_transform=power_transform, scaling=scaling, num_imputation=num_imputation,
+        )
 
         zero_shot_hp = get_zero_shot_hyperparams(
             size_cat=profile.dataset_size_category,
@@ -215,6 +295,59 @@ class RecommendationEngine:
             imbalance_ratio=profile.imbalance_ratio,
             models=models,
         )
+
+        # Per-column configs — only columns that differ from the global default
+        col_configs: dict[str, dict[str, str]] = {}
+        for col, stat in profile.column_distribution.items():
+            entry: dict[str, str] = {}
+            col_pt = _col_power_transform(stat)
+            col_s  = _col_scaling(stat)
+            col_i  = _col_imputation(stat)
+            if col_pt != power_transform:
+                entry["numericPowerTransform"] = col_pt
+            if col_s != scaling:
+                entry["numericScaling"] = col_s
+            if col_i != num_imputation:
+                entry["numericImputation"] = col_i
+            if entry:
+                col_configs[col] = entry
+
+        threshold_strategy = (
+            "maximize_f2" if imbalance_rec.severity in {"severe", "critical"} and apply_threshold
+            else "maximize_f1"
+        )
+
+        preprocessing_payload: dict[str, Any] = {
+            "defaults": {
+                "numericPowerTransform":  power_transform,
+                "numericScaling":         scaling,
+                "numericImputation":      num_imputation,
+                "categoricalImputation":  cat_imputation,
+                "categoricalEncoding":    "none",
+            },
+            "columns": {col: dict(cfg) for col, cfg in col_configs.items()},
+        }
+
+        payload: dict[str, Any] = {
+            "taskType":      _map_task_type(profile.task_type),
+            "models":        models,
+            "metrics":       [metrics.primary] + metrics.secondary,
+            "splitMethod":   cv,
+            "kFolds":        k_folds,
+            "shuffle":       True,
+            "trainRatio":    split["trainRatio"],
+            "valRatio":      split["valRatio"],
+            "testRatio":     split["testRatio"],
+            "searchType":    search_type,
+            "balancing": {
+                "strategy":           resampling or "none",
+                "apply_threshold":    apply_threshold,
+                "threshold_strategy": threshold_strategy,
+            },
+            "preprocessing": preprocessing_payload,
+            "modelHyperparams": zero_shot_hp,
+            "configMode":    "manual",
+        }
 
         warnings: list[str] = []
         if profile.has_missing_values and profile.missing_ratio > 0.3:
@@ -232,41 +365,7 @@ class RecommendationEngine:
                 "Very small dataset: results may have high variance. "
                 "Prefer cross-validation over a simple train/test split."
             )
-        # Surface any SMOTE/undersampling feasibility notes from imbalance handler
-        for note in imbalance_rec.feasibility_notes:
-            warnings.append(note)
-
-        # Choose threshold strategy based on imbalance severity.
-        # For severe/critical imbalance, maximize_f2 (beta=2) penalises false negatives more
-        # heavily than false positives — i.e., it prioritises not missing minority cases.
-        # For mild/moderate we default to maximize_f1 (balanced precision/recall).
-        if imbalance_rec.severity in {"severe", "critical"} and apply_threshold:
-            threshold_strategy = "maximize_f2"
-        else:
-            threshold_strategy = "maximize_f1"
-
-        # Build the unified payload dict (ready for TrainingConfig.from_front)
-        balancing_payload: dict[str, Any] = {
-            "strategy": resampling or "none",
-            "apply_threshold": apply_threshold,
-            "threshold_strategy": threshold_strategy,
-        }
-
-        payload: dict[str, Any] = {
-            "taskType": _map_task_type(profile.task_type),
-            "models": models,
-            "metrics": [metrics.primary] + metrics.secondary,
-            "splitMethod": cv,
-            "kFolds": k_folds,
-            "shuffle": True,
-            "trainRatio": split["trainRatio"],
-            "valRatio": split["valRatio"],
-            "testRatio": split["testRatio"],
-            "searchType": search_type,
-            "balancing": balancing_payload,
-            "modelHyperparams": zero_shot_hp,
-            "configMode": "manual",
-        }
+        warnings.extend(imbalance_rec.feasibility_notes)
 
         return TrainingRecommendation(
             mode="recommendation",
@@ -283,12 +382,9 @@ class RecommendationEngine:
             recommended_split=split,
             reasoning=reasoning,
             training_config_payload=payload,
+            recommended_power_transform=power_transform,
+            recommended_scaling=scaling,
+            recommended_preprocessing=preprocessing_payload,
+            recommended_column_configs=col_configs,
             warnings=warnings,
         )
-
-
-def _map_task_type(full_task: str) -> str:
-    """Convert DatasetProfile.task_type → TrainingConfig.task_type."""
-    if full_task == "regression":
-        return "regression"
-    return "classification"

@@ -20,6 +20,7 @@ from app.schemas.training import (
     TrainingRecommendationOut,
 )
 from app.services.data.loader import load_dataframe, resolve_dataset_path
+from app.api.utils.versions import load_version_df
 from app.services.data.profiler import DatasetProfiler
 from app.services.preparation_ml.balancing.profiler import profile_binary_dataset
 from app.services.training import presenter
@@ -47,8 +48,7 @@ def recommend_training_config(
     ensure_project_owner(db, project_id, current_user.id)
 
     try:
-        dataset_path, _ = resolve_dataset_path(db, project_id, payload.version_id)
-        df = load_dataframe(dataset_path)
+        df = load_version_df(db, project_id, payload.version_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -76,6 +76,10 @@ def recommend_training_config(
         recommended_resampling=prof.recommended_resampling,
         recommended_metric=prof.recommended_metric,
         meta_features=prof.meta_features,
+        non_normal_ratio=prof.non_normal_ratio,
+        avg_skewness=prof.avg_skewness,
+        highly_skewed_count=prof.highly_skewed_count,
+        column_distribution=prof.column_distribution,
     )
 
     return TrainingRecommendationOut(
@@ -93,6 +97,10 @@ def recommend_training_config(
         recommended_split=rec.recommended_split,
         reasoning=rec.reasoning,
         training_config_payload=rec.training_config_payload,
+        recommended_power_transform=rec.recommended_power_transform,
+        recommended_scaling=rec.recommended_scaling,
+        recommended_preprocessing=rec.recommended_preprocessing,
+        recommended_column_configs=rec.recommended_column_configs,
         warnings=rec.warnings,
         profile=profile_out,
     )

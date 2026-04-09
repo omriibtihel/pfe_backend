@@ -31,11 +31,13 @@ NUMERIC_IMPUTATION_METHODS = ["none", "median", "mean", "most_frequent", "consta
 CATEGORICAL_IMPUTATION_METHODS = ["none", "most_frequent", "constant"]
 CATEGORICAL_ENCODING_METHODS = ["none", "onehot", "label", "ordinal"]
 NUMERIC_SCALING_METHODS = ["none", "standard", "minmax", "robust", "maxabs"]
+NUMERIC_POWER_TRANSFORM_METHODS = ["none", "yeo_johnson", "box_cox"]
 
 DEFAULT_NUMERIC_IMPUTATION = "none"
 DEFAULT_CATEGORICAL_IMPUTATION = "none"
 DEFAULT_CATEGORICAL_ENCODING = "none"
 DEFAULT_NUMERIC_SCALING = "none"
+DEFAULT_NUMERIC_POWER_TRANSFORM = "none"
 
 SUPPORTED_SPLIT_METHODS = [
     "holdout",
@@ -79,6 +81,7 @@ THRESHOLD_STRATEGIES = ["maximize_f1", "maximize_f2", "min_recall", "precision_r
 # Canonical frontend contract for Step3.
 PREPROCESSING_CAPABILITIES = {
     "numericImputation": NUMERIC_IMPUTATION_METHODS,
+    "numericPowerTransform": NUMERIC_POWER_TRANSFORM_METHODS,
     "numericScaling": NUMERIC_SCALING_METHODS,
     "categoricalImputation": CATEGORICAL_IMPUTATION_METHODS,
     "categoricalEncoding": CATEGORICAL_ENCODING_METHODS,
@@ -86,6 +89,7 @@ PREPROCESSING_CAPABILITIES = {
     "supportsPerColumn": True,
     "defaults": {
         "numericImputation": DEFAULT_NUMERIC_IMPUTATION,
+        "numericPowerTransform": DEFAULT_NUMERIC_POWER_TRANSFORM,
         "numericScaling": DEFAULT_NUMERIC_SCALING,
         "categoricalImputation": DEFAULT_CATEGORICAL_IMPUTATION,
         "categoricalEncoding": DEFAULT_CATEGORICAL_ENCODING,
@@ -479,8 +483,8 @@ def _legacy_preprocessing_capabilities() -> dict[str, Any]:
             "defaultNumeric": PREPROCESSING_CAPABILITIES["defaults"]["numericScaling"],
         },
         "normalization": {
-            "numeric": PREPROCESSING_CAPABILITIES["numericScaling"],
-            "defaultNumeric": PREPROCESSING_CAPABILITIES["defaults"]["numericScaling"],
+            "numeric": PREPROCESSING_CAPABILITIES["numericPowerTransform"],
+            "defaultNumeric": PREPROCESSING_CAPABILITIES["defaults"]["numericPowerTransform"],
         },
     }
 
@@ -555,6 +559,19 @@ def _norm_choice(raw: Any, allowed: list[str], default: str, aliases: dict[str, 
     if aliases:
         v = aliases.get(v, v)
     return v if v in allowed else default
+
+
+def _migrate_legacy_numeric_transform(raw_scaling: Any, raw_power_transform: Any) -> tuple[Any, Any]:
+    """
+    Preserve backward compatibility for legacy payloads that used
+    numericScaling for power transforms before numericPowerTransform existed.
+    """
+    scaling_value = str(raw_scaling or "").strip().lower()
+    power_value = str(raw_power_transform or "").strip().lower()
+
+    if not power_value and scaling_value in {"yeo_johnson", "box_cox"}:
+        return None, scaling_value
+    return raw_scaling, raw_power_transform
 
 
 def _to_bool(raw: Any, default: bool = False) -> bool:
@@ -903,10 +920,12 @@ class PreprocessingDefaults:
     categorical_imputation: str = DEFAULT_CATEGORICAL_IMPUTATION
     categorical_encoding: str = DEFAULT_CATEGORICAL_ENCODING
     numeric_scaling: str = DEFAULT_NUMERIC_SCALING
+    numeric_power_transform: str = DEFAULT_NUMERIC_POWER_TRANSFORM
 
     def as_dict(self) -> dict[str, str]:
         return {
             "numericImputation": self.numeric_imputation,
+            "numericPowerTransform": self.numeric_power_transform,
             "numericScaling": self.numeric_scaling,
             "categoricalImputation": self.categorical_imputation,
             "categoricalEncoding": self.categorical_encoding,
@@ -925,7 +944,7 @@ class PreprocessingDefaults:
                 "numeric": self.numeric_scaling,
             },
             "normalization": {
-                "numeric": self.numeric_scaling,
+                "numeric": self.numeric_power_transform,
             },
         }
 
@@ -976,6 +995,18 @@ class PreprocessingConfig:
         enc = _as_dict(pp.get("encoding"))
         scl = _as_dict(pp.get("scaling"))
         nrm = _as_dict(pp.get("normalization"))
+        raw_numeric_scaling = defaults.get(
+            "numericScaling",
+            pp.get("numericScaling", scl.get("numeric", payload.get("numericScaling"))),
+        )
+        raw_numeric_power_transform = defaults.get(
+            "numericPowerTransform",
+            pp.get("numericPowerTransform", nrm.get("numeric", payload.get("numericPowerTransform"))),
+        )
+        raw_numeric_scaling, raw_numeric_power_transform = _migrate_legacy_numeric_transform(
+            raw_numeric_scaling,
+            raw_numeric_power_transform,
+        )
 
         numeric_imputation = _norm_choice(
             defaults.get("numericImputation", pp.get("numericImputation", imp.get("numeric", payload.get("numericImputation")))),
@@ -1004,16 +1035,14 @@ class PreprocessingConfig:
             },
         )
         numeric_scaling = _norm_choice(
-            defaults.get(
-                "numericScaling",
-                pp.get("numericScaling", scl.get("numeric", nrm.get("numeric", payload.get("numericScaling")))),
-            ),
+            raw_numeric_scaling,
             NUMERIC_SCALING_METHODS,
             DEFAULT_NUMERIC_SCALING,
-            aliases={
-                "normalization": "standard",
-                "normalisation": "standard",
-            },
+        )
+        numeric_power_transform = _norm_choice(
+            raw_numeric_power_transform,
+            NUMERIC_POWER_TRANSFORM_METHODS,
+            DEFAULT_NUMERIC_POWER_TRANSFORM,
         )
 
         resolved_defaults = PreprocessingDefaults(
@@ -1021,6 +1050,7 @@ class PreprocessingConfig:
             categorical_imputation=categorical_imputation,
             categorical_encoding=categorical_encoding,
             numeric_scaling=numeric_scaling,
+            numeric_power_transform=numeric_power_transform,
         )
 
         columns_raw = _as_dict(pp.get("columns"))
@@ -1047,12 +1077,24 @@ class PreprocessingConfig:
                     NUMERIC_IMPUTATION_METHODS,
                     resolved_defaults.numeric_imputation,
                 )
+            raw_col_numeric_scaling, raw_col_numeric_power_transform = _migrate_legacy_numeric_transform(
+                cfg_col.get("numericScaling"),
+                cfg_col.get("numericPowerTransform"),
+            )
             if "numericScaling" in cfg_col:
                 out["numericScaling"] = _norm_choice(
-                    cfg_col.get("numericScaling"),
+                    raw_col_numeric_scaling,
                     NUMERIC_SCALING_METHODS,
                     resolved_defaults.numeric_scaling,
-                    aliases={"normalization": "standard", "normalisation": "standard"},
+                )
+            if "numericPowerTransform" in cfg_col or (
+                "numericScaling" in cfg_col
+                and str(cfg_col.get("numericScaling") or "").strip().lower() in {"yeo_johnson", "box_cox"}
+            ):
+                out["numericPowerTransform"] = _norm_choice(
+                    raw_col_numeric_power_transform,
+                    NUMERIC_POWER_TRANSFORM_METHODS,
+                    resolved_defaults.numeric_power_transform,
                 )
             if "categoricalImputation" in cfg_col:
                 out["categoricalImputation"] = _norm_choice(
@@ -1133,6 +1175,10 @@ class PreprocessingConfig:
         return self.defaults.numeric_scaling
 
     @property
+    def numeric_power_transform(self) -> str:
+        return self.defaults.numeric_power_transform
+
+    @property
     def categorical_imputation(self) -> str:
         return self.defaults.categorical_imputation
 
@@ -1159,11 +1205,15 @@ class PreprocessingConfig:
                 NUMERIC_IMPUTATION_METHODS,
                 self.defaults.numeric_imputation,
             ),
+            "numericPowerTransform": _norm_choice(
+                cfg.get("numericPowerTransform"),
+                NUMERIC_POWER_TRANSFORM_METHODS,
+                self.defaults.numeric_power_transform,
+            ),
             "numericScaling": _norm_choice(
                 cfg.get("numericScaling"),
                 NUMERIC_SCALING_METHODS,
                 self.defaults.numeric_scaling,
-                aliases={"normalization": "standard", "normalisation": "standard"},
             ),
             "categoricalImputation": _norm_choice(
                 cfg.get("categoricalImputation"),
@@ -1196,6 +1246,7 @@ class PreprocessingConfig:
     def defaults_dict(self) -> dict[str, str]:
         return {
             "numericImputation": self.defaults.numeric_imputation,
+            "numericPowerTransform": self.defaults.numeric_power_transform,
             "numericScaling": self.defaults.numeric_scaling,
             "categoricalImputation": self.defaults.categorical_imputation,
             "categoricalEncoding": self.defaults.categorical_encoding,

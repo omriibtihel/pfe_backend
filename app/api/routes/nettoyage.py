@@ -55,6 +55,33 @@ def df_preview_payload(df: pd.DataFrame, page: int, page_size: int):
 # Columns meta
 # -----------------------------
 
+def _numeric_extra_stats(non_null: pd.Series) -> dict:
+    """Return skewness, IQR-based outlier stats, and has_negative for a numeric series.
+
+    Returns a dict with nullable values so non-numeric columns can pass None.
+    Requires at least 4 non-null values to produce meaningful results.
+    """
+    from scipy.stats import skew as _skew  # lazy import
+
+    data = non_null.to_numpy(dtype=float)
+    if len(data) < 4:
+        return {"skewness": None, "outlier_count": None, "outlier_ratio": None, "has_negative": None}
+
+    skewness = float(_skew(data))
+    q1, q3 = float(np.percentile(data, 25)), float(np.percentile(data, 75))
+    iqr = q3 - q1
+    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    outlier_count = int(((data < lower) | (data > upper)).sum())
+    outlier_ratio = float(outlier_count / len(data))
+    has_negative = bool(float(data.min()) <= 0)
+
+    return {
+        "skewness": skewness,
+        "outlier_count": outlier_count,
+        "outlier_ratio": outlier_ratio,
+        "has_negative": has_negative,
+    }
+
 
 def _columns_meta_payload(df: pd.DataFrame):
     cols = [str(c) for c in df.columns]
@@ -88,6 +115,12 @@ def _columns_meta_payload(df: pd.DataFrame):
         except Exception:
             sample_vals = []
 
+        extra = (
+            _numeric_extra_stats(non_null)
+            if pd.api.types.is_numeric_dtype(s2)
+            else {"skewness": None, "outlier_count": None, "outlier_ratio": None, "has_negative": None}
+        )
+
         out_cols.append(
             {
                 "name": c,
@@ -99,6 +132,7 @@ def _columns_meta_payload(df: pd.DataFrame):
                 "unique": unique,
                 "total": total_rows,
                 "sample": sample_vals,
+                **extra,
             }
         )
 

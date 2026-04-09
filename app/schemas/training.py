@@ -23,6 +23,7 @@ NumericImputationMethod = Literal["none", "median", "mean", "most_frequent", "co
 CategoricalImputationMethod = Literal["none", "most_frequent", "constant"]
 CategoricalEncodingMethod = Literal["none", "onehot", "label", "ordinal"]
 NumericScalingMethod = Literal["none", "standard", "minmax", "robust", "maxabs"]
+NumericPowerTransformMethod = Literal["none", "yeo_johnson", "box_cox"]
 ColumnType = Literal["numeric", "categorical", "ordinal"]
 ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance"]
 
@@ -293,5 +294,9 @@ class TrainingRecommendationOut(BaseModel):
     recommended_split: Dict[str, int]
     reasoning: Dict[str, str]
     training_config_payload: Dict[str, Any]
+    recommended_power_transform: str = "none"
+    recommended_scaling: str = "none"
+    recommended_preprocessing: Dict[str, Any] = Field(default_factory=dict)
+    recommended_column_configs: Dict[str, Dict[str, str]] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)
     profile: DatasetProfileOut
