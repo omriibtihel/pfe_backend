@@ -8,8 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import SessionLocal
-from app.models.user import User
-from app.models.user import User, UserRole  # adapte si ton enum s'appelle différemment
+from app.models.user import User, UserRole
 from app.models.project import Project
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")

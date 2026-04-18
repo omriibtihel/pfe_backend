@@ -349,6 +349,33 @@ def _adapt_resampler_for_cv(
     return _clone_resampler_with_smote_k(resampler, safe_k), safe_k
 
 
+def _warn_if_all_nan_scores(search: Any, search_type: str, model_type: str) -> bool:
+    """Return True and log a structured warning when every CV candidate scored NaN.
+
+    This happens when *all* estimators in the search raised an exception that was
+    silently converted to NaN by ``error_score=np.nan``.  In that case
+    ``best_score_`` is NaN and the selected ``best_estimator_`` is effectively
+    arbitrary — a dangerous silent failure.
+    """
+    test_scores = search.cv_results_.get("mean_test_score", np.array([]))
+    if len(test_scores) == 0:
+        return False
+    if np.all(np.isnan(test_scores)):
+        log_event(
+            "training.search.all_nan_scores",
+            model_type=model_type,
+            search_type=search_type,
+            n_candidates=len(test_scores),
+            message=(
+                "All CV candidates scored NaN — every estimator raised an exception "
+                "(captured by error_score=np.nan). The selected best_estimator_ is "
+                "unreliable. Check data shape, hyperparameter ranges, or resampler compatibility."
+            ),
+        )
+        return True
+    return False
+
+
 def _extract_search_artifacts(
     search: Any,
     *,
@@ -358,6 +385,7 @@ def _extract_search_artifacts(
     param_grid: Dict[str, Any],
     n_candidates: int,
     fit_sample_weight: Any,
+    all_nan: bool = False,
 ) -> Dict[str, Any]:
     """Extract tuning artifacts from a fitted search estimator.
 
@@ -383,6 +411,7 @@ def _extract_search_artifacts(
         "n_candidates": n_candidates,
         "cv_results_summary": _summarize_cv_results(search.cv_results_),
         "sample_weight_used": bool(fit_sample_weight is not None),
+        "all_nan_scores": all_nan,
     }
 
 
@@ -618,6 +647,7 @@ class Trainer:
                     verbose=0,
                 )
                 hs.fit(X_train, y_train, **fit_params)
+                _hs_all_nan = _warn_if_all_nan_scores(hs, "halving_random", model_type)
 
                 return TrainerFitResult(
                     fitted_pipeline=hs.best_estimator_,
@@ -629,6 +659,7 @@ class Trainer:
                         param_grid={},
                         n_candidates=int(sum(hs.n_candidates_)),
                         fit_sample_weight=fit_sample_weight,
+                        all_nan=_hs_all_nan,
                     ),
                 )
 
@@ -682,6 +713,7 @@ class Trainer:
                 verbose=0,
             )
             rs.fit(X_train, y_train, **fit_params)
+            _rs_all_nan = _warn_if_all_nan_scores(rs, "random", model_type)
 
             return TrainerFitResult(
                 fitted_pipeline=rs.best_estimator_,
@@ -693,6 +725,7 @@ class Trainer:
                     param_grid={},
                     n_candidates=n_iter,
                     fit_sample_weight=fit_sample_weight,
+                    all_nan=_rs_all_nan,
                 ),
             )
 
@@ -764,6 +797,7 @@ class Trainer:
             verbose=0,
         )
         gs.fit(X_train, y_train, **fit_params)
+        _gs_all_nan = _warn_if_all_nan_scores(gs, "grid", model_type)
 
         return TrainerFitResult(
             fitted_pipeline=gs.best_estimator_,
@@ -775,5 +809,6 @@ class Trainer:
                 param_grid=dict(model_grid),
                 n_candidates=int(len(gs.cv_results_.get("params", []))),
                 fit_sample_weight=fit_sample_weight,
+                all_nan=_gs_all_nan,
             ),
         )

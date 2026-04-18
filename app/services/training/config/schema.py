@@ -1,10 +1,61 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
 from app.services.training.pipeline.models import MODEL_REGISTRY, list_available_models
+
+# ---------------------------------------------------------------------------
+# Feature Engineering config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FeatureDef:
+    """Single engineered-feature definition (mirrors FeatureDefIn Pydantic schema)."""
+    name: str
+    expression: str
+    enabled: bool = True
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "expression": self.expression,
+            "enabled": self.enabled,
+        }
+
+
+@dataclass(frozen=True)
+class FeatureEngineeringConfig:
+    features: tuple[FeatureDef, ...] = field(default_factory=tuple)
+
+    @staticmethod
+    def from_front(payload: dict[str, Any] | None) -> "FeatureEngineeringConfig":
+        if not payload:
+            return FeatureEngineeringConfig()
+        raw_features = payload.get("features") or []
+        defs: list[FeatureDef] = []
+        for item in raw_features:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            expr = str(item.get("expression", "")).strip()
+            if not name or not expr:
+                continue
+            defs.append(FeatureDef(
+                name=name,
+                expression=expr,
+                enabled=bool(item.get("enabled", True)),
+            ))
+        return FeatureEngineeringConfig(features=tuple(defs))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"features": [f.as_dict() for f in self.features]}
+
+    def is_empty(self) -> bool:
+        return not any(f.enabled for f in self.features)
 
 TaskType = Literal["classification", "regression"]
 SplitMethod = Literal[
@@ -25,7 +76,7 @@ BalancingStrategy = Literal[
     "random_undersampling",
     "threshold_optimization",
 ]
-ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance", "youden"]
+ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "maximize_f_beta", "min_recall", "precision_recall_balance", "youden", "minimize_cost"]
 
 NUMERIC_IMPUTATION_METHODS = ["none", "median", "mean", "most_frequent", "constant", "knn"]
 CATEGORICAL_IMPUTATION_METHODS = ["none", "most_frequent", "constant"]
@@ -76,7 +127,7 @@ BALANCING_STRATEGIES = [
     "random_undersampling",
     "threshold_optimization",
 ]
-THRESHOLD_STRATEGIES = ["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance", "youden"]
+THRESHOLD_STRATEGIES = ["maximize_f1", "maximize_f2", "maximize_f_beta", "min_recall", "precision_recall_balance", "youden", "minimize_cost"]
 
 # Canonical frontend contract for Step3.
 PREPROCESSING_CAPABILITIES = {
@@ -430,6 +481,85 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "help": "Features considered at each split. null = all features (default). 'sqrt'/'log2' reduce overfitting.",
         },
     },
+    "mlp": {
+        "hidden_layer_sizes": {
+            "type": "enum",
+            "enum": ["100", "100,50", "50,50,50", "200", "200,100", "64,32", "128,64,32"],
+            "default": "100",
+            "grid_values": ["100", "100,50", "50,50,50", "200", "200,100"],
+            "help": "Architecture du réseau : neurones par couche cachée, séparés par des virgules. Ex: '100,50' = 2 couches (100 puis 50 neurones).",
+        },
+        "activation": {
+            "type": "enum",
+            "enum": ["relu", "tanh", "logistic"],
+            "default": "relu",
+            "help": "Fonction d'activation des neurones cachés. relu est recommandé en général.",
+        },
+        "alpha": {
+            "type": "float",
+            "default": 0.0001,
+            "gt": 0.0,
+            "grid_values": [0.0001, 0.001, 0.01, 0.1],
+            "help": "Régularisation L2 — réduit le surapprentissage. Augmenter si le modèle overfite.",
+        },
+        "learning_rate_init": {
+            "type": "float",
+            "default": 0.001,
+            "gt": 0.0,
+            "grid_values": [0.0001, 0.001, 0.01],
+            "help": "Taux d'apprentissage initial (solver=adam). Trop élevé → instabilité ; trop bas → convergence lente.",
+        },
+        "max_iter": {
+            "type": "int",
+            "default": 500,
+            "min": 50,
+            "max": 5000,
+            "grid_values": [200, 500, 1000],
+            "help": "Nombre maximal d'itérations d'optimisation.",
+        },
+    },
+    "elasticnet": {
+        "alpha": {
+            "type": "float",
+            "default": 1.0,
+            "gt": 0.0,
+            "grid_values": [0.001, 0.01, 0.1, 1.0, 10.0],
+            "help": "Force globale de régularisation. Augmenter pour réduire l'overfitting et la variance.",
+        },
+        "l1_ratio": {
+            "type": "float",
+            "default": 0.5,
+            "ge": 0.0,
+            "le": 1.0,
+            "grid_values": [0.1, 0.3, 0.5, 0.7, 0.9],
+            "help": "Mélange L1/L2 : 0 = Ridge pur (L2), 1 = Lasso pur (L1), 0.5 = mélange égal.",
+        },
+        "max_iter": {
+            "type": "int",
+            "default": 2000,
+            "min": 100,
+            "max": 20000,
+            "grid_values": [500, 1000, 2000],
+            "help": "Nombre maximal d'itérations pour la descente de coordonnées.",
+        },
+    },
+    "lasso": {
+        "alpha": {
+            "type": "float",
+            "default": 1.0,
+            "gt": 0.0,
+            "grid_values": [0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
+            "help": "Force de régularisation L1 — favorise la sélection de variables (coefficients mis à zéro).",
+        },
+        "max_iter": {
+            "type": "int",
+            "default": 2000,
+            "min": 100,
+            "max": 20000,
+            "grid_values": [500, 1000, 2000],
+            "help": "Nombre maximal d'itérations pour la descente de coordonnées.",
+        },
+    },
     "catboost": {
         "iterations": {
             "type": "int",
@@ -663,6 +793,8 @@ def _coerce_scalar_with_schema(field_name: str, raw_value: Any, schema: dict[str
         raise ValueError("not an int")
 
     def _check_bounds(v: float | int) -> str | None:
+        if not math.isfinite(float(v)):
+            return f"{field_name} must be a finite number"
         min_value = schema.get("min")
         max_value = schema.get("max")
         gt_value = schema.get("gt")
@@ -1262,6 +1394,9 @@ class BalancingConfig:
     apply_threshold: bool = False
     threshold_strategy: ThresholdStrategy = "maximize_f1"
     min_recall_constraint: float | None = None
+    f_beta: float = 2.0
+    cost_fn: float = 1.0
+    cost_fp: float = 1.0
 
     @staticmethod
     def from_front(raw: Any, *, legacy_use_smote: bool = False) -> "BalancingConfig":
@@ -1288,11 +1423,21 @@ class BalancingConfig:
         if min_recall_constraint is not None and not (0.0 < min_recall_constraint < 1.0):
             min_recall_constraint = None
 
+        f_beta_raw = _to_optional_float(data.get("f_beta", data.get("fBeta")))
+        f_beta = max(0.1, min(10.0, float(f_beta_raw))) if f_beta_raw is not None else 2.0
+        cost_fn_raw = _to_optional_float(data.get("cost_fn", data.get("costFn")))
+        cost_fn = max(0.0, min(100.0, float(cost_fn_raw))) if cost_fn_raw is not None else 1.0
+        cost_fp_raw = _to_optional_float(data.get("cost_fp", data.get("costFp")))
+        cost_fp = max(0.0, min(100.0, float(cost_fp_raw))) if cost_fp_raw is not None else 1.0
+
         return BalancingConfig(
             strategy=strategy,  # type: ignore[arg-type]
             apply_threshold=apply_threshold,
             threshold_strategy=threshold_strategy,  # type: ignore[arg-type]
             min_recall_constraint=min_recall_constraint,
+            f_beta=f_beta,
+            cost_fn=cost_fn,
+            cost_fp=cost_fp,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -1301,6 +1446,9 @@ class BalancingConfig:
             "apply_threshold": bool(self.apply_threshold),
             "threshold_strategy": str(self.threshold_strategy),
             "min_recall_constraint": self.min_recall_constraint,
+            "f_beta": self.f_beta,
+            "cost_fn": self.cost_fn,
+            "cost_fp": self.cost_fp,
         }
 
 
@@ -1345,6 +1493,7 @@ class TrainingConfig:
     inner_cv_folds: int = 3            # folds for inner GridSearch in nested CV
     n_repeats: int = 3                 # only used when split_method == "repeated_stratified_kfold"
     group_column: str | None = None    # only used when split_method in ("group_kfold", "stratified_group_kfold")
+    feature_engineering: FeatureEngineeringConfig = field(default_factory=FeatureEngineeringConfig)
 
     @staticmethod
     def from_front(payload: dict[str, Any]) -> "TrainingConfig":
@@ -1393,7 +1542,7 @@ class TrainingConfig:
             search_type=_parse_search_type(payload),
             use_grid_search=_parse_search_type(payload) != "none",
             n_iter_random_search=int(payload.get("nIterRandomSearch", 40) or 40),
-            inner_cv_folds=int(payload.get("innerCvFolds", 3) or 3),
+            inner_cv_folds=int(payload.get("gridCvFolds") or payload.get("innerCvFolds", 3) or 3),
             use_smote=use_smote,
             shuffle=_to_bool(payload.get("shuffle"), default=True),
             balancing=balancing_cfg,
@@ -1406,6 +1555,9 @@ class TrainingConfig:
             custom_code=str(payload.get("customCode", "") or ""),
             n_repeats=int(payload.get("nRepeats", 3) or 3),
             group_column=str(payload.get("groupColumn", "") or "").strip() or None,
+            feature_engineering=FeatureEngineeringConfig.from_front(
+                payload.get("featureEngineering")
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -1435,4 +1587,5 @@ class TrainingConfig:
             "customCode": self.custom_code,
             "nRepeats": self.n_repeats,
             "groupColumn": self.group_column,
+            "featureEngineering": self.feature_engineering.as_dict(),
         }

@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 # Map our metric names to FLAML metric names
 _FLAML_METRIC_MAP: dict[str, str] = {
     "roc_auc": "roc_auc",
+    "roc_auc_ovr": "roc_auc_ovr",   # multiclass One-vs-Rest
+    "roc_auc_ovo": "roc_auc_ovo",   # multiclass One-vs-One
     "f1": "f1",
     "accuracy": "accuracy",
     "pr_auc": "ap",           # FLAML uses "ap" for average precision
@@ -35,7 +37,7 @@ _FLAML_METRIC_MAP: dict[str, str] = {
 }
 
 _AUTO_METRIC: dict[str, str] = {
-    "classification": "roc_auc",
+    "classification": "roc_auc",      # binary — overridden at runtime for multiclass
     "regression": "rmse",
 }
 
@@ -69,6 +71,21 @@ def _build_automl_preprocessor(
         X_train = X_train.copy()
         X_train = X_train.astype({col: "object" for col in str_cols})
     X_train.columns = X_train.columns.astype(object)
+
+    # Coerce object columns that are actually numeric (e.g. "1.5" stored as str).
+    # infer_columns would classify them as categorical — leading to OrdinalEncoder
+    # on numeric data and a degraded preprocessed feature space.
+    obj_cols = X_train.select_dtypes(include="object").columns.tolist()
+    if obj_cols:
+        coercible = []
+        for col in obj_cols:
+            sample = X_train[col].dropna()
+            if len(sample) > 0 and pd.to_numeric(sample, errors="coerce").notna().mean() >= 0.9:
+                coercible.append(col)
+        if coercible:
+            X_train = X_train.copy() if not str_cols else X_train
+            for col in coercible:
+                X_train[col] = pd.to_numeric(X_train[col], errors="coerce")
 
     numeric_cols, categorical_cols = infer_columns(X_train)
 
@@ -181,7 +198,6 @@ class AutoMLPipeline:
 class _MedicalPrepResult:
     """All parameters produced by the medical pre-fit optimizations."""
     X_train: pd.DataFrame
-    feature_pairs: List[Tuple[str, str, str]]
     sample_weight: Optional[np.ndarray]
     effective_budget: int
     eval_method: str
@@ -189,7 +205,23 @@ class _MedicalPrepResult:
     flaml_metric: str
     custom_hp: Dict[str, Any]
     imbalance_applied: bool
-    features_added: int
+
+
+def _adaptive_budget(requested: int, n_samples: int, n_features: int) -> int:
+    """
+    Reduce the time budget for small datasets — no point spending 60s
+    exploring HP on 50 rows.  Never exceeds the user-requested budget.
+    """
+    complexity = n_samples * n_features
+    if complexity < 1_000:
+        cap = 20
+    elif complexity < 5_000:
+        cap = 45
+    elif complexity < 20_000:
+        cap = 90
+    else:
+        return requested
+    return min(requested, cap)
 
 
 def _prepare_medical_automl(
@@ -202,6 +234,7 @@ def _prepare_medical_automl(
     """
     Apply generic pre-fit optimizations before automl.fit():
 
+      0. Adaptive budget — scaled to dataset complexity (never exceeds requested).
       1. Sample-weight balancing — inverse-frequency weights for imbalanced classes.
       2. CV 5-fold forced — more robust HP search than 3-fold.
       3. Wider HP search space — more exploration freedom for FLAML.
@@ -212,6 +245,14 @@ def _prepare_medical_automl(
     from flaml import tune  # lazy import so flaml is optional at module load
 
     X = X_train.copy()
+
+    # ── Opt 0 : Adaptive budget ────────────────────────────────────────────────
+    effective_budget = _adaptive_budget(cfg.time_budget, n_samples, X_train.shape[1])
+    if effective_budget < cfg.time_budget:
+        logger.info(
+            "MedAutoML Opt0: dataset complexity %d×%d → budget capped %ds (requested %ds)",
+            n_samples, X_train.shape[1], effective_budget, cfg.time_budget,
+        )
 
     # ── Opt 1 : Sample-weight balancing ───────────────────────────────────────
     sample_weight: Optional[np.ndarray] = None
@@ -226,7 +267,6 @@ def _prepare_medical_automl(
                 logger.info("MedAutoML Opt1: IR=%.2f → sample_weight balanced", ir)
 
     # ── Opt 2 : CV 5-fold forced ──────────────────────────────────────────────
-    effective_budget = cfg.time_budget
     eval_method = "cv"
     n_splits = 5   # 5-fold: better generalization estimate than 3-fold
     logger.info("MedAutoML Opt2: budget=%ds, eval=cv/5-fold", effective_budget)
@@ -256,19 +296,15 @@ def _prepare_medical_automl(
         },
     }
 
-    feature_pairs: List[Tuple[str, str, str]] = []
-
     return _MedicalPrepResult(
         X_train=X,
-        feature_pairs=feature_pairs,
         sample_weight=sample_weight,
         effective_budget=effective_budget,
         eval_method=eval_method,
         n_splits=n_splits,
-        flaml_metric=flaml_metric,   # keep requested/auto metric — no F1 switch
+        flaml_metric=flaml_metric,
         custom_hp=custom_hp,
         imbalance_applied=imbalance_applied,
-        features_added=0,
     )
 
 
@@ -277,10 +313,12 @@ def _find_optimal_threshold(
     X: Any,
     y: np.ndarray,
     positive_label: Any = None,
+    beta: float = 1.0,
 ) -> float:
     """
-    Post-fit: find the probability threshold that maximises F1
+    Post-fit: find the probability threshold that maximises F-beta
     on the holdout test set via the Precision-Recall curve.
+    beta=1.0 → F1 (default, symmetric). beta>1 → recall-heavy (sensitivity favoured).
     Only meaningful for binary classification.
     Returns a value in [0.01, 0.99] or 0.5 as fallback.
     """
@@ -307,9 +345,12 @@ def _find_optimal_threshold(
         if len(thresholds) == 0:
             return 0.5
 
-        denom = precisions[:-1] + recalls[:-1]
-        f1_scores = np.where(denom > 0, 2 * precisions[:-1] * recalls[:-1] / denom, 0.0)
-        optimal = float(thresholds[int(np.argmax(f1_scores))])
+        b2 = float(beta) ** 2
+        p = precisions[:-1]
+        r = recalls[:-1]
+        denom = (b2 * p) + r
+        f_scores = np.where(denom > 0, (1.0 + b2) * p * r / denom, 0.0)
+        optimal = float(thresholds[int(np.argmax(f_scores))])
         return max(0.01, min(0.99, optimal))
     except Exception:
         return 0.5
@@ -401,40 +442,55 @@ def run_automl(
         X_test_arr = preprocessor.transform(X_test)
         X_test_prep = pd.DataFrame(X_test_arr, columns=pd.Index(prep_names, dtype=object), index=X_test.index)
 
-    # Keep a pre-SMOTE copy for unbiased train-set evaluation
-    X_train_prep_for_eval = X_train_prep.copy()
-    y_train_for_eval = y_train.copy()
-
     # ── 4. SMOTE oversampling (binary classification, severe imbalance only) ─
+    # Check eligibility BEFORE copying — only copy if SMOTE will actually run.
     smote_applied = False
+    _smote_eligible = False
+    _ir_sm = 1.0
+    _k_nn = 0
     if cfg.task_type == "classification":
         classes_sm, counts_sm = np.unique(y_train, return_counts=True)
         if len(classes_sm) == 2 and counts_sm.min() > 0:
-            ir_sm = float(counts_sm.max()) / float(counts_sm.min())
-            k_nn = min(5, int(counts_sm.min()) - 1)
-            if ir_sm > 2.0 and k_nn >= 1 and X_train_prep.shape[0] >= 12:
-                try:
-                    from imblearn.over_sampling import SMOTE
-                    smote = SMOTE(k_neighbors=k_nn, random_state=42)
-                    X_train_resampled, y_train_resampled = smote.fit_resample(
-                        X_train_prep.values, y_train
-                    )
-                    X_train_prep = pd.DataFrame(X_train_resampled, columns=pd.Index(prep_names, dtype=object))
-                    y_train = y_train_resampled
-                    smote_applied = True
-                    logger.info(
-                        "MedAutoML: SMOTE applied (IR=%.2f), train size %d → %d",
-                        ir_sm, len(y_train_for_eval), len(y_train),
-                    )
-                except Exception as exc:
-                    logger.warning("MedAutoML: SMOTE failed, continuing without: %s", exc)
+            _ir_sm = float(counts_sm.max()) / float(counts_sm.min())
+            _k_nn = min(5, int(counts_sm.min()) - 1)
+            _smote_eligible = _ir_sm > 2.0 and _k_nn >= 1 and X_train_prep.shape[0] >= 12
+
+    # Only allocate the pre-SMOTE evaluation copy when SMOTE will actually run.
+    if _smote_eligible:
+        X_train_prep_for_eval = X_train_prep.copy()
+        y_train_for_eval = y_train.copy()
+        try:
+            from imblearn.over_sampling import SMOTE
+            smote = SMOTE(k_neighbors=_k_nn, random_state=42)
+            X_train_resampled, y_train_resampled = smote.fit_resample(
+                X_train_prep.values, y_train
+            )
+            X_train_prep = pd.DataFrame(X_train_resampled, columns=pd.Index(prep_names, dtype=object))
+            y_train = y_train_resampled
+            smote_applied = True
+            logger.info(
+                "MedAutoML: SMOTE applied (IR=%.2f), train size %d → %d",
+                _ir_sm, len(y_train_for_eval), len(y_train),
+            )
+        except Exception as exc:
+            logger.warning("MedAutoML: SMOTE failed, continuing without: %s", exc)
+    else:
+        # No copy needed — SMOTE won't modify these arrays.
+        X_train_prep_for_eval = X_train_prep
+        y_train_for_eval = y_train
 
     # ── 5. Map metric ─────────────────────────────────────────────────────────
     requested_metric = cfg.metric
     if requested_metric:
         flaml_metric = _FLAML_METRIC_MAP.get(requested_metric, requested_metric)
+    elif cfg.task_type == "classification":
+        # "roc_auc" is binary-only in FLAML — multiclass requires "roc_auc_ovr".
+        n_classes = int(np.unique(y_train).size)
+        flaml_metric = "roc_auc" if n_classes == 2 else "roc_auc_ovr"
+        if n_classes > 2:
+            logger.info("AutoML: multiclass detected (%d classes) → metric set to roc_auc_ovr", n_classes)
     else:
-        flaml_metric = _AUTO_METRIC.get(cfg.task_type, "roc_auc")
+        flaml_metric = _AUTO_METRIC.get(cfg.task_type, "rmse")
 
     # ── 6. Medical pre-fit optimizations (sample weights, CV folds, HP bounds) ─
     med = _prepare_medical_automl(X_train_prep, y_train, cfg, flaml_metric, n_samples)
@@ -451,7 +507,7 @@ def run_automl(
                     progress_cb(pct, f"AutoML : {int(elapsed)}s / {cfg.time_budget}s")
                 except Exception:
                     pass
-            _stop.wait(timeout=3.0)
+            _stop.wait(timeout=1.0)
 
     prog_thread = threading.Thread(target=_progress_worker, daemon=True)
     prog_thread.start()
@@ -459,6 +515,10 @@ def run_automl(
     # ── 8. Run FLAML on preprocessed data ─────────────────────────────────────
     log_fd, log_path = tempfile.mkstemp(suffix=".log")
     os.close(log_fd)
+
+    # Stacking/ensemble requires multiple fitted estimators and a non-trivial budget.
+    # Disable it on small datasets or very short budgets to avoid silent FLAML errors.
+    use_ensemble = n_samples >= 200 and med.effective_budget >= 30
 
     automl = AutoML()
     try:
@@ -471,7 +531,7 @@ def run_automl(
             eval_method=med.eval_method,    # "cv"
             n_splits=med.n_splits,          # 5-fold
             n_jobs=-1,
-            ensemble=True,
+            ensemble=use_ensemble,
             early_stop=True,
             custom_hp=med.custom_hp,
             verbose=0,
@@ -504,7 +564,9 @@ def run_automl(
     if cfg.task_type == "classification":
         if has_test and X_test_prep is not None:
             optimal_threshold = _find_optimal_threshold(
-                automl, X_test_prep, y_test, positive_label=cfg.positive_label
+                automl, X_test_prep, y_test,
+                positive_label=cfg.positive_label,
+                beta=float(getattr(cfg, "f_beta", 1.0)),
             )
         threshold_optimized = optimal_threshold != 0.5
         if threshold_optimized:
@@ -627,8 +689,6 @@ def run_automl(
     except Exception:
         pass
 
-    _original_trained = automl._trained_estimator
-
     for est_name, est_config in per_estimator_configs.items():
         if est_name == best_estimator_name:
             continue
@@ -638,18 +698,15 @@ def run_automl(
                 logger.debug("AutoML: no trained model for %s, skipping", est_name)
                 continue
 
-            automl._trained_estimator = est_learner
-            try:
-                est_eval_test = (
-                    evaluator.evaluate(automl, X_test_prep, y_test, threshold=0.5)
-                    if has_test and X_test_prep is not None
-                    else evaluator.evaluate(automl, X_train_prep_for_eval, y_train_for_eval, threshold=0.5)
-                )
-                est_eval_train = evaluator.evaluate(
-                    automl, X_train_prep_for_eval, y_train_for_eval, threshold=0.5
-                )
-            finally:
-                automl._trained_estimator = _original_trained
+            # Evaluate the learner directly — no need to mutate automl's internal state.
+            est_eval_test = (
+                evaluator.evaluate(est_learner, X_test_prep, y_test, threshold=0.5)
+                if has_test and X_test_prep is not None
+                else evaluator.evaluate(est_learner, X_train_prep_for_eval, y_train_for_eval, threshold=0.5)
+            )
+            est_eval_train = evaluator.evaluate(
+                est_learner, X_train_prep_for_eval, y_train_for_eval, threshold=0.5
+            )
 
             est_loss = per_estimator_losses.get(est_name)
 
@@ -701,7 +758,6 @@ def run_automl(
             logger.info("AutoML per-estimator result added: %s", est_name)
         except Exception as exc:
             logger.warning("AutoML per-estimator result for %s failed: %s", est_name, exc)
-            automl._trained_estimator = _original_trained
 
     return all_results
 

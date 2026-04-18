@@ -18,6 +18,9 @@ class BalancingDecision:
     optimal_threshold: float
     random_state: int = 42
     min_recall_constraint: float | None = None
+    f_beta: float = 2.0
+    cost_fn: float = 1.0
+    cost_fp: float = 1.0
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -53,6 +56,9 @@ def resolve(
     requested_strategy = str(config.strategy or "none").strip().lower()
     threshold_strategy = str(config.threshold_strategy or "maximize_f1").strip().lower()
     min_recall_constraint = config.min_recall_constraint
+    f_beta = float(getattr(config, "f_beta", 2.0))
+    cost_fn = float(getattr(config, "cost_fn", 1.0))
+    cost_fp = float(getattr(config, "cost_fp", 1.0))
     apply_threshold = bool(config.apply_threshold) or requested_strategy == "threshold_optimization"
     refit_metric = (
         "average_precision"
@@ -82,6 +88,9 @@ def resolve(
             optimal_threshold=0.5,
             random_state=random_state,
             min_recall_constraint=min_recall_constraint,
+            f_beta=f_beta,
+            cost_fn=cost_fn,
+            cost_fp=cost_fp,
         )
 
     strategy = requested_strategy
@@ -175,4 +184,7 @@ def resolve(
         optimal_threshold=0.5,
         random_state=random_state,
         min_recall_constraint=min_recall_constraint,
+        f_beta=f_beta,
+        cost_fn=cost_fn,
+        cost_fp=cost_fp,
     )

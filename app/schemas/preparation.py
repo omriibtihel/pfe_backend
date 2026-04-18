@@ -4,6 +4,39 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature Engineering preview schemas
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FeaturePreviewDef(BaseModel):
+    name: str = Field(..., min_length=1)
+    expression: str = Field(..., min_length=1)
+    enabled: bool = True
+
+
+class FeatureEngineeringPreviewIn(BaseModel):
+    version_id: int
+    target_column: str
+    features: List[FeaturePreviewDef]
+    n_rows: int = Field(default=10, ge=1, le=50)
+
+
+class FeaturePreviewResult(BaseModel):
+    name: str
+    expression: str
+    preview_values: List[Any]
+    error: Optional[str] = None
+
+
+class FeatureEngineeringColumnsOut(BaseModel):
+    columns: List[str]
+    n_rows: int
+
+class FeatureEngineeringPreviewOut(BaseModel):
+    available_columns: List[str]
+    results: List[FeaturePreviewResult]
+
 # Types needed by preparation schemas (defined here to avoid circular imports)
 ImpactLevel = Literal["low", "medium", "high"]
 ImbalanceLevel = Literal["balanced", "mild", "moderate", "severe", "critical"]

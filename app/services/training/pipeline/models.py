@@ -10,7 +10,8 @@ from sklearn.ensemble import (
     ExtraTreesClassifier, ExtraTreesRegressor,
     GradientBoostingClassifier, GradientBoostingRegressor,
 )
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import ElasticNet, Lasso, LogisticRegression, Ridge
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.svm import SVC, SVR
@@ -33,6 +34,43 @@ try:
 except Exception:
     CatBoostClassifier = None
     CatBoostRegressor = None
+
+
+# ---------------------------------------------------------------------------
+# MLP wrapper — accepts hidden_layer_sizes as a string like "100,50" so that
+# GridSearchCV can pass string values via set_params without sklearn iterating
+# over individual characters.  The conversion to tuple happens in fit().
+# ---------------------------------------------------------------------------
+
+def _parse_hidden_layer_sizes(hls: Any) -> tuple:
+    if isinstance(hls, tuple):
+        return hls
+    if isinstance(hls, (int, float)) and not isinstance(hls, bool):
+        return (int(hls),)
+    if isinstance(hls, str):
+        parts = [p.strip() for p in hls.split(",") if p.strip()]
+        try:
+            parsed = tuple(int(p) for p in parts)
+        except ValueError:
+            return (100,)
+        return parsed if parsed else (100,)
+    return (100,)
+
+
+class _StrLayersMLP:
+    """Mixin: converts hidden_layer_sizes string → tuple before sklearn's fit."""
+
+    def fit(self, X: Any, y: Any, **kw: Any) -> Any:
+        self.hidden_layer_sizes = _parse_hidden_layer_sizes(self.hidden_layer_sizes)
+        return super().fit(X, y, **kw)  # type: ignore[misc]
+
+
+class _MLPClassifier(_StrLayersMLP, MLPClassifier):  # type: ignore[misc]
+    pass
+
+
+class _MLPRegressor(_StrLayersMLP, MLPRegressor):  # type: ignore[misc]
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +181,24 @@ def _naivebayes_factory(task_type: str, params: Dict[str, Any]) -> Any:
     if task_type != "classification":
         raise RuntimeError("naivebayes is classification-only")
     return GaussianNB(**params)
+
+
+def _mlp_factory(task_type: str, params: Dict[str, Any]) -> Any:
+    if task_type == "classification":
+        return _MLPClassifier(**params)
+    return _MLPRegressor(**params)
+
+
+def _elasticnet_factory(task_type: str, params: Dict[str, Any]) -> Any:
+    if task_type != "regression":
+        raise RuntimeError("elasticnet is regression-only")
+    return ElasticNet(**params)
+
+
+def _lasso_factory(task_type: str, params: Dict[str, Any]) -> Any:
+    if task_type != "regression":
+        raise RuntimeError("lasso is regression-only")
+    return Lasso(**params)
 
 
 def _xgb_factory(task_type: str, params: Dict[str, Any]) -> Any:
@@ -897,6 +953,132 @@ class ModelRegistry:
                 estimator_factory=_ridge_factory,
             )
         )
+        # ---------------------------------------------------------------
+        # MLP — Multi-Layer Perceptron (classification + regression)
+        # hidden_layer_sizes stored as string "100,50"; converted in fit().
+        # ---------------------------------------------------------------
+        self._register(
+            ModelSpec(
+                name="mlp",
+                aliases=("neural_network", "nn"),
+                supports_classification=True,
+                supports_regression=True,
+                supports_class_weight=False,
+                supports_predict_proba=True,
+                supports_sample_weight=False,
+                default_params={
+                    "classification": {
+                        "hidden_layer_sizes": "100",
+                        "activation": "relu",
+                        "alpha": 0.0001,
+                        "learning_rate_init": 0.001,
+                        "max_iter": 500,
+                        "random_state": 42,
+                    },
+                    "regression": {
+                        "hidden_layer_sizes": "100",
+                        "activation": "relu",
+                        "alpha": 0.0001,
+                        "learning_rate_init": 0.001,
+                        "max_iter": 500,
+                        "random_state": 42,
+                    },
+                },
+                param_grid={
+                    "classification": {
+                        "hidden_layer_sizes": ["100", "100,50"],
+                        "alpha": [0.0001, 0.001, 0.01],
+                        "activation": ["relu", "tanh"],
+                    },
+                    "regression": {
+                        "hidden_layer_sizes": ["100", "100,50"],
+                        "alpha": [0.0001, 0.001, 0.01],
+                        "activation": ["relu", "tanh"],
+                    },
+                },
+                param_distributions={
+                    "classification": {
+                        "hidden_layer_sizes": ["100", "100,50", "50,50,50", "200", "200,100", "64,32"],
+                        "alpha": loguniform(1e-5, 1e-1),
+                        "activation": ["relu", "tanh"],
+                        "learning_rate_init": loguniform(1e-4, 1e-1),
+                    },
+                    "regression": {
+                        "hidden_layer_sizes": ["100", "100,50", "50,50,50", "200", "200,100", "64,32"],
+                        "alpha": loguniform(1e-5, 1e-1),
+                        "activation": ["relu", "tanh"],
+                        "learning_rate_init": loguniform(1e-4, 1e-1),
+                    },
+                },
+                estimator_factory=_mlp_factory,
+            )
+        )
+        # ---------------------------------------------------------------
+        # ElasticNet (regression only)
+        # ---------------------------------------------------------------
+        self._register(
+            ModelSpec(
+                name="elasticnet",
+                aliases=("elastic_net", "en"),
+                supports_classification=False,
+                supports_regression=True,
+                supports_class_weight=False,
+                supports_predict_proba=False,
+                supports_sample_weight=True,
+                default_params={
+                    "regression": {
+                        "alpha": 1.0,
+                        "l1_ratio": 0.5,
+                        "max_iter": 2000,
+                    },
+                },
+                param_grid={
+                    "regression": {
+                        "alpha": [0.001, 0.01, 0.1, 1.0, 10.0],
+                        "l1_ratio": [0.1, 0.5, 0.9],
+                    },
+                },
+                param_distributions={
+                    "regression": {
+                        "alpha": loguniform(1e-4, 100),
+                        "l1_ratio": uniform(0.0, 1.0),
+                    },
+                },
+                estimator_factory=_elasticnet_factory,
+            )
+        )
+        # ---------------------------------------------------------------
+        # Lasso (regression only)
+        # ---------------------------------------------------------------
+        self._register(
+            ModelSpec(
+                name="lasso",
+                aliases=(),
+                supports_classification=False,
+                supports_regression=True,
+                supports_class_weight=False,
+                supports_predict_proba=False,
+                supports_sample_weight=True,
+                default_params={
+                    "regression": {
+                        "alpha": 1.0,
+                        "max_iter": 2000,
+                    },
+                },
+                param_grid={
+                    "regression": {
+                        "alpha": [0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
+                    },
+                },
+                param_distributions={
+                    "regression": {
+                        "alpha": loguniform(1e-4, 100),
+                        "max_iter": [1000, 2000, 5000],
+                    },
+                },
+                estimator_factory=_lasso_factory,
+            )
+        )
 
     def normalize_name(self, model_type: str) -> str:
         key = str(model_type or "").strip().lower()
@@ -1160,6 +1342,50 @@ _ADAPTIVE_GRIDS: Dict[str, Dict[str, Dict[str, Dict[str, list]]]] = {
             "large":  {"alpha": [0.1, 1.0, 10.0, 100.0]},
         },
     },
+    # MLP: architecture search uniquement sur medium/large — trop coûteux sur petits datasets
+    "mlp": {
+        "classification": {
+            # micro: seule la régularisation — architecture fixe (trop peu de données)
+            "micro":  {"alpha": [0.01, 0.1, 1.0]},
+            # tiny: régularisation + activation — pas d'architecture
+            "tiny":   {"alpha": [0.001, 0.01, 0.1], "activation": ["relu", "tanh"]},
+            # small: idem tiny (peu de données, architecture search = overfitting)
+            "small":  {"alpha": [0.0001, 0.001, 0.01], "activation": ["relu", "tanh"]},
+            # medium: on peut explorer l'architecture (2×2×2=8 combos)
+            "medium": {"hidden_layer_sizes": ["100", "100,50"], "alpha": [0.0001, 0.001, 0.01], "activation": ["relu", "tanh"]},
+            # large: architecture + régularisation seulement — pas d'activation search (coût)
+            "large":  {"hidden_layer_sizes": ["100", "100,50"], "alpha": [0.0001, 0.001]},
+        },
+        "regression": {
+            "micro":  {"alpha": [0.01, 0.1, 1.0]},
+            "tiny":   {"alpha": [0.001, 0.01, 0.1], "activation": ["relu", "tanh"]},
+            "small":  {"alpha": [0.0001, 0.001, 0.01], "activation": ["relu", "tanh"]},
+            "medium": {"hidden_layer_sizes": ["100", "100,50"], "alpha": [0.0001, 0.001, 0.01], "activation": ["relu", "tanh"]},
+            "large":  {"hidden_layer_sizes": ["100", "100,50"], "alpha": [0.0001, 0.001]},
+        },
+    },
+    "elasticnet": {
+        "regression": {
+            # alpha fort + mix L1/L2 équilibré sur très peu de données
+            "micro":  {"alpha": [0.1, 1.0, 10.0], "l1_ratio": [0.1, 0.5, 0.9]},
+            "tiny":   {"alpha": [0.01, 0.1, 1.0, 10.0], "l1_ratio": [0.1, 0.5, 0.9]},
+            # 5×3=15
+            "small":  {"alpha": [0.001, 0.01, 0.1, 1.0, 10.0], "l1_ratio": [0.15, 0.5, 0.85]},
+            # 5×5=25
+            "medium": {"alpha": [0.001, 0.01, 0.1, 1.0, 10.0], "l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9]},
+            "large":  {"alpha": [0.01, 0.1, 1.0, 10.0], "l1_ratio": [0.1, 0.5, 0.9]},
+        },
+    },
+    "lasso": {
+        "regression": {
+            # alpha fort indispensable sur peu de données (L1 = sélection de variables)
+            "micro":  {"alpha": [0.1, 1.0, 10.0, 100.0]},
+            "tiny":   {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
+            "small":  {"alpha": [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]},
+            "medium": {"alpha": [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]},
+            "large":  {"alpha": [0.001, 0.01, 0.1, 1.0, 10.0]},
+        },
+    },
 }
 
 # Models that support class_weight — used to inject it in grids for imbalanced data
@@ -1330,6 +1556,10 @@ def list_available_models() -> list[Dict[str, Any]]:
         "ridge": "Ridge Regression",
         "extratrees": "Extra Trees",
         "gradientboosting": "Gradient Boosting",
+        "catboost": "CatBoost",
+        "mlp": "MLP (Réseau de Neurones)",
+        "elasticnet": "ElasticNet",
+        "lasso": "Lasso",
     }
 
     out: list[Dict[str, Any]] = []

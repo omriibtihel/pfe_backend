@@ -27,6 +27,10 @@ from app.services.training.pipeline.learning_curves import _select_scoring
 
 
 _MAX_FEATURES = 30
+# Cap the test set fed into permutation importance so that on large datasets the
+# computation does not dominate total training time.  2 000 samples gives a
+# statistically robust importance estimate while bounding runtime to O(seconds).
+_MAX_IMPORTANCE_SAMPLES = 2_000
 
 
 def compute_permutation_importance(
@@ -73,6 +77,13 @@ def compute_permutation_importance(
     if len(y_arr) < 20:
         return None
 
+    # Cap test set size to bound computation time on large datasets.
+    if len(y_arr) > _MAX_IMPORTANCE_SAMPLES:
+        rng = np.random.RandomState(random_state)
+        idx = rng.choice(len(y_arr), size=_MAX_IMPORTANCE_SAMPLES, replace=False)
+        X_arr = X_arr.iloc[idx] if isinstance(X_arr, pd.DataFrame) else X_arr[idx]
+        y_arr = y_arr[idx]
+
     names = feature_names if feature_names is not None else list(X_test_raw.columns)
     scoring = _select_scoring(task_type, y_arr)
 
@@ -84,7 +95,7 @@ def compute_permutation_importance(
             n_repeats=n_repeats,
             scoring=scoring,
             random_state=random_state,
-            n_jobs=1,
+            n_jobs=-1,
         )
     except Exception:
         return None

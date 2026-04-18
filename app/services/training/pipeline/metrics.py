@@ -10,6 +10,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     brier_score_loss,
     confusion_matrix,
+    fbeta_score,
     matthews_corrcoef,
     mean_absolute_error,
     mean_squared_error,
@@ -184,10 +185,12 @@ def _safe_average_block(
             average=average,
             zero_division=0,
         )
+        f2 = float(fbeta_score(y_true, y_pred, beta=2.0, average=average, zero_division=0))
         return {
             "precision": float(precision),
             "recall": float(recall),
             "f1": float(f1),
+            "f2": f2,
             "support": None,
         }
     except Exception:
@@ -610,11 +613,13 @@ def compute_classification_metrics(
                 pos_label=pos_label,
                 zero_division=0,
             )
+            f2_pos = float(fbeta_score(y_true_arr, y_pred_arr, beta=2.0, pos_label=pos_label, average="binary", zero_division=0))
             binary_block = {
                 "positive_label": _to_json_label(pos_label),
                 "precision_pos": float(precision_pos),
                 "recall_pos": float(recall_pos),
                 "f1_pos": float(f1_pos),
+                "f2_pos": f2_pos,
             }
         except Exception as exc:
             warnings.append(f"Binary positive-class metrics unavailable: {exc}")
@@ -623,6 +628,7 @@ def compute_classification_metrics(
                 "precision_pos": None,
                 "recall_pos": None,
                 "f1_pos": None,
+                "f2_pos": None,
             }
     else:
         pos_label = None

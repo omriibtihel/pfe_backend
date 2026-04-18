@@ -20,6 +20,10 @@ from app.schemas.preparation import (
     BalanceAnalysisResponse,
     DatasetProfileIn,
     DatasetProfileOut,
+    FeatureEngineeringColumnsOut,
+    FeatureEngineeringPreviewIn,
+    FeatureEngineeringPreviewOut,
+    FeaturePreviewResult,
     FeatureTypesOut,
 )
 from app.schemas.training import TrainingConfigIn, TrainingValidateOut
@@ -31,6 +35,11 @@ from app.services.data.profiler import DatasetProfiler
 from app.services.data.preview import PreviewValidationError, build_validation_preview
 from app.services.training.utils import to_python_scalar
 from app.services.training.config.validation import validate_training_config_payload
+from app.services.preparation_ml.feature_engineering.transformer import (
+    _eval_expression,
+    _validate_ast,
+    validate_feature_defs,
+)
 
 _profiler = DatasetProfiler()
 
@@ -240,4 +249,100 @@ def profile_dataset(
         avg_skewness=prof.avg_skewness,
         highly_skewed_count=prof.highly_skewed_count,
         column_distribution=prof.column_distribution,
+    )
+
+
+@router.get("/feature-engineering/columns", response_model=FeatureEngineeringColumnsOut)
+def get_feature_columns(
+    project_id: int,
+    version_id: int,
+    target_column: str = "",
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Return the list of feature columns available for expression authoring.
+    The target column is excluded so users don't accidentally reference it.
+    """
+    ensure_project_owner(db, project_id, current_user.id)
+    try:
+        df = load_version_df(db, project_id, version_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    columns = [c for c in df.columns if c != target_column]
+    return FeatureEngineeringColumnsOut(columns=columns, n_rows=len(df))
+
+
+@router.post("/feature-engineering/preview", response_model=FeatureEngineeringPreviewOut)
+def preview_feature_engineering(
+    project_id: int,
+    payload: FeatureEngineeringPreviewIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Evaluate feature engineering expressions on a small sample of the dataset.
+    Returns a preview of computed values (or an error message) for each feature.
+    """
+    ensure_project_owner(db, project_id, current_user.id)
+
+    try:
+        df = load_version_df(db, project_id, payload.version_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Drop the target column from the feature namespace to avoid accidental leakage.
+    feature_cols = [c for c in df.columns if c != payload.target_column]
+    available_columns = feature_cols
+
+    # Take a small sample for preview.
+    n_rows = min(payload.n_rows, len(df))
+    df_sample = df[feature_cols].head(n_rows).copy()
+
+    results: list[FeaturePreviewResult] = []
+    # Accumulate computed FE columns so later features can reference earlier ones.
+    df_running = df_sample.copy()
+
+    for feat in payload.features:
+        if not feat.enabled:
+            continue
+
+        name = feat.name.strip()
+        expr = feat.expression.strip()
+
+        if not name or not expr:
+            results.append(FeaturePreviewResult(
+                name=name or "(unnamed)",
+                expression=expr,
+                preview_values=[],
+                error="Name or expression is empty.",
+            ))
+            continue
+
+        try:
+            tree = _validate_ast(expr)
+            series = _eval_expression(expr, df_running, tree=tree)
+            # Add to running df so subsequent features can depend on this one.
+            df_running[name] = series
+            preview_values = [
+                None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
+                for v in series.tolist()
+            ]
+            results.append(FeaturePreviewResult(
+                name=name,
+                expression=expr,
+                preview_values=preview_values,
+            ))
+        except Exception as exc:
+            results.append(FeaturePreviewResult(
+                name=name,
+                expression=expr,
+                preview_values=[],
+                error=str(exc),
+            ))
+
+    return FeatureEngineeringPreviewOut(
+        available_columns=available_columns,
+        results=results,
     )

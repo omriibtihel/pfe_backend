@@ -15,6 +15,7 @@ class AutoMLConfig:
     metric: Optional[str] = None  # None = auto-select per task type
     test_ratio: float = 0.2
     positive_label: Optional[str] = None
+    f_beta: float = 1.0   # F-beta for threshold optimisation (1.0=F1, 2.0=F2/recall-heavy)
 
     @classmethod
     def from_front(cls, payload: dict) -> "AutoMLConfig":
@@ -30,4 +31,5 @@ class AutoMLConfig:
             metric=raw_metric,
             test_ratio=float(payload.get("testRatio", 0.2)),
             positive_label=payload.get("positiveLabel") or None,
+            f_beta=float(payload.get("fBeta", payload.get("f_beta", 1.0))),
         )

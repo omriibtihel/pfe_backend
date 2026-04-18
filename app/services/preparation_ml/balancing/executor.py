@@ -134,7 +134,9 @@ class BalancingExecutor:
                     if decision.min_recall_constraint is not None
                     else 0.70
                 ),
-                beta=2.0,
+                beta=float(getattr(decision, "f_beta", 2.0)),
+                cost_fn=float(getattr(decision, "cost_fn", 1.0)),
+                cost_fp=float(getattr(decision, "cost_fp", 1.0)),
                 classes=model_classes,
             )
             # Revert to 0.5 if the optimized threshold brings no improvement or degrades F1.

@@ -22,7 +22,9 @@ from app.services.preparation_ml.balancing import (
     profile_binary_dataset,
     resolve,
 )
-from app.services.training.config.schema import TrainingConfig, normalize_model_hyperparams
+from app.services.training.config.schema import (
+    TrainingConfig, PreprocessingConfig, PreprocessingDefaults, normalize_model_hyperparams,
+)
 from app.services.training.pipeline.confidence import compute_bootstrap_cis
 from app.services.training.pipeline.evaluator import Evaluator
 from app.services.training.pipeline.importance import compute_permutation_importance
@@ -32,6 +34,8 @@ from app.services.training.pipeline.residuals import compute_residuals
 from app.services.training.pipeline.models import build_model, get_model_capabilities
 from app.services.shap import compute_global_shap
 from app.services.preparation_ml.preprocessing.preprocessing import build_preprocessor
+from app.services.preparation_ml.feature_engineering import FeatureEngineeringTransformer
+from app.services.preparation_ml.feature_engineering.transformer import validate_feature_defs
 from app.services.training.output.reporter import Reporter, build_training_schema
 from app.services.preparation_ml.splitters import (
     make_holdout_split,
@@ -45,8 +49,51 @@ from sklearn.model_selection import GridSearchCV as _GridSearchCV
 from app.services.preparation_ml.preprocessing.transformers import ColumnAligner
 
 logger = logging.getLogger(__name__)
-_DENSE_REQUIRED_MODELS = {"naivebayes"}
+_DENSE_REQUIRED_MODELS = {"naivebayes", "mlp"}
 _RESAMPLE_STRATEGIES = {"smote", "smote_tomek", "random_undersampling"}
+# Models that require feature scaling to converge.  When the user selects
+# "none" for numeric scaling we silently upgrade to "standard" and log a
+# warning rather than letting the model produce nonsensical results (e.g.
+# MLP with R² = -12 on unscaled data).
+_SCALING_SENSITIVE_MODELS = {"mlp", "svm", "knn", "logisticregression", "logreg"}
+
+
+def _ensure_scaling_for_model(
+    model_type: str,
+    preprocessing: "PreprocessingConfig",
+) -> "PreprocessingConfig":
+    """Return a (possibly patched) PreprocessingConfig that guarantees scaling
+    for models that cannot converge without it (MLP, SVM, KNN, logistic regression).
+
+    When the user explicitly set ``numericScaling="none"`` we silently upgrade
+    to ``"standard"``.  The original config is never mutated (frozen dataclass).
+    A structured log event is emitted so the audit trail shows the override.
+    """
+    if model_type not in _SCALING_SENSITIVE_MODELS:
+        return preprocessing
+    current_scaling = preprocessing.defaults.numeric_scaling
+    if current_scaling != "none":
+        return preprocessing  # already has a scaler — nothing to do
+
+    _log_event(
+        "training.preprocessing.scaling_override",
+        model_type=model_type,
+        original="none",
+        override="standard",
+        reason=(
+            f"{model_type} requires feature scaling to converge. "
+            "numericScaling automatically upgraded from 'none' to 'standard'."
+        ),
+    )
+    new_defaults = PreprocessingDefaults(
+        numeric_imputation=preprocessing.defaults.numeric_imputation,
+        categorical_imputation=preprocessing.defaults.categorical_imputation,
+        categorical_encoding=preprocessing.defaults.categorical_encoding,
+        numeric_scaling="standard",
+        numeric_power_transform=preprocessing.defaults.numeric_power_transform,
+    )
+    import dataclasses as _dc
+    return _dc.replace(preprocessing, defaults=new_defaults)
 
 
 def _build_resampler_for_gs(decision: Any) -> Any:
@@ -124,8 +171,12 @@ def _build_inference_pipeline(
     model: Any,
     model_type: str,
     feature_selector: Any = None,
+    fe_transformer: Any = None,
 ) -> Pipeline:
-    steps = [("align", aligner), ("prep", preprocessor)]
+    steps: list[tuple[str, Any]] = [("align", aligner)]
+    if fe_transformer is not None and not fe_transformer.is_noop():
+        steps.append(("fe", fe_transformer))
+    steps.append(("prep", preprocessor))
     if feature_selector is not None:
         steps.append(("select", feature_selector))
     if model_type in _DENSE_REQUIRED_MODELS:
@@ -277,7 +328,30 @@ def _aggregate_cv_metrics(fold_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 reason="metric was None/NaN in some folds (e.g. single-class validation fold)",
             )
 
-    return {"mean": mean, "std": std, "min": mn, "max": mx, "n_folds_ok": n_ok, "n_folds_per_metric": n_folds_per_metric}
+    instability_warnings: list[str] = []
+    for k, s in std.items():
+        if s > 0.15 and mean.get(k, 0.0) > 0.0:
+            instability_warnings.append(
+                f"High CV variance on '{k}': std={s:.3f} (mean={mean[k]:.3f}). "
+                "Results may be unreliable — consider more data or a simpler model."
+            )
+            _log_event(
+                "training.cv.high_variance",
+                metric=k,
+                mean=mean[k],
+                std=s,
+                n_folds_ok=n_ok,
+            )
+
+    return {
+        "mean": mean,
+        "std": std,
+        "min": mn,
+        "max": mx,
+        "n_folds_ok": n_ok,
+        "n_folds_per_metric": n_folds_per_metric,
+        "instability_warnings": instability_warnings,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -371,7 +445,11 @@ def _run_holdout(
     if split.X_train is None or len(split.X_train) == 0:
         raise RuntimeError("Preprocessing requires a valid split with a non-empty train set.")
 
-    spec = build_preprocessor(split.X_train, cfg.preprocessing)
+    effective_preprocessing = _ensure_scaling_for_model(model_type_norm, cfg.preprocessing)
+    fe_defs = [f.as_dict() for f in cfg.feature_engineering.features]
+    fe_validation_errors = validate_feature_defs(fe_defs, list(split.X_train.columns))
+    if fe_validation_errors:
+        raise RuntimeError("Feature engineering config errors:\n" + "\n".join(fe_validation_errors))
     requested_hyperparams_raw = cfg.model_hyperparams.get(model_type_norm, {})
     if not isinstance(requested_hyperparams_raw, dict):
         requested_hyperparams_raw = {}
@@ -384,15 +462,16 @@ def _run_holdout(
     hp_errors = [str(msg) for msg in (hp_normalized.get("errors") or []) if str(msg).strip()]
     if hp_errors:
         raise RuntimeError(f"Invalid hyperparameters for '{model_type_norm}': {' | '.join(hp_errors)}")
-    for hp_warning in hp_normalized.get("warnings", []) or []:
-        _log_event("training.hyperparams.warning", model_type=model_type_norm, message=str(hp_warning))
+    hp_warnings: list[str] = [str(w) for w in (hp_normalized.get("warnings") or []) if str(w).strip()]
+    for hp_warning in hp_warnings:
+        _log_event("training.hyperparams.warning", model_type=model_type_norm, message=hp_warning)
 
     estimator_hyperparams = dict(hp_normalized.get("estimator_params") or {})
     param_grid = dict(hp_normalized.get("param_grid") or {})
     training_schema = build_training_schema(
         X=split.X_train,
         target=cfg.target_column,
-        preprocessing_config=cfg.preprocessing.as_dict(),
+        preprocessing_config=effective_preprocessing.as_dict(),
     )
     aligner = ColumnAligner(
         feature_names=training_schema["feature_names"],
@@ -401,7 +480,11 @@ def _run_holdout(
 
     # Fit preprocessing on train split once (train-only policy), then execute balancing on transformed train data.
     X_train_aligned = aligner.fit_transform(split.X_train)
-    X_train_prepared = spec.preprocessor.fit_transform(X_train_aligned, np.asarray(split.y_train))
+    # Feature engineering: fit stats on train only (anti-leakage), add new columns before preprocessor.
+    fe_transformer = FeatureEngineeringTransformer(fe_defs)
+    X_train_fe = fe_transformer.fit_transform(X_train_aligned)
+    spec = build_preprocessor(X_train_fe, effective_preprocessing)
+    X_train_prepared = spec.preprocessor.fit_transform(X_train_fe, np.asarray(split.y_train))
 
     # Fit VarianceThreshold on prepared train data, then apply to remove zero-variance features.
     if spec.feature_selector is not None:
@@ -500,7 +583,16 @@ def _run_holdout(
 
     fit_sample_weight = fit_params.get("sample_weight")
     if fit_sample_weight is not None:
-        fit_sample_weight = np.asarray(fit_sample_weight)
+        _sw_caps = get_model_capabilities(model_type_norm)
+        if not _sw_caps.get("supports_sample_weight", True):
+            _log_event(
+                "training.balancing.sample_weight_skipped",
+                model_type=model_type_norm,
+                reason="model does not support sample_weight — weight ignored to avoid TypeError",
+            )
+            fit_sample_weight = None
+        else:
+            fit_sample_weight = np.asarray(fit_sample_weight)
 
     # imbalanced=True only when the dataset is skewed AND no balancing mechanism
     # already handles it.  This flag controls whether class_weight is injected
@@ -538,6 +630,7 @@ def _run_holdout(
     fitted_pipe = _build_inference_pipeline(
         aligner, spec.preprocessor, fitted_model, model_type_norm,
         feature_selector=spec.feature_selector,
+        fe_transformer=fe_transformer,
     )
     if debug_mode and cfg.task_type == "classification":
         _log_event(
@@ -782,6 +875,8 @@ def _run_holdout(
         "threshold_source": threshold_source,
         "confidence_intervals": bootstrap_cis,
     }
+    if hp_warnings:
+        metrics_json["warnings"] = list(hp_warnings)
     if val_metrics is not None:
         metrics_json["val"] = val_metrics
 
@@ -886,6 +981,11 @@ def _run_kfold_cv(
     X_all = df2.drop(columns=drop_cols)
     y_all = np.asarray(df2[cfg.target_column].values)
 
+    fe_defs = [f.as_dict() for f in cfg.feature_engineering.features]
+    fe_validation_errors = validate_feature_defs(fe_defs, list(X_all.columns))
+    if fe_validation_errors:
+        raise RuntimeError("Feature engineering config errors:\n" + "\n".join(fe_validation_errors))
+
     resolved_positive_label, positive_label_warning = _resolve_positive_label_for_run(
         y_all, cfg.positive_label
     )
@@ -964,12 +1064,14 @@ def _run_kfold_cv(
     hp_errors = [str(m) for m in (hp_normalized_no_gs.get("errors") or []) if str(m).strip()]
     if hp_errors:
         raise RuntimeError(f"Invalid hyperparameters for '{model_type_norm}': {' | '.join(hp_errors)}")
-    for hp_warn in hp_normalized_no_gs.get("warnings", []) or []:
-        _log_event("training.hyperparams.warning", model_type=model_type_norm, message=str(hp_warn))
+    hp_warnings: list[str] = [str(w) for w in (hp_normalized_no_gs.get("warnings") or []) if str(w).strip()]
+    for hp_warn in hp_warnings:
+        _log_event("training.hyperparams.warning", model_type=model_type_norm, message=hp_warn)
 
     base_estimator_hp = dict(hp_normalized_no_gs.get("estimator_params") or {})
     capabilities = get_model_capabilities(model_type_norm)
     shuffle = bool(getattr(cfg, "shuffle", True))
+    effective_preprocessing = _ensure_scaling_for_model(model_type_norm, cfg.preprocessing)
 
     # ── Nested CV: param_grid for inner GridSearch ────────────────────────────
     # When use_grid_search=True and the model has a param_grid, each outer fold
@@ -1052,21 +1154,22 @@ def _run_kfold_cv(
             fold_schema = build_training_schema(
                 X=X_train_fold,
                 target=cfg.target_column,
-                preprocessing_config=cfg.preprocessing.as_dict(),
+                preprocessing_config=effective_preprocessing.as_dict(),
             )
             fold_aligner = ColumnAligner(
                 feature_names=fold_schema["feature_names"],
                 dtypes=fold_schema["dtypes"],
             )
-            fold_spec = build_preprocessor(X_train_fold, cfg.preprocessing)
-
             X_train_aligned = fold_aligner.fit_transform(X_train_fold)
-            X_train_prep = fold_spec.preprocessor.fit_transform(
-                X_train_aligned, y_train_fold
-            )
+            # Feature engineering: fit stats on train_fold only (anti-leakage)
+            fold_fe = FeatureEngineeringTransformer(fe_defs)
+            X_train_fe = fold_fe.fit_transform(X_train_aligned)
+            fold_spec = build_preprocessor(X_train_fe, effective_preprocessing)
+            X_train_prep = fold_spec.preprocessor.fit_transform(X_train_fe, y_train_fold)
             # ② Transform val_fold with the train-fitted preprocessor (no leakage)
             X_val_aligned = fold_aligner.transform(X_val_fold)
-            X_val_prep = fold_spec.preprocessor.transform(X_val_aligned)
+            X_val_fe = fold_fe.transform(X_val_aligned)
+            X_val_prep = fold_spec.preprocessor.transform(X_val_fe)
 
             # ② b) Fit VarianceThreshold on train_fold ONLY, then apply to both (no leakage)
             if fold_spec.feature_selector is not None:
@@ -1236,16 +1339,18 @@ def _run_kfold_cv(
     final_training_schema = build_training_schema(
         X=X_refit,
         target=cfg.target_column,
-        preprocessing_config=cfg.preprocessing.as_dict(),
+        preprocessing_config=effective_preprocessing.as_dict(),
     )
     final_aligner = ColumnAligner(
         feature_names=final_training_schema["feature_names"],
         dtypes=final_training_schema["dtypes"],
     )
-    final_spec = build_preprocessor(X_refit, cfg.preprocessing)
-
     X_refit_aligned = final_aligner.fit_transform(X_refit)
-    X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_aligned, y_refit)
+    # Feature engineering: fit on full refit data (anti-leakage: test set transforms via pipeline)
+    final_fe = FeatureEngineeringTransformer(fe_defs)
+    X_refit_fe = final_fe.fit_transform(X_refit_aligned)
+    final_spec = build_preprocessor(X_refit_fe, effective_preprocessing)
+    X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_fe, y_refit)
 
     # Fit VarianceThreshold on refit data, then apply (anti-leakage: test set transforms later via pipeline)
     if final_spec.feature_selector is not None:
@@ -1330,6 +1435,7 @@ def _run_kfold_cv(
     fitted_pipe = _build_inference_pipeline(
         final_aligner, final_spec.preprocessor, final_fitted_model, model_type_norm,
         feature_selector=final_spec.feature_selector,
+        fe_transformer=final_fe,
     )
 
     # Threshold + audit — calibrated on X_refit (never on test set)
@@ -1453,6 +1559,10 @@ def _run_kfold_cv(
     }
     if has_holdout_test and holdout_test_metrics is not None:
         metrics_json["holdout_test_metrics"] = holdout_test_metrics
+    cv_instability = cv_summary.get("instability_warnings", [])
+    all_warnings: list[str] = list(hp_warnings) + list(cv_instability)
+    if all_warnings:
+        metrics_json["warnings"] = all_warnings
 
     return ModelRunResult(
         model_type=model_type_norm,
@@ -1518,6 +1628,11 @@ def _run_loo(
     X_all = df2.drop(columns=[cfg.target_column])
     y_all = np.asarray(df2[cfg.target_column].values)
 
+    fe_defs = [f.as_dict() for f in cfg.feature_engineering.features]
+    fe_validation_errors = validate_feature_defs(fe_defs, list(X_all.columns))
+    if fe_validation_errors:
+        raise RuntimeError("Feature engineering config errors:\n" + "\n".join(fe_validation_errors))
+
     resolved_positive_label, positive_label_warning = _resolve_positive_label_for_run(
         y_all, cfg.positive_label
     )
@@ -1537,9 +1652,13 @@ def _run_loo(
     hp_errors = [str(m) for m in (hp_normalized_no_gs.get("errors") or []) if str(m).strip()]
     if hp_errors:
         raise RuntimeError(f"Invalid hyperparameters for '{model_type_norm}': {' | '.join(hp_errors)}")
+    hp_warnings: list[str] = [str(w) for w in (hp_normalized_no_gs.get("warnings") or []) if str(w).strip()]
+    for hp_warn in hp_warnings:
+        _log_event("training.hyperparams.warning", model_type=model_type_norm, message=hp_warn)
 
     base_estimator_hp = dict(hp_normalized_no_gs.get("estimator_params") or {})
     capabilities = get_model_capabilities(model_type_norm)
+    effective_preprocessing = _ensure_scaling_for_model(model_type_norm, cfg.preprocessing)
 
     # ── LOO prediction collection ─────────────────────────────────────────────
     y_true_loo: list[Any] = []
@@ -1567,18 +1686,21 @@ def _run_loo(
             fold_schema = build_training_schema(
                 X=X_train_fold,
                 target=cfg.target_column,
-                preprocessing_config=cfg.preprocessing.as_dict(),
+                preprocessing_config=effective_preprocessing.as_dict(),
             )
             fold_aligner = ColumnAligner(
                 feature_names=fold_schema["feature_names"],
                 dtypes=fold_schema["dtypes"],
             )
-            fold_spec = build_preprocessor(X_train_fold, cfg.preprocessing)
-
             X_train_aligned = fold_aligner.fit_transform(X_train_fold)
-            X_train_prep = fold_spec.preprocessor.fit_transform(X_train_aligned, y_train_fold)
+            # Feature engineering: fit stats on train_fold only (anti-leakage)
+            fold_fe = FeatureEngineeringTransformer(fe_defs)
+            X_train_fe = fold_fe.fit_transform(X_train_aligned)
+            fold_spec = build_preprocessor(X_train_fe, effective_preprocessing)
+            X_train_prep = fold_spec.preprocessor.fit_transform(X_train_fe, y_train_fold)
             X_val_aligned = fold_aligner.transform(X_val_fold)
-            X_val_prep = fold_spec.preprocessor.transform(X_val_aligned)
+            X_val_fe = fold_fe.transform(X_val_aligned)
+            X_val_prep = fold_spec.preprocessor.transform(X_val_fe)
 
             if fold_spec.feature_selector is not None:
                 _vt_n_before = X_train_prep.shape[1] if hasattr(X_train_prep, "shape") else 0
@@ -1673,13 +1795,13 @@ def _run_loo(
         # Fit a quick dummy model on all data to extract class labels
         _dummy_schema = build_training_schema(
             X=X_all, target=cfg.target_column,
-            preprocessing_config=cfg.preprocessing.as_dict(),
+            preprocessing_config=effective_preprocessing.as_dict(),
         )
         _dummy_aligner = ColumnAligner(
             feature_names=_dummy_schema["feature_names"],
             dtypes=_dummy_schema["dtypes"],
         )
-        _dummy_spec = build_preprocessor(X_all, cfg.preprocessing)
+        _dummy_spec = build_preprocessor(X_all, effective_preprocessing)
         _X_prep = _dummy_spec.preprocessor.fit_transform(
             _dummy_aligner.fit_transform(X_all), y_all
         )
@@ -1734,15 +1856,17 @@ def _run_loo(
 
     final_training_schema = build_training_schema(
         X=X_all, target=cfg.target_column,
-        preprocessing_config=cfg.preprocessing.as_dict(),
+        preprocessing_config=effective_preprocessing.as_dict(),
     )
     final_aligner = ColumnAligner(
         feature_names=final_training_schema["feature_names"],
         dtypes=final_training_schema["dtypes"],
     )
-    final_spec = build_preprocessor(X_all, cfg.preprocessing)
     X_refit_aligned = final_aligner.fit_transform(X_all)
-    X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_aligned, y_all)
+    final_fe = FeatureEngineeringTransformer(fe_defs)
+    X_refit_fe = final_fe.fit_transform(X_refit_aligned)
+    final_spec = build_preprocessor(X_refit_fe, effective_preprocessing)
+    X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_fe, y_all)
     if final_spec.feature_selector is not None:
         _vt_n_before = X_refit_prep.shape[1] if hasattr(X_refit_prep, "shape") else 0
         final_spec.feature_selector.fit(X_refit_prep)
@@ -1812,6 +1936,7 @@ def _run_loo(
     fitted_pipe = _build_inference_pipeline(
         final_aligner, final_spec.preprocessor, final_fitted_model, model_type_norm,
         feature_selector=final_spec.feature_selector,
+        fe_transformer=final_fe,
     )
 
     optimal_threshold = 0.5
@@ -1880,6 +2005,10 @@ def _run_loo(
         "training_time_sec": float(time.perf_counter() - t0),
         "threshold_used": optimal_threshold,
     }
+    loo_instability = cv_summary.get("instability_warnings", [])
+    loo_all_warnings: list[str] = list(hp_warnings) + list(loo_instability)
+    if loo_all_warnings:
+        metrics_json["warnings"] = loo_all_warnings
 
     return ModelRunResult(
         model_type=model_type_norm,

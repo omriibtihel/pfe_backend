@@ -25,7 +25,7 @@ CategoricalEncodingMethod = Literal["none", "onehot", "label", "ordinal"]
 NumericScalingMethod = Literal["none", "standard", "minmax", "robust", "maxabs"]
 NumericPowerTransformMethod = Literal["none", "yeo_johnson", "box_cox"]
 ColumnType = Literal["numeric", "categorical", "ordinal"]
-ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "min_recall", "precision_recall_balance"]
+ThresholdStrategy = Literal["maximize_f1", "maximize_f2", "maximize_f_beta", "min_recall", "precision_recall_balance", "youden", "minimize_cost"]
 
 # Preparation-related types re-imported from preparation schemas
 from app.schemas.preparation import (  # noqa: E402
@@ -59,6 +59,9 @@ ModelType = Literal[
     "gb",
     "gbm",
     "ridge",
+    "mlp",
+    "elasticnet",
+    "lasso",
 ]
 MetricType = Literal[
     "accuracy",
@@ -121,6 +124,17 @@ class PreprocessingConfigIn(BaseModel):
     normalization: Dict[str, Any] = Field(default_factory=dict)
 
 
+class FeatureDefIn(BaseModel):
+    """Single user-defined feature to be created before preprocessing."""
+    name: str = Field(..., min_length=1)
+    expression: str = Field(..., min_length=1)
+    enabled: bool = True
+
+
+class FeatureEngineeringConfigIn(BaseModel):
+    features: List[FeatureDefIn] = Field(default_factory=list)
+
+
 class BalancingConfigIn(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -128,6 +142,9 @@ class BalancingConfigIn(BaseModel):
     apply_threshold: bool = False
     threshold_strategy: ThresholdStrategy = "maximize_f1"
     min_recall_constraint: float | None = None
+    f_beta: float = Field(default=2.0, ge=0.1, le=10.0)
+    cost_fn: float = Field(default=1.0, ge=0.0, le=100.0)
+    cost_fp: float = Field(default=1.0, ge=0.0, le=100.0)
 
     @field_validator("min_recall_constraint")
     @classmethod
@@ -180,6 +197,8 @@ class TrainingConfigIn(BaseModel):
     modelHyperparams: Dict[str, Any] = Field(default_factory=dict)
     include: Optional[TrainingValidateIncludeIn] = None
     preview: Optional[TrainingValidatePreviewIn] = None
+
+    featureEngineering: FeatureEngineeringConfigIn = Field(default_factory=FeatureEngineeringConfigIn)
 
     # Stored but never executed server side.
     customCode: str = ""

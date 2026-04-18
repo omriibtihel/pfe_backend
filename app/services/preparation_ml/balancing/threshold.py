@@ -26,6 +26,21 @@ def _f_beta(precision: np.ndarray, recall: np.ndarray, beta: float) -> np.ndarra
     return out
 
 
+def _cost_weighted_threshold(
+    precisions: np.ndarray,
+    recalls: np.ndarray,
+    cost_fn: float,
+    cost_fp: float,
+) -> np.ndarray:
+    """
+    Coût normalisé par seuil = cost_fp*(1-precision) + cost_fn*(1-recall).
+
+    Un coût_fn élevé (FN coûteux) → seuil bas → sensibilité favorisée.
+    Un coût_fp élevé (FP coûteux) → seuil haut → spécificité favorisée.
+    """
+    return cost_fp * (1.0 - precisions) + cost_fn * (1.0 - recalls)
+
+
 def _as_binary_minority(y_true: np.ndarray) -> np.ndarray:
     values, counts = np.unique(y_true, return_counts=True)
     if len(values) != 2:
@@ -42,6 +57,8 @@ class ThresholdOptimizer:
         strategy: str,
         min_recall: float = 0.70,
         beta: float = 2.0,
+        cost_fn: float = 1.0,
+        cost_fp: float = 1.0,
         classes: np.ndarray | None = None,
     ) -> ThresholdResult:
         y_arr = np.asarray(y_true).reshape(-1)
@@ -113,6 +130,14 @@ class ThresholdOptimizer:
         if strategy_norm == "maximize_f2":
             selected_idx = int(np.nanargmax(f2_scores))
             strategy_used = "maximize_f2"
+        elif strategy_norm == "maximize_f_beta":
+            fb_scores = _f_beta(precision, recall, beta=float(beta))
+            selected_idx = int(np.nanargmax(fb_scores))
+            strategy_used = "maximize_f_beta"
+        elif strategy_norm == "minimize_cost":
+            cost_scores = _cost_weighted_threshold(precision, recall, cost_fn=float(cost_fn), cost_fp=float(cost_fp))
+            selected_idx = int(np.nanargmin(cost_scores))
+            strategy_used = "minimize_cost"
         elif strategy_norm == "min_recall":
             target_recall = float(min_recall)
             if not (0.0 < target_recall < 1.0):
