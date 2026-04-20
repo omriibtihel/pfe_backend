@@ -21,3 +21,7 @@ env/
 # App generated files (ton cas)
 storage/
 *.sqlite3
+
+models/*.pth
+*.pth
+

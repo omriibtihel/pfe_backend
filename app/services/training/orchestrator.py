@@ -29,7 +29,11 @@ from app.services.training.pipeline.confidence import compute_bootstrap_cis
 from app.services.training.pipeline.evaluator import Evaluator
 from app.services.training.pipeline.importance import compute_permutation_importance
 from app.services.training.pipeline.learning_curves import compute_learning_curve
-from app.services.training.pipeline.metrics import get_class_labels, get_proba_or_score
+from app.services.training.pipeline.metrics import (
+    _is_zero_one_label_set,
+    get_class_labels,
+    get_proba_or_score,
+)
 from app.services.training.pipeline.residuals import compute_residuals
 from app.services.training.pipeline.models import build_model, get_model_capabilities
 from app.services.shap import compute_global_shap
@@ -44,7 +48,8 @@ from app.services.preparation_ml.splitters import (
     iter_group_kfold_splits,
     iter_loo_splits,
 )
-from app.services.training.pipeline.trainer import Trainer, _build_cv_splitter, _choose_refit_metric
+from app.services.training.pipeline.trainer import Trainer
+from app.services.training.pipeline.cv_utils import _build_cv_splitter, _choose_refit_metric
 from sklearn.model_selection import GridSearchCV as _GridSearchCV
 from app.services.preparation_ml.preprocessing.transformers import ColumnAligner
 
@@ -191,14 +196,6 @@ def _is_debug_enabled(cfg: TrainingConfig) -> bool:
     import os
     raw = str(os.getenv("TRAINING_DEBUG", "")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
-
-
-def _is_zero_one_label_set(labels: np.ndarray) -> bool:
-    try:
-        normalized = {float(v) for v in labels}
-    except Exception:
-        return False
-    return normalized == {0.0, 1.0}
 
 
 def _resolve_positive_label_for_run(y_all: np.ndarray, requested_positive_label: Any) -> tuple[Any, Optional[str]]:

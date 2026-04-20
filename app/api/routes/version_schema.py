@@ -6,10 +6,10 @@ import numpy as np
 import pandas as pd
 
 from app.api.deps import get_current_user, get_db, ensure_project_owner
-from app.api.utils.datasets import get_dataset_or_404
-from app.api.utils.nettoyage_df import load_current_df
-from app.api.utils.versions import load_version_df
-from app.services.column_inference import infer_kind_for_series
+from app.api.utils_shared.datasets import get_dataset_or_404
+from app.services.nettoyage.df_utils import load_current_df
+from app.api.utils_shared.versions import load_version_df
+from app.services.data.column_inference import infer_kind_for_series
 from app.crud import version_column_schema as crud_schema
 from app.schemas.version_column_schema import ColumnsMetaOut, ColumnKindsIn
 

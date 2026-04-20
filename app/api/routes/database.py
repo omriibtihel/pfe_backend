@@ -7,11 +7,11 @@ from typing import Any, Dict, List
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from app.api.utils.df import read_df
+from app.api.utils_shared.df import read_df
 from app.schemas.database import CorrelationOut
 from app.schemas.dataset import DatasetPreviewOut, DatasetColumnOut
 from fastapi.encoders import jsonable_encoder
-from app.api.utils.datasets import get_dataset_or_404
+from app.api.utils_shared.datasets import get_dataset_or_404
 import numpy as np
 
 

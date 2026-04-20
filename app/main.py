@@ -11,6 +11,7 @@ from app.api.routes.database import router as database_router
 from app.api.routes.charts import router as charts_router
 from app.api.routes.nettoyage import router as nettoyage_router
 from app.api.routes.versions import router as versions_router
+from app.api.routes.version_analytics import router as version_analytics_router
 from app.api.routes.preparation import router as preparation_router
 from app.api.routes.training import router as training_router
 from app.api.routes.prediction import router as prediction_router
@@ -50,6 +51,7 @@ app.include_router(database_router, prefix="/api/projects/{project_id}", tags=["
 app.include_router(charts_router,prefix="/api/projects/{project_id}/datasets",tags=["Charts"])
 app.include_router(nettoyage_router, prefix="/api/projects/{project_id}", tags=["nettoyage"])
 app.include_router(versions_router, prefix="/api/projects/{project_id}/versions", tags=["versions"])
+app.include_router(version_analytics_router, prefix="/api/projects/{project_id}/versions", tags=["versions"])
 app.include_router(preparation_router, prefix="/api/projects/{project_id}/training", tags=["preparation"])
 app.include_router(training_router, prefix="/api/projects/{project_id}/training", tags=["training"])
 app.include_router(prediction_router, prefix="/api/projects/{project_id}/training", tags=["prediction"])

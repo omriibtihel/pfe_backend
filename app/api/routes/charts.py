@@ -10,8 +10,8 @@ from scipy import stats
 from sqlalchemy.orm import Session
 
 from app.api.deps import ensure_project_owner, get_current_user, get_db
-from app.api.utils.datasets import get_dataset_or_404
-from app.api.utils.df import read_df
+from app.api.utils_shared.datasets import get_dataset_or_404
+from app.api.utils_shared.df import read_df
 
 router = APIRouter()
 

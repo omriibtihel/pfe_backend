@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from app.api.routes.training import _model_to_front_result
+from app.services.training.presenter import model_to_front_result as _model_to_front_result
 from app.services.training.pipeline.metrics import compute_classification_metrics
 
 

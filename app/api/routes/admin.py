@@ -11,7 +11,7 @@ from app.schemas.admin import (
     RejectUserRequest,
     RejectUserResponse,
 )
-from app.services.email_service import send_approval_email, send_rejection_email
+from app.core.email import send_approval_email, send_rejection_email
 
 logger = logging.getLogger(__name__)
 

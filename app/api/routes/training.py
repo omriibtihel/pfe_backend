@@ -20,7 +20,7 @@ from app.schemas.training import (
     TrainingRecommendationOut,
 )
 from app.services.data.loader import load_dataframe, resolve_dataset_path
-from app.api.utils.versions import load_version_df
+from app.api.utils_shared.versions import load_version_df
 from app.services.data.profiler import DatasetProfiler
 from app.services.preparation_ml.balancing.profiler import profile_binary_dataset
 from app.services.training import presenter

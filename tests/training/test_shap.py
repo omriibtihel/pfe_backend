@@ -87,7 +87,8 @@ def test_global_shap_top_level_keys():
     pipe, df, y, _ = _make_clf_pipe()
     result = compute_global_shap(pipe, df, task_type="classification")
     assert result is not None
-    assert set(result.keys()) == {"summary", "expected_value", "explainer_type", "n_samples"}
+    expected_keys = {"summary", "expected_value", "explainer_type", "n_samples", "background_data"}
+    assert expected_keys.issubset(result.keys())
 
 
 def test_global_shap_summary_non_empty():

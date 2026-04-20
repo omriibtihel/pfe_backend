@@ -13,12 +13,12 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.services.column_inference import infer_kind_for_series
-from app.api.utils.datasets import get_dataset_or_404
-from app.api.utils.nettoyage_df import load_current_df
+from app.services.data.column_inference import infer_kind_for_series
+from app.api.utils_shared.datasets import get_dataset_or_404
+from app.services.nettoyage.df_utils import load_current_df
 from app.schemas.nettoyage import OperationIn, OperationOut
 from app.crud import nettoyage as crud_nettoyage
-from app.services.nettoyage_rebuild import rebuild_processed
+from app.services.nettoyage.rebuild import rebuild_processed
 from app.models.dataset_version import DatasetVersion
 from app.core.config import PROJECTS_PATH
 

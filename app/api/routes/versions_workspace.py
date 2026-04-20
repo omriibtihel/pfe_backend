@@ -6,8 +6,8 @@ import json
 import os
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.api.utils.nettoyage_df import load_current_df
-from app.api.utils.workspaces import get_or_create_workspace_for_version
+from app.services.nettoyage.df_utils import load_current_df
+from app.api.utils_shared.workspaces import get_or_create_workspace_for_version
 from app.crud import nettoyage as crud_nettoyage
 from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion

@@ -10,11 +10,11 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.api.utils.df import read_df
+from app.api.utils_shared.df import read_df
 from app.core.config import PROJECTS_PATH
 from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion
-from app.api.utils.datasets import get_dataset_or_404
+from app.api.utils_shared.datasets import get_dataset_or_404
 
 from app.schemas.dataset import DatasetOut, DatasetPreviewOut, DatasetTargetIn, DatasetTargetOut
 from app.schemas.dataset_active import ActiveDatasetIn, ActiveDatasetOut
