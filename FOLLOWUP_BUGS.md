@@ -33,29 +33,22 @@ class distribution on the same data that training will use.
 
 ---
 
-## BUG-04: presenter.py silently returns value=0.0 on metric parse failure
+## ~~BUG-04: presenter.py silently returns value=0.0 on metric parse failure~~ ✅ FIXED
 
-**File:** `app/services/training/presenter.py:85-172`
-**Audit reference:** Deception Audit AXE 3
+**Fixed in:** `app/services/training/presenter.py` + `app/schemas/training/results.py`
 
-Four nested try/except blocks in `get_primary_metric()` swallow any parsing
-failure and return `PrimaryMetric(name="unknown", value=0.0, displayName="—")`.
-The user sees "—" in the ModelResultCard and cannot distinguish "metric not
-applicable for this model" from "metric calculation failed entirely."
-
-**Fix:** Return `PrimaryMetric(name="error", value=None, displayName="Erreur calcul")`
-on parse failure and display a red badge in the frontend.
+- `PrimaryMetric` now has `value: Optional[float]` and `status: Literal["success","not_applicable","error"]`
+- `get_primary_metric()` wrapped in outer try/except; raises `MetricNotApplicable` when no
+  metric found → `status="not_applicable"`; unexpected exceptions → `status="error"` + log
+- `ModelResultCard.tsx`: red badge on error, muted "N/A" on not_applicable, unchanged on success
 
 ---
 
-## BUG-05: testScore semantically overloaded between holdout and CV-only mode
+## ~~BUG-05: testScore semantically overloaded between holdout and CV-only mode~~ ✅ FIXED
 
-**File:** `app/services/training/orchestrator.py:1557` + `presenter.py:207-248`
-**Audit reference:** Deception Audit AXE 3
+**Fixed in:** `app/services/training/orchestrator.py` + `presenter.py` + `ModelResultCard.tsx`
 
-When `test_ratio=0` (CV without holdout), `testScore` = mean of CV validation
-fold metrics, but is presented identically to a true holdout test score.
-Frontend cannot distinguish the two cases.
-
-**Fix:** Add `"test_is_cv_mean": true` flag in the API response and update
-`ModelResultCard.tsx` to display "CV val." instead of the primary metric label.
+- orchestrator adds `test_is_cv_mean: bool` and `test_label: str` to the CV metrics_json
+- presenter forwards both as `testIsCvMean` / `testLabel` on `ModelResultResponse`
+- TypeScript `ModelResult` interface updated with optional `testIsCvMean` and `testLabel`
+- `ModelResultCard` shows "CV val." underline with tooltip when `testIsCvMean` is true
