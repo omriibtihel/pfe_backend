@@ -256,11 +256,13 @@ class PreprocessingConfig:
                 normalized_columns[col] = out
 
         adv = _as_dict(pp.get("advancedParams"))
-        knn_n_neighbors = max(1, min(50, int(adv.get("knnNeighbors") or 5)))
+        _knn_raw = adv.get("knnNeighbors")
+        knn_n_neighbors = max(1, min(50, int(_knn_raw))) if _knn_raw is not None else 5
         constant_fill_numeric = float(adv.get("constantFillNumeric") if adv.get("constantFillNumeric") is not None else 0.0)
         raw_cat_fill = str(adv.get("constantFillCategorical") or "").strip()
         constant_fill_categorical = raw_cat_fill if raw_cat_fill else "__missing__"
-        variance_threshold = max(0.0, min(1.0, float(adv.get("varianceThreshold") or 0.01)))
+        _vt_raw = adv.get("varianceThreshold")
+        variance_threshold = max(0.0, min(1.0, float(_vt_raw))) if _vt_raw is not None else 0.01
 
         return PreprocessingConfig(
             defaults=resolved_defaults,

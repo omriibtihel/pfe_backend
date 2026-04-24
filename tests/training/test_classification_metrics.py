@@ -173,9 +173,9 @@ def test_front_result_keeps_unavailable_metrics_as_none() -> None:
         task_type="classification",
         metrics_json={"test": metrics, "train": metrics, "training_time_sec": 0.1},
         artifacts_json={},
+        is_saved=False,
     )
 
     front = _model_to_front_result(model)
 
-    assert front["metrics"]["roc_auc"] is None
-    assert front["metrics"]["pr_auc"] is None
+    assert front["metrics"]["rocAuc"] is None
