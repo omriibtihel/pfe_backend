@@ -33,6 +33,7 @@ from app.services.preparation_ml.balancing.profiler import profile_binary_datase
 from app.services.training import presenter
 from app.services.training.intelligence.recommender import RecommendationEngine
 from app.services.training.notifier import training_notifier
+from app.services.training.config.schema.training_config import TrainingConfig
 from app.services.training.training_service import run_automl_session, run_training_session
 
 _profiler = DatasetProfiler()
@@ -165,6 +166,13 @@ def start_training_for_version(
         raise HTTPException(status_code=400, detail="No model selected")
     if not payload.metrics:
         raise HTTPException(status_code=400, detail="No metric selected")
+
+    # Eager param validation — catches kFolds/testRatio/ratio-sum errors before
+    # the background task starts, so the caller gets 422 not a silent failure.
+    try:
+        TrainingConfig.from_front(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if str(payload.taskType).strip().lower() == "classification":
         try:

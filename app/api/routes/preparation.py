@@ -161,7 +161,10 @@ def validate_training(
         raise HTTPException(status_code=400, detail=str(exc))
 
     payload_dict = payload.model_dump()
-    result = validate_training_config_payload(payload_dict, df)
+    try:
+        result = validate_training_config_payload(payload_dict, df)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     include_payload = payload_dict.get("include") if isinstance(payload_dict.get("include"), dict) else {}
     include_preview = bool(include_payload.get("preview", False))
     if include_preview:
