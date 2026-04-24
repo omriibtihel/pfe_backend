@@ -2,184 +2,528 @@
 """
 Training presenter layer.
 
-Transforms raw ORM objects (TrainedModel, TrainingSession) into the camelCase
-dicts expected by the frontend.  No HTTP or DB dependency — pure data shaping.
+Transforms raw ORM objects (TrainedModel, TrainingSession) into typed Pydantic
+response models.  No HTTP or DB dependency — pure data shaping.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from app.models.training import TrainedModel, TrainingSession
 
+logger = logging.getLogger(__name__)
+
+
+class MetricNotApplicable(Exception):
+    """No valid metric is available for this model (expected, not a pipeline error)."""
+from app.schemas.training.results import (
+    AnalysisBlock,
+    AutoMLInfo,
+    BalancingInfo,
+    CVInfo,
+    CurvesResponse,
+    ExplainabilityResponse,
+    FeatureImportanceItem,
+    GridSearchInfo,
+    MetricsSummary,
+    ModelResultDetailResponse,
+    ModelResultResponse,
+    PrimaryMetric,
+    SavedModelResponse,
+    SplitSummary,
+    ThresholdInfo,
+    TrainingSessionResponse,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Internal extraction helpers
+# Metric display names
 # ──────────────────────────────────────────────────────────────────────────────
 
-def extract_primary_score(
-    metrics_all: dict,
-    metrics: dict,
+_METRIC_DISPLAY: dict[str, str] = {
+    "f1": "F1-score",
+    "f1_macro": "F1 macro",
+    "f1_weighted": "F1 pondéré",
+    "f1_pos": "F1 (classe +)",
+    "accuracy": "Accuracy",
+    "roc_auc": "AUC-ROC",
+    "pr_auc": "AUC-PR",
+    "rmse": "RMSE",
+    "mae": "MAE",
+    "r2": "R²",
+    "mse": "MSE",
+    "mcc": "MCC",
+    "precision": "Précision",
+    "recall": "Rappel",
+}
+
+# Ordered preference by task type — used when the backend has not stored a
+# primary_score block.
+_CLASSIFICATION_CANDIDATES = ["roc_auc", "f1", "f1_pos", "f1_macro", "accuracy", "pr_auc"]
+_REGRESSION_CANDIDATES = ["rmse", "r2", "mae", "mse"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Internal metric extraction helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _resolve_metrics(metrics_all: dict) -> tuple[dict, callable]:
+    """
+    Returns (flat_metrics_dict, mget_fn).
+
+    flat_metrics_dict is the test-metrics dict with common sub-dicts merged in.
+    mget_fn(key) returns the first non-None float found across all metric dicts.
+    """
+    test_block = metrics_all.get("test")
+    metrics: dict = test_block if isinstance(test_block, dict) else metrics_all
+
+    legacy = metrics.get("legacy_flat") if isinstance(metrics.get("legacy_flat"), dict) else {}
+    global_ = metrics.get("global") if isinstance(metrics.get("global"), dict) else {}
+    binary = metrics.get("binary") if isinstance(metrics.get("binary"), dict) else {}
+
+    dicts = (metrics, legacy, global_, binary)
+
+    def mget(k: str) -> Optional[float]:
+        for d in dicts:
+            v = d.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return None
+
+    return metrics, mget
+
+
+def _extract_training_time(metrics_all: dict) -> float:
+    try:
+        return float(metrics_all.get("training_time_sec", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _extract_train_score(metrics_all: dict, primary_name: Optional[str]) -> float:
+    if not primary_name:
+        return 0.0
+    train_block = metrics_all.get("train")
+    if isinstance(train_block, dict) and primary_name in train_block:
+        try:
+            return float(train_block[primary_name])
+        except Exception:
+            pass
+    return 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DÉCISION 2 — get_primary_metric
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_primary_metric(
     task_type: str,
-    mget: Any,
-) -> tuple[Optional[str], float, float, float]:
-    """Returns (primary_metric, test_score, train_score, training_time)."""
-    primary = metrics_all.get("primary_score") if isinstance(metrics_all.get("primary_score"), dict) else {}
-    primary_metric = primary.get("metric")
+    metrics_all: dict,
+    mget: callable,
+) -> PrimaryMetric:
+    """
+    Select and return the single most informative metric for this model.
 
-    if not primary_metric:
+    Returns a PrimaryMetric whose ``status`` field encodes one of three states:
+      "success"        — a valid float was found (normal case)
+      "not_applicable" — no valid metric exists in metrics_json (expected gap)
+      "error"          — an unexpected exception prevented extraction entirely
+
+    Priority order when status="success":
+    1. primary_score block stored by the training pipeline (explicit backend choice)
+    2. Task-type ordered fallback (classification → AUC/F1, regression → RMSE/R²)
+    3. First parseable float in the metrics dict
+    """
+    try:
+        # 1. Use stored primary_score if available
+        primary_score = metrics_all.get("primary_score")
+        if isinstance(primary_score, dict):
+            stored_name = primary_score.get("metric")
+            stored_value = primary_score.get("value")
+            if stored_name and stored_value is not None:
+                try:
+                    return PrimaryMetric(
+                        name=str(stored_name),
+                        value=float(stored_value),
+                        displayName=_METRIC_DISPLAY.get(str(stored_name), str(stored_name).upper()),
+                    )
+                except Exception:
+                    pass  # stored value uncastable — fall through to next priority
+
+        # 2. Ordered fallback by task type
         candidates = (
-            ["f1", "accuracy", "roc_auc", "pr_auc"]
-            if task_type == "classification"
-            else ["r2", "rmse", "mae", "mse"]
+            _REGRESSION_CANDIDATES
+            if str(task_type).lower() == "regression"
+            else _CLASSIFICATION_CANDIDATES
         )
         for key in candidates:
-            if key in metrics:
-                primary_metric = key
-                break
-        if not primary_metric and isinstance(metrics, dict) and metrics:
-            primary_metric = next(iter(metrics.keys()))
+            val = mget(key)
+            if val is not None:
+                return PrimaryMetric(
+                    name=key,
+                    value=val,
+                    displayName=_METRIC_DISPLAY.get(key, key.upper()),
+                )
 
-    test_score = 0.0
-    if isinstance(primary, dict) and primary.get("value") is not None:
-        try:
-            test_score = float(primary["value"])
-        except Exception:
-            pass
-    elif primary_metric and isinstance(metrics, dict):
-        try:
-            test_score = float(metrics.get(primary_metric, 0.0))
-        except Exception:
-            pass
+        # 3. First available metric
+        metrics, _ = _resolve_metrics(metrics_all)
+        for key, raw in metrics.items():
+            if isinstance(key, str) and key not in ("legacy_flat", "global", "binary", "warnings"):
+                try:
+                    return PrimaryMetric(
+                        name=key,
+                        value=float(raw),
+                        displayName=_METRIC_DISPLAY.get(key, key.upper()),
+                    )
+                except Exception:
+                    continue
 
-    train_score = 0.0
-    train_block = metrics_all.get("train")
-    if isinstance(train_block, dict) and primary_metric and primary_metric in train_block:
-        try:
-            train_score = float(train_block[primary_metric])
-        except Exception:
-            pass
+        raise MetricNotApplicable("no valid metric found in metrics_json")
 
-    try:
-        training_time = float(metrics_all.get("training_time_sec", 0.0))
+    except MetricNotApplicable:
+        return PrimaryMetric(name="unknown", value=None, displayName="—", status="not_applicable")
     except Exception:
-        training_time = 0.0
+        logger.error("get_primary_metric failed unexpectedly", exc_info=True)
+        return PrimaryMetric(name="error", value=None, displayName="Erreur de calcul", status="error")
 
-    return primary_metric, test_score, train_score, training_time
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sub-object builders
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_split_summary(metrics_all: dict, artifacts: dict) -> Optional[SplitSummary]:
+    split = metrics_all.get("split_info")
+    if not isinstance(split, dict):
+        split = artifacts.get("split_info")
+    if not isinstance(split, dict):
+        return None
+    return SplitSummary(
+        method=split.get("method"),
+        trainRows=split.get("train_rows"),
+        valRows=split.get("val_rows"),
+        testRows=split.get("test_rows"),
+    )
 
 
-def extract_automl_fields(metrics_all: dict, artifacts: dict) -> Optional[dict]:
-    """Returns the automl result dict when the model was trained with AutoML, else None."""
+def _build_automl_info(metrics_all: dict, artifacts: dict) -> Optional[AutoMLInfo]:
     if not bool(metrics_all.get("automl", False)):
         return None
     automl_artifacts = artifacts.get("automl") if isinstance(artifacts.get("automl"), dict) else {}
-    return {
-        "isAutoML": True,
-        "isBest": bool(automl_artifacts.get("is_best", True)),
-        "bestEstimator": metrics_all.get("best_estimator"),
-        "nIterations": metrics_all.get("n_iterations"),
-        "totalTimeS": metrics_all.get("total_time_s"),
-        "timeBudgetS": automl_artifacts.get("time_budget_s"),
-        "metricOptimized": automl_artifacts.get("metric_optimized"),
-    }
-
-
-def extract_cv_fields(
-    metrics_all: dict,
-    *,
-    primary_metric: Optional[str],
-    test_score: float,
-) -> tuple[dict, float]:
-    """Returns (cv_fields_dict, updated_test_score)."""
-    is_cv = bool(metrics_all.get("cv", False))
-    cv_summary = metrics_all.get("cv_summary") if isinstance(metrics_all.get("cv_summary"), dict) else None
-    cv_fold_results = metrics_all.get("fold_results") if isinstance(metrics_all.get("fold_results"), list) else None
-    k_folds_used = metrics_all.get("k_folds")
-    has_holdout_test = bool(metrics_all.get("has_holdout_test", False))
-    cv_mean_metrics = metrics_all.get("cv_mean") if isinstance(metrics_all.get("cv_mean"), dict) else None
-    holdout_test_metrics = (
-        metrics_all.get("holdout_test_metrics")
-        if isinstance(metrics_all.get("holdout_test_metrics"), dict)
-        else None
+    return AutoMLInfo(
+        isBest=bool(automl_artifacts.get("is_best", True)),
+        bestEstimator=metrics_all.get("best_estimator"),
+        nIterations=metrics_all.get("n_iterations"),
+        totalTimeS=metrics_all.get("total_time_s"),
+        timeBudgetS=automl_artifacts.get("time_budget_s"),
+        metricOptimized=automl_artifacts.get("metric_optimized"),
     )
 
-    if is_cv and primary_metric:
-        if has_holdout_test and isinstance(holdout_test_metrics, dict):
-            raw = holdout_test_metrics.get(primary_metric)
+
+def _build_cv_info(metrics_all: dict, *, primary_name: Optional[str]) -> tuple[Optional[CVInfo], float, bool, bool]:
+    """Returns (cv_info | None, test_score_override, is_cv, has_holdout)."""
+    is_cv = bool(metrics_all.get("cv", False))
+    if not is_cv:
+        return None, 0.0, False, False
+
+    has_holdout = bool(metrics_all.get("has_holdout_test", False))
+    cv_summary = metrics_all.get("cv_summary") if isinstance(metrics_all.get("cv_summary"), dict) else None
+    holdout_metrics = metrics_all.get("holdout_test_metrics") if isinstance(metrics_all.get("holdout_test_metrics"), dict) else None
+    cv_mean = metrics_all.get("cv_mean") if isinstance(metrics_all.get("cv_mean"), dict) else None
+
+    test_score_override = 0.0
+    if primary_name:
+        if has_holdout and isinstance(holdout_metrics, dict):
+            raw = holdout_metrics.get(primary_name)
             if raw is None:
-                lf = holdout_test_metrics.get("legacy_flat") if isinstance(holdout_test_metrics.get("legacy_flat"), dict) else {}
-                gl = holdout_test_metrics.get("global") if isinstance(holdout_test_metrics.get("global"), dict) else {}
-                raw = lf.get(primary_metric) or gl.get(primary_metric)
+                lf = holdout_metrics.get("legacy_flat") if isinstance(holdout_metrics.get("legacy_flat"), dict) else {}
+                gl = holdout_metrics.get("global") if isinstance(holdout_metrics.get("global"), dict) else {}
+                raw = lf.get(primary_name) or gl.get(primary_name)
             if raw is not None:
                 try:
-                    test_score = float(raw)
+                    test_score_override = float(raw)
                 except Exception:
                     pass
         elif isinstance(cv_summary, dict):
-            cv_mean = cv_summary.get("mean", {})
-            if isinstance(cv_mean, dict) and primary_metric in cv_mean:
+            cv_mean_block = cv_summary.get("mean", {})
+            if isinstance(cv_mean_block, dict) and primary_name in cv_mean_block:
                 try:
-                    test_score = float(cv_mean[primary_metric])
+                    test_score_override = float(cv_mean_block[primary_name])
                 except Exception:
                     pass
 
-    cv_fields = {
-        "isCV": is_cv,
-        "nestedCv": bool(metrics_all.get("nested_cv", False)),
-        "cvFoldResults": cv_fold_results,
-        "cvSummary": cv_summary,
-        "kFoldsUsed": k_folds_used,
-        "hasHoldoutTest": has_holdout_test,
-        "cvMeanMetrics": cv_mean_metrics,
-        "cvTestMetrics": holdout_test_metrics,
-    }
-    return cv_fields, test_score
+    fold_results = metrics_all.get("fold_results") if isinstance(metrics_all.get("fold_results"), list) else None
+    cv_info = CVInfo(
+        kFoldsUsed=metrics_all.get("k_folds"),
+        nestedCv=bool(metrics_all.get("nested_cv", False)),
+        cvSummary=cv_summary,
+        cvFoldResults=fold_results,
+        cvMeanMetrics=cv_mean,
+        cvTestMetrics=holdout_metrics,
+    )
+    return cv_info, test_score_override, True, has_holdout
 
 
-def extract_tuning_fields(artifacts: dict) -> tuple[dict, Any]:
-    """Returns (gridSearch_response_dict, gs_raw)."""
-    gs = artifacts.get("grid_search") if isinstance(artifacts.get("grid_search"), dict) else {}
-    best_params = gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None
-    cv_best_score = gs.get("best_score")
-    cv_scoring = gs.get("scoring")
+def _build_threshold_info(artifacts: dict) -> Optional[ThresholdInfo]:
+    thresh = artifacts.get("thresholding")
+    if not isinstance(thresh, dict):
+        return None
+    return ThresholdInfo(
+        enabled=bool(thresh.get("enabled", False)),
+        strategy=thresh.get("strategy"),
+        optimalThreshold=thresh.get("optimal_threshold"),
+        improvementDelta=thresh.get("improvement_delta"),
+        warnings=thresh.get("warnings") if isinstance(thresh.get("warnings"), list) else [],
+    )
 
-    _raw = gs.get("cv_results_summary")
-    cv_results_summary: Optional[list] = None
-    if isinstance(_raw, list) and _raw:
-        _mapped = []
-        for row in _raw:
+
+def _build_grid_search_info(artifacts: dict) -> Optional[GridSearchInfo]:
+    gs = artifacts.get("grid_search")
+    if not isinstance(gs, dict) or not gs.get("enabled"):
+        return None
+
+    raw_summary = gs.get("cv_results_summary")
+    cv_results_summary = None
+    if isinstance(raw_summary, list) and raw_summary:
+        mapped = []
+        for row in raw_summary:
             if not isinstance(row, dict):
                 continue
-            entry: dict = {
+            entry: dict[str, Any] = {
                 "params": dict(row.get("params") or {}),
                 "mean_score": float(row.get("mean_score") or row.get("mean_test_score") or 0.0),
             }
-            # Optional enrichment fields — present only when available
-            if row.get("mean_train_score") is not None:
-                entry["mean_train_score"] = float(row["mean_train_score"])
-            if row.get("overfit_gap") is not None:
-                entry["overfit_gap"] = float(row["overfit_gap"])
-            if row.get("mean_fit_time_s") is not None:
-                entry["mean_fit_time_s"] = float(row["mean_fit_time_s"])
-            # HalvingRandomSearchCV-specific
-            if row.get("halving_iter") is not None:
-                entry["halving_iter"] = int(row["halving_iter"])
-            if row.get("n_resources") is not None:
-                entry["n_resources"] = int(row["n_resources"])
-            _mapped.append(entry)
-        cv_results_summary = _mapped or None
+            for opt_key in ("mean_train_score", "overfit_gap", "mean_fit_time_s", "halving_iter", "n_resources"):
+                if row.get(opt_key) is not None:
+                    entry[opt_key] = row[opt_key]
+            mapped.append(entry)
+        cv_results_summary = mapped or None
 
-    grid_search_block = {
-        "enabled": bool(gs.get("enabled", False)),
-        "searchType": gs.get("search_type") or None,
-        "cvBestScore": float(cv_best_score) if cv_best_score is not None else None,
-        "cvScoring": str(cv_scoring) if cv_scoring else None,
-        "bestParams": best_params,
-        "cvSplits": int(gs.get("cv_splits", 0)) if gs.get("cv_splits") else None,
-        "nCandidates": int(gs.get("n_candidates", 0)) if gs.get("n_candidates") else None,
-        "cvResultsSummary": cv_results_summary,
-    }
-    return grid_search_block, gs
+    best_score = gs.get("best_score")
+    return GridSearchInfo(
+        enabled=True,
+        searchType=gs.get("search_type") or None,
+        cvBestScore=float(best_score) if best_score is not None else None,
+        cvScoring=str(gs["scoring"]) if gs.get("scoring") else None,
+        bestParams=gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None,
+        cvSplits=int(gs["cv_splits"]) if gs.get("cv_splits") else None,
+        nCandidates=int(gs["n_candidates"]) if gs.get("n_candidates") else None,
+        cvResultsSummary=cv_results_summary,
+    )
 
+
+def _build_balancing_info(artifacts: dict) -> Optional[BalancingInfo]:
+    bal = artifacts.get("balancing")
+    if not isinstance(bal, dict):
+        return None
+    ratio = bal.get("imbalance_ratio")
+    return BalancingInfo(
+        strategyApplied=str(bal["strategy_applied"]) if bal.get("strategy_applied") is not None else None,
+        refitMetric=str(bal["refit_metric"]) if bal.get("refit_metric") is not None else None,
+        imbalanceRatio=float(ratio) if ratio is not None else None,
+    )
+
+
+def _build_metrics_summary(mget: callable, task_type: str) -> MetricsSummary:
+    return MetricsSummary(
+        accuracy=mget("accuracy"),
+        rocAuc=mget("roc_auc"),
+        f1=mget("f1") if task_type != "regression" else None,
+        r2=mget("r2") if task_type == "regression" else None,
+        rmse=mget("rmse") if task_type == "regression" else None,
+        mae=mget("mae") if task_type == "regression" else None,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public serialisers — typed Pydantic responses
+# ──────────────────────────────────────────────────────────────────────────────
+
+def model_to_list_result(
+    m: TrainedModel,
+    *,
+    is_active: bool = False,
+) -> ModelResultResponse:
+    """Lightweight serialisation for session list / session summary views."""
+    metrics_all: dict = m.metrics_json or {}
+    artifacts: dict = m.artifacts_json or {}
+    task_type = str(m.task_type or "").lower()
+
+    flat_metrics, mget = _resolve_metrics(metrics_all)
+
+    primary = get_primary_metric(task_type, metrics_all, mget)
+    training_time = _extract_training_time(metrics_all)
+    train_score = _extract_train_score(metrics_all, primary.name)
+
+    cv_info, cv_test_score, is_cv, has_holdout = _build_cv_info(
+        metrics_all, primary_name=primary.name
+    )
+
+    # Determine test_score: CV override > primary_score > 0
+    ps_block = metrics_all.get("primary_score") if isinstance(metrics_all.get("primary_score"), dict) else {}
+    raw_test = ps_block.get("value")
+    test_score = cv_test_score if is_cv and cv_test_score else (float(raw_test) if raw_test is not None else primary.value)
+
+    return ModelResultResponse(
+        id=str(m.id),
+        modelType=str(m.model_type),
+        taskType=task_type,
+        primaryMetric=primary,
+        metrics=_build_metrics_summary(mget, task_type),
+        trainScore=train_score,
+        testScore=test_score,
+        trainingTime=training_time,
+        isSaved=bool(m.is_saved),
+        isActive=bool(is_active),
+        isCV=is_cv,
+        hasHoldoutTest=has_holdout,
+        testIsCvMean=bool(metrics_all.get("test_is_cv_mean", False)),
+        testLabel=metrics_all.get("test_label") or None,
+        splitInfo=_build_split_summary(metrics_all, artifacts),
+        automl=_build_automl_info(metrics_all, artifacts),
+    )
+
+
+def model_to_detail_result(
+    m: TrainedModel,
+    *,
+    is_active: bool = False,
+) -> ModelResultDetailResponse:
+    """Full serialisation for the /details endpoint."""
+    metrics_all: dict = m.metrics_json or {}
+    artifacts: dict = m.artifacts_json or {}
+    task_type = str(m.task_type or "").lower()
+
+    flat_metrics, mget = _resolve_metrics(metrics_all)
+
+    primary = get_primary_metric(task_type, metrics_all, mget)
+    training_time = _extract_training_time(metrics_all)
+    train_score = _extract_train_score(metrics_all, primary.name)
+
+    cv_info, cv_test_score, is_cv, has_holdout = _build_cv_info(
+        metrics_all, primary_name=primary.name
+    )
+
+    ps_block = metrics_all.get("primary_score") if isinstance(metrics_all.get("primary_score"), dict) else {}
+    raw_test = ps_block.get("value")
+    test_score = cv_test_score if is_cv and cv_test_score else (float(raw_test) if raw_test is not None else primary.value)
+
+    baseline = artifacts.get("baseline_majority")
+    analysis = AnalysisBlock(
+        crossValidation=cv_info,
+        thresholding=_build_threshold_info(artifacts),
+        gridSearch=_build_grid_search_info(artifacts),
+        residualAnalysis=artifacts.get("residual_analysis"),
+        confusionMatrix=artifacts.get("confusion_matrix"),
+        classDistribution=artifacts.get("class_distribution"),
+        baselineMajority=float(baseline) if baseline is not None else None,
+        metricsWarnings=flat_metrics.get("warnings", []) if isinstance(flat_metrics.get("warnings"), list) else [],
+    )
+
+    return ModelResultDetailResponse(
+        id=str(m.id),
+        modelType=str(m.model_type),
+        taskType=task_type,
+        primaryMetric=primary,
+        metrics=_build_metrics_summary(mget, task_type),
+        trainScore=train_score,
+        testScore=test_score,
+        trainingTime=training_time,
+        isSaved=bool(m.is_saved),
+        isActive=bool(is_active),
+        isCV=is_cv,
+        hasHoldoutTest=has_holdout,
+        testIsCvMean=bool(metrics_all.get("test_is_cv_mean", False)),
+        testLabel=metrics_all.get("test_label") or None,
+        splitInfo=_build_split_summary(metrics_all, artifacts),
+        automl=_build_automl_info(metrics_all, artifacts),
+        metricsDetailed=flat_metrics,
+        analysis=analysis,
+        preprocessing=artifacts.get("preprocessing"),
+        balancing=_build_balancing_info(artifacts),
+        hyperparams=artifacts.get("hyperparams"),
+    )
+
+
+def model_to_explainability(m: TrainedModel) -> ExplainabilityResponse:
+    """Serialise les données d'explicabilité (SHAP, permutation, feature importance)."""
+    artifacts: dict = m.artifacts_json or {}
+
+    raw_fi = artifacts.get("feature_importance", [])
+    feature_importance: list[FeatureImportanceItem] = []
+    if isinstance(raw_fi, list):
+        for item in raw_fi:
+            if isinstance(item, dict) and "feature" in item and "importance" in item:
+                try:
+                    feature_importance.append(
+                        FeatureImportanceItem(
+                            feature=str(item["feature"]),
+                            importance=float(item["importance"]),
+                        )
+                    )
+                except Exception:
+                    pass
+
+    return ExplainabilityResponse(
+        featureImportance=feature_importance,
+        permutationImportance=artifacts.get("permutation_importance"),
+        shapGlobal=artifacts.get("shap"),
+    )
+
+
+def model_to_curves(m: TrainedModel) -> CurvesResponse:
+    """Serialise les courbes ROC, PR, calibration et d'apprentissage."""
+    artifacts: dict = m.artifacts_json or {}
+    curves = artifacts.get("curves") if isinstance(artifacts.get("curves"), dict) else {}
+    return CurvesResponse(
+        roc=curves.get("roc"),
+        pr=curves.get("pr"),
+        calibration=curves.get("calibration"),
+        learningCurves=artifacts.get("learning_curves"),
+    )
+
+
+def session_to_response(
+    s: TrainingSession,
+    models: list[TrainedModel],
+    *,
+    active_model_id: int | None = None,
+) -> TrainingSessionResponse:
+    """Serialize a TrainingSession + its models to a typed TrainingSessionResponse."""
+    config = s.config_json if isinstance(s.config_json, dict) else {}
+    name = config.get("name") if isinstance(config.get("name"), str) else None
+
+    results = [
+        model_to_list_result(
+            m,
+            is_active=bool(active_model_id is not None and int(m.id) == int(active_model_id)),
+        )
+        for m in models
+    ]
+
+    return TrainingSessionResponse(
+        id=str(s.id),
+        projectId=str(s.project_id),
+        datasetVersionId=str(s.dataset_version_id) if s.dataset_version_id else None,
+        name=name,
+        status=str(s.status),
+        progress=int(s.progress or 0),
+        currentModel=s.current_model,
+        errorMessage=s.error_message,
+        activeModelId=str(active_model_id) if active_model_id is not None else None,
+        config=config,
+        results=results,
+        createdAt=s.created_at.isoformat() if s.created_at else None,
+        startedAt=s.started_at.isoformat() if s.started_at else None,
+        completedAt=s.finished_at.isoformat() if s.finished_at else None,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers used outside the presenter (prediction routes, etc.)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def extract_feature_names_for_prediction(artifacts: dict[str, Any]) -> list[str]:
     """
@@ -189,8 +533,6 @@ def extract_feature_names_for_prediction(artifacts: dict[str, Any]) -> list[str]
     1. artifacts["training_schema"]["feature_names"]  — most accurate
     2. artifacts["columns"]["numeric"] + ["categorical"]  — fallback
     3. Empty list
-
-    AutoML interaction features are excluded (backend reconstructs them at inference time).
     """
     training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
     feature_names = training_schema.get("feature_names")
@@ -225,7 +567,8 @@ def extract_threshold(artifacts: dict[str, Any]) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public serialisers
+# Backward-compat alias — kept so existing callers don't break during migration
+# Remove once all callers are updated to session_to_response / model_to_list_result
 # ──────────────────────────────────────────────────────────────────────────────
 
 def model_to_front_result(
@@ -234,114 +577,9 @@ def model_to_front_result(
     is_saved: bool | None = None,
     is_active: bool = False,
 ) -> dict[str, Any]:
-    """Serialize a TrainedModel ORM object to the frontend result dict."""
-    metrics_all = m.metrics_json or {}
-    artifacts = m.artifacts_json or {}
-    if is_saved is None:
-        is_saved = bool(getattr(m, "is_saved", None) or artifacts.get("saved", False))
-
-    test_metrics = metrics_all.get("test")
-    metrics = test_metrics if isinstance(test_metrics, dict) else metrics_all
-    metrics_legacy = metrics.get("legacy_flat") if isinstance(metrics.get("legacy_flat"), dict) else {}
-    metrics_global = metrics.get("global") if isinstance(metrics.get("global"), dict) else {}
-    metrics_binary = metrics.get("binary") if isinstance(metrics.get("binary"), dict) else {}
-
-    def mget(k: str) -> Optional[float]:
-        for d in (metrics, metrics_legacy, metrics_global, metrics_binary):
-            v = d.get(k)
-            if v is not None:
-                try:
-                    return float(v)
-                except Exception:
-                    pass
-        return None
-
-    task_type = str(m.task_type or "").lower()
-    primary_metric, test_score, train_score, training_time = extract_primary_score(
-        metrics_all, metrics, task_type, mget
-    )
-
-    split_info = metrics_all.get("split_info") if isinstance(metrics_all.get("split_info"), dict) else None
-    if split_info is None:
-        split_info = artifacts.get("split_info") if isinstance(artifacts.get("split_info"), dict) else None
-
-    grid_search_block, _ = extract_tuning_fields(artifacts)
-    thresholding = artifacts.get("thresholding") if isinstance(artifacts.get("thresholding"), dict) else None
-    balancing = artifacts.get("balancing") if isinstance(artifacts.get("balancing"), dict) else None
-    automl_result = extract_automl_fields(metrics_all, artifacts)
-    cv_fields, test_score = extract_cv_fields(metrics_all, primary_metric=primary_metric, test_score=test_score)
-
-    # Sprint 1: Brier score from test metrics
-    brier_score: Optional[float] = None
-    for _d in (metrics_legacy, metrics_global, metrics_binary, metrics):
-        if isinstance(_d, dict):
-            _bs = _d.get("brier_score")
-            if _bs is not None:
-                try:
-                    brier_score = float(_bs)
-                    break
-                except Exception:
-                    pass
-
-    # Sprint 1: Confidence intervals from metrics_json
-    confidence_intervals = (
-        metrics_all.get("confidence_intervals")
-        if isinstance(metrics_all.get("confidence_intervals"), dict)
-        else None
-    )
-
-    return {
-        "id": str(m.id),
-        "modelType": m.model_type,
-        "status": "completed",
-        "metrics": {
-            "accuracy": mget("accuracy"),
-            "precision": mget("precision"),
-            "recall": mget("recall"),
-            "f1": mget("f1"),
-            "roc_auc": mget("roc_auc"),
-            "pr_auc": mget("pr_auc"),
-            "brier_score": brier_score,
-            "precision_pos": mget("precision_pos"),
-            "recall_pos": mget("recall_pos"),
-            "f1_pos": mget("f1_pos"),
-            "f1_macro": mget("f1_macro"),
-            "specificity": mget("specificity"),
-            "npv": mget("npv"),
-            "mcc": mget("mcc"),
-            "mse": mget("mse"),
-            "rmse": mget("rmse"),
-            "mae": mget("mae"),
-            "r2": mget("r2"),
-        },
-        "trainScore": train_score,
-        "testScore": test_score,
-        "primaryMetric": primary_metric,
-        "splitInfo": split_info,
-        **cv_fields,
-        "gridSearch": grid_search_block,
-        "featureImportance": artifacts.get("feature_importance", []),
-        "curves": artifacts.get("curves", None),
-        "confusionMatrix": artifacts.get("confusion_matrix", []),
-        "metricsDetailed": metrics,
-        "metricsWarnings": metrics.get("warnings", []) if isinstance(metrics, dict) else [],
-        "hyperparams": artifacts.get("hyperparams", None),
-        "classDistribution": artifacts.get("class_distribution", None),
-        "baselineMajority": artifacts.get("baseline_majority", None),
-        "splitDebug": artifacts.get("split_debug", None),
-        "preprocessing": artifacts.get("preprocessing", None),
-        "balancing": balancing,
-        "thresholding": thresholding,
-        "trainingTime": training_time,
-        "isSaved": bool(is_saved),
-        "isActive": bool(is_active),
-        "automl": automl_result,
-        "confidenceIntervals": confidence_intervals,
-        "learningCurves": artifacts.get("learning_curves", None),
-        "permutationImportance": artifacts.get("permutation_importance", None),
-        "residualAnalysis": artifacts.get("residual_analysis", None),
-        "shapGlobal": artifacts.get("shap", None),
-    }
+    """Deprecated: use model_to_list_result or model_to_detail_result instead."""
+    result = model_to_list_result(m, is_active=is_active)
+    return result.model_dump()
 
 
 def session_to_front(
@@ -350,26 +588,5 @@ def session_to_front(
     *,
     active_model_id: int | None = None,
 ) -> dict[str, Any]:
-    """Serialize a TrainingSession + its models to the frontend session dict."""
-    return {
-        "id": str(s.id),
-        "projectId": str(s.project_id),
-        "datasetVersionId": str(s.dataset_version_id) if s.dataset_version_id else None,
-        "status": s.status,
-        "progress": int(s.progress or 0),
-        "currentModel": s.current_model,
-        "errorMessage": s.error_message,
-        "activeModelId": str(active_model_id) if active_model_id is not None else None,
-        "config": s.config_json,
-        "results": [
-            model_to_front_result(
-                m,
-                is_saved=bool((m.artifacts_json or {}).get("saved", False)),
-                is_active=bool(active_model_id is not None and int(m.id) == int(active_model_id)),
-            )
-            for m in models
-        ],
-        "createdAt": s.created_at.isoformat() if s.created_at else None,
-        "startedAt": s.started_at.isoformat() if s.started_at else None,
-        "completedAt": s.finished_at.isoformat() if s.finished_at else None,
-    }
+    """Deprecated: use session_to_response instead."""
+    return session_to_response(s, models, active_model_id=active_model_id).model_dump()
