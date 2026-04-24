@@ -362,6 +362,7 @@ def run_one_model(
     *,
     db: Session | None = None,
     session_id: int | None = None,
+    kind_overrides: dict[str, str] | None = None,
 ) -> ModelRunResult:
     """
     Entry point for a single model run.
@@ -373,10 +374,10 @@ def run_one_model(
         "group_kfold", "stratified_group_kfold",
     }
     if cfg.split_method == "loo":
-        return _run_loo(df, cfg, model_type, db=db, session_id=session_id)
+        return _run_loo(df, cfg, model_type, db=db, session_id=session_id, kind_overrides=kind_overrides)
     if cfg.split_method in _CV_METHODS:
-        return _run_kfold_cv(df, cfg, model_type, db=db, session_id=session_id)
-    return _run_holdout(df, cfg, model_type, db=db, session_id=session_id)
+        return _run_kfold_cv(df, cfg, model_type, db=db, session_id=session_id, kind_overrides=kind_overrides)
+    return _run_holdout(df, cfg, model_type, db=db, session_id=session_id, kind_overrides=kind_overrides)
 
 
 def _run_holdout(
@@ -386,6 +387,7 @@ def _run_holdout(
     *,
     db: Session | None = None,
     session_id: int | None = None,
+    kind_overrides: dict[str, str] | None = None,
 ) -> ModelRunResult:
     t0 = time.perf_counter()
     model_type_norm = str(model_type or "").strip().lower()
@@ -480,7 +482,7 @@ def _run_holdout(
     # Feature engineering: fit stats on train only (anti-leakage), add new columns before preprocessor.
     fe_transformer = FeatureEngineeringTransformer(fe_defs)
     X_train_fe = fe_transformer.fit_transform(X_train_aligned)
-    spec = build_preprocessor(X_train_fe, effective_preprocessing)
+    spec = build_preprocessor(X_train_fe, effective_preprocessing, kind_overrides=kind_overrides)
     X_train_prepared = spec.preprocessor.fit_transform(X_train_fe, np.asarray(split.y_train))
 
     # Fit VarianceThreshold on prepared train data, then apply to remove zero-variance features.
@@ -907,6 +909,7 @@ def _run_kfold_cv(
     *,
     db: Session | None = None,
     session_id: int | None = None,
+    kind_overrides: dict[str, str] | None = None,
 ) -> ModelRunResult:
     """
     Cross-validation pipeline (kfold / stratified_kfold / repeated_stratified_kfold /
@@ -1161,7 +1164,7 @@ def _run_kfold_cv(
             # Feature engineering: fit stats on train_fold only (anti-leakage)
             fold_fe = FeatureEngineeringTransformer(fe_defs)
             X_train_fe = fold_fe.fit_transform(X_train_aligned)
-            fold_spec = build_preprocessor(X_train_fe, effective_preprocessing)
+            fold_spec = build_preprocessor(X_train_fe, effective_preprocessing, kind_overrides=kind_overrides)
             X_train_prep = fold_spec.preprocessor.fit_transform(X_train_fe, y_train_fold)
             # ② Transform val_fold with the train-fitted preprocessor (no leakage)
             X_val_aligned = fold_aligner.transform(X_val_fold)
@@ -1346,7 +1349,7 @@ def _run_kfold_cv(
     # Feature engineering: fit on full refit data (anti-leakage: test set transforms via pipeline)
     final_fe = FeatureEngineeringTransformer(fe_defs)
     X_refit_fe = final_fe.fit_transform(X_refit_aligned)
-    final_spec = build_preprocessor(X_refit_fe, effective_preprocessing)
+    final_spec = build_preprocessor(X_refit_fe, effective_preprocessing, kind_overrides=kind_overrides)
     X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_fe, y_refit)
 
     # Fit VarianceThreshold on refit data, then apply (anti-leakage: test set transforms later via pipeline)
@@ -1552,6 +1555,8 @@ def _run_kfold_cv(
         "has_holdout_test": has_holdout_test,
         "cv_mean": cv_mean_metrics,
         "test": holdout_test_metrics if (has_holdout_test and holdout_test_metrics is not None) else cv_mean_metrics,
+        "test_is_cv_mean": not has_holdout_test,
+        "test_label": "CV validation (moyenne des folds)" if not has_holdout_test else "Holdout test set",
         "training_time_sec": float(time.perf_counter() - t0),
     }
     if has_holdout_test and holdout_test_metrics is not None:
@@ -1581,6 +1586,7 @@ def _run_loo(
     *,
     db: Session | None = None,
     session_id: int | None = None,
+    kind_overrides: dict[str, str] | None = None,
 ) -> ModelRunResult:
     """
     Leave-One-Out evaluation pipeline.
@@ -1693,7 +1699,7 @@ def _run_loo(
             # Feature engineering: fit stats on train_fold only (anti-leakage)
             fold_fe = FeatureEngineeringTransformer(fe_defs)
             X_train_fe = fold_fe.fit_transform(X_train_aligned)
-            fold_spec = build_preprocessor(X_train_fe, effective_preprocessing)
+            fold_spec = build_preprocessor(X_train_fe, effective_preprocessing, kind_overrides=kind_overrides)
             X_train_prep = fold_spec.preprocessor.fit_transform(X_train_fe, y_train_fold)
             X_val_aligned = fold_aligner.transform(X_val_fold)
             X_val_fe = fold_fe.transform(X_val_aligned)
@@ -1798,7 +1804,7 @@ def _run_loo(
             feature_names=_dummy_schema["feature_names"],
             dtypes=_dummy_schema["dtypes"],
         )
-        _dummy_spec = build_preprocessor(X_all, effective_preprocessing)
+        _dummy_spec = build_preprocessor(X_all, effective_preprocessing, kind_overrides=kind_overrides)
         _X_prep = _dummy_spec.preprocessor.fit_transform(
             _dummy_aligner.fit_transform(X_all), y_all
         )
@@ -1862,7 +1868,7 @@ def _run_loo(
     X_refit_aligned = final_aligner.fit_transform(X_all)
     final_fe = FeatureEngineeringTransformer(fe_defs)
     X_refit_fe = final_fe.fit_transform(X_refit_aligned)
-    final_spec = build_preprocessor(X_refit_fe, effective_preprocessing)
+    final_spec = build_preprocessor(X_refit_fe, effective_preprocessing, kind_overrides=kind_overrides)
     X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_fe, y_all)
     if final_spec.feature_selector is not None:
         _vt_n_before = X_refit_prep.shape[1] if hasattr(X_refit_prep, "shape") else 0
