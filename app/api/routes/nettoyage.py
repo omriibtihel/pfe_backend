@@ -13,13 +13,15 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.services.data.column_inference import infer_kind_for_series
+from app.services.data.column_inference import infer_kind_for_series, detect_parasites
 from app.api.utils_shared.datasets import get_dataset_or_404
-from app.services.nettoyage.df_utils import load_current_df
+from app.api.utils_shared.workspaces import create_fresh_workspace_for_dataset
+from app.services.nettoyage.df_utils import load_current_df, processed_path_for
 from app.schemas.nettoyage import OperationIn, OperationOut
 from app.crud import nettoyage as crud_nettoyage
 from app.services.nettoyage.rebuild import rebuild_processed
 from app.models.dataset_version import DatasetVersion
+from app.models.processing_operation import ProcessingOperation
 from app.core.config import PROJECTS_PATH
 
 router = APIRouter()
@@ -132,6 +134,7 @@ def _columns_meta_payload(df: pd.DataFrame):
                 "unique": unique,
                 "total": total_rows,
                 "sample": sample_vals,
+                "parasites": detect_parasites(s2),
                 **extra,
             }
         )
@@ -146,9 +149,10 @@ ALLOWED_CLEANING_ACTIONS = {
     "drop_columns",
     "drop_duplicates",
     "drop_empty_rows",
+    "drop_empty_cols",
     "rename_columns",
     "strip_whitespace",
-    "substitute_values",  # ✅ added
+    "substitute_values",
 }
 
 
@@ -296,23 +300,37 @@ def apply_operation(
     df_current = load_current_df(ds.file_path, dataset_id)
     _validate_cleaning_payload(payload, df_current)
 
-    op = crud_nettoyage.create_operation(
-        db=db,
-        project_id=project_id,
-        dataset_id=dataset_id,
-        user_id=current_user.id,
-        op_type="cleaning",
-        description=payload.description,
-        columns=payload.columns or [],
-        params=payload.params or {},
-    )
-
+    # Step 1: write to disk FIRST — if this fails no DB record is created.
     try:
+        op = crud_nettoyage.create_operation(
+            db=db,
+            project_id=project_id,
+            dataset_id=dataset_id,
+            user_id=current_user.id,
+            op_type="cleaning",
+            description=payload.description,
+            columns=payload.columns or [],
+            params=payload.params or {},
+            flush_only=True,  # staged in session, not yet committed
+        )
         rebuild_processed(db, project_id, dataset_id)
+    except IOError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Cleaning could not be persisted to disk: {e}")
     except Exception as e:
         db.rollback()
-        crud_nettoyage.pop_last_operation(db, project_id, dataset_id, op_type="cleaning")
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Step 2: commit DB only after the file is safely on disk.
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        processed_path_for(ds.file_path, dataset_id).unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cleaning written to disk but DB record failed — file cleaned up: {e}",
+        )
 
     db.refresh(op)
     return op
@@ -387,13 +405,45 @@ def undo_last(
     current_user=Depends(get_current_user),
 ):
     ensure_project_owner(db, project_id, current_user.id)
+    ds = get_dataset_or_404(db, project_id, dataset_id)
 
-    last = crud_nettoyage.pop_last_operation(db, project_id, dataset_id, op_type=None)
+    last = (
+        db.query(ProcessingOperation)
+        .filter_by(project_id=project_id, dataset_id=dataset_id)
+        .order_by(ProcessingOperation.created_at.desc())
+        .first()
+    )
     if not last:
         return {"ok": False, "reason": "no_operations"}
 
     if last.op_type == "cleaning":
-        rebuild_processed(db, project_id, dataset_id)
+        # Step 1: stage the deletion then rebuild the file WITHOUT this operation.
+        # If the disk write fails, rollback restores the record — no data loss.
+        db.delete(last)
+        db.flush()
+
+        try:
+            rebuild_processed(db, project_id, dataset_id)
+        except IOError as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Undo failed at disk write — operation record preserved: {e}",
+            )
+
+        # Step 2: commit only after the file is on disk and consistent.
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Undo written to disk but DB cleanup failed: {e}",
+            )
+    else:
+        # Schema operations have no file side-effect — direct delete is safe.
+        db.delete(last)
+        db.commit()
 
     return {"ok": True, "undone_type": last.op_type, "undone_id": last.id}
 
@@ -467,6 +517,22 @@ def export_cleaned_dataset(
     )
 
 
+@router.post("/datasets/{dataset_id}/nettoyage/workspace")
+def create_dataset_workspace(
+    project_id: int,
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Crée (ou retourne) un workspace isolé pour le nettoyage du dataset brut.
+    Le dataset source ne sera jamais modifié.
+    """
+    ensure_project_owner(db, project_id, current_user.id)
+    ws = create_fresh_workspace_for_dataset(db, project_id, dataset_id, current_user.id)
+    return {"workspace_dataset_id": ws.id}
+
+
 class SaveVersionBody(BaseModel):
     name: str = ""
 
@@ -517,9 +583,17 @@ def save_cleaned_as_version(
 
     operations_json = json.dumps(ops_payload, ensure_ascii=False, default=str)
 
+    # Résoudre le source_dataset_id : si l'opération vient d'un workspace brut,
+    # le vrai dataset source est workspace_source_dataset_id (pas le workspace lui-même).
+    src_kind = getattr(src, "kind", "source")
+    if src_kind == "raw_workspace" and getattr(src, "workspace_source_dataset_id", None):
+        real_source_id = src.workspace_source_dataset_id
+    else:
+        real_source_id = src.id
+
     new_version = DatasetVersion(
         project_id=project_id,
-        source_dataset_id=src.id,
+        source_dataset_id=real_source_id,
         name=version_name,
         stored_name=stored_name,
         file_path=str(dst_path),

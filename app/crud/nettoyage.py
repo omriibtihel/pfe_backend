@@ -45,6 +45,7 @@ def create_operation(
     description: str,
     columns: list,
     params: dict,
+    flush_only: bool = False,
 ) -> ProcessingOperation:
     obj = ProcessingOperation(
         project_id=project_id,
@@ -56,7 +57,10 @@ def create_operation(
         params=params or {},
     )
     db.add(obj)
-    db.commit()
+    if flush_only:
+        db.flush()
+    else:
+        db.commit()
     db.refresh(obj)
     return obj
 
