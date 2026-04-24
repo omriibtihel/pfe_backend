@@ -13,11 +13,10 @@ from app.core.config import PROJECTS_PATH
 from app.models.training import TrainingSession
 
 from app.services.training.config.schema import TrainingConfig
-from app.services.data.loader import resolve_dataset_path, load_dataframe
+from app.services.data.loader import load_dataframe
 from app.services.training.orchestrator import run_one_model
 from app.crud import version_column_schema as crud_vcs
-from app.models.dataset_version import DatasetVersion as _DatasetVersion
-from app.services.nettoyage.df_utils import processed_path_for
+from app.services.training.data_source import resolve_training_data_path
 from app.services.training.output.persistence import save_pipeline, persist_trained_model
 from app.services.training.notifier import training_notifier, EventType
 from app.services.training.intelligence.meta_learner import MetaLearner, build_training_record
@@ -89,33 +88,16 @@ def run_training_session(session_id: int) -> None:
         if not cfg.models:
             raise RuntimeError("No model selected")
 
-        dataset_path, dv_id = resolve_dataset_path(db, s.project_id, s.dataset_version_id)
-
-        # Prefer the ephemeral cleaned file (processed_dataset_<id>.csv) over the raw version.
-        # The processed file exists when the user has applied cleaning operations but has not
-        # yet saved them as a new named version.
-        _dv = db.query(_DatasetVersion).filter(_DatasetVersion.id == dv_id).first()
-        _src_ds = _dv.source_dataset if _dv is not None else None
-        if _src_ds is not None:
-            _processed = processed_path_for(_src_ds.file_path, _src_ds.id)
-            path_to_load = _processed if _processed.exists() else dataset_path
-        else:
-            path_to_load = dataset_path
-
-        _data_source = "processed" if path_to_load != dataset_path else "RAW_ORIGINAL"
-        logger.info(
-            "training_data_source | session_id=%s | dataset_version_id=%s | file=%s | source=%s",
-            session_id, dv_id, path_to_load.name, _data_source,
-        )
-
+        path_to_load, dv_id, _data_source = resolve_training_data_path(
+            db, s.project_id, s.dataset_version_id)
         df = load_dataframe(path_to_load)
 
         if _data_source == "RAW_ORIGINAL":
-            _raw_warning = (
-                "Training used the original unprocessed dataset. "
-                "Apply and save cleaning operations before training to use cleaned data."
+            _append_session_message(
+                db, s,
+                "WARNING: Training used the original unprocessed dataset. "
+                "Apply and save cleaning operations before training to use cleaned data.",
             )
-            _append_session_message(db, s, f"WARNING: {_raw_warning}")
 
         out_dir = PROJECTS_PATH / str(s.project_id) / "training_models" / str(session_id)
 
@@ -335,8 +317,9 @@ def run_automl_session(session_id: int) -> None:
         if not cfg.target_column:
             raise RuntimeError("targetColumn is required")
 
-        dataset_path, dv_id = resolve_dataset_path(db, s.project_id, s.dataset_version_id)
-        df = load_dataframe(dataset_path)
+        path_to_load, dv_id, _ = resolve_training_data_path(
+            db, s.project_id, s.dataset_version_id)
+        df = load_dataframe(path_to_load)
 
         _update_session(db, s, dataset_version_id=dv_id, progress=10, current_model="AutoML en cours…")
         training_notifier.emit_sync(session_id, EventType.PROGRESS, {"progress": 10, "phase": "data_loaded"})

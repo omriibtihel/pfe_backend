@@ -116,7 +116,7 @@ def test_uses_processed_file_when_exists(tmp_path):
         return _tiny_df()
 
     with patch("app.services.training.training_service.SessionLocal", return_value=db), \
-         patch("app.services.training.training_service.resolve_dataset_path",
+         patch("app.services.training.data_source.resolve_dataset_path",
                return_value=(raw_csv, dv.id)), \
          patch("app.services.training.training_service.load_dataframe",
                side_effect=_fake_load), \
@@ -159,7 +159,7 @@ def test_falls_back_to_raw_when_no_processed_file(tmp_path):
         return _tiny_df()
 
     with patch("app.services.training.training_service.SessionLocal", return_value=db), \
-         patch("app.services.training.training_service.resolve_dataset_path",
+         patch("app.services.training.data_source.resolve_dataset_path",
                return_value=(raw_csv, dv.id)), \
          patch("app.services.training.training_service.load_dataframe",
                side_effect=_fake_load), \
@@ -202,7 +202,7 @@ def test_raw_warning_appended_to_session(tmp_path):
         appended_messages.append(msg)
 
     with patch("app.services.training.training_service.SessionLocal", return_value=db), \
-         patch("app.services.training.training_service.resolve_dataset_path",
+         patch("app.services.training.data_source.resolve_dataset_path",
                return_value=(raw_csv, dv.id)), \
          patch("app.services.training.training_service.load_dataframe",
                return_value=_tiny_df()), \
