@@ -18,8 +18,15 @@ from app.schemas.training import (
     RecommendIn,
     TrainingConfigIn,
     TrainingRecommendationOut,
+    # Typed response schemas
+    CurvesResponse,
+    ExplainabilityResponse,
+    ModelResultDetailResponse,
+    SavedModelResponse,
+    TrainingSessionResponse,
 )
-from app.services.data.loader import load_dataframe, resolve_dataset_path
+from app.services.data.loader import load_dataframe
+from app.services.training.data_source import resolve_training_data_path
 from app.api.utils_shared.versions import load_version_df
 from app.services.data.profiler import DatasetProfiler
 from app.services.preparation_ml.balancing.profiler import profile_binary_dataset
@@ -139,7 +146,11 @@ async def stream_training_events(
 # Launch training sessions
 # ──────────────────────────────────────────────────────────────────────────────
 
-@router.post("/versions/{version_id}/sessions", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/versions/{version_id}/sessions",
+    response_model=TrainingSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def start_training_for_version(
     project_id: int,
     version_id: int,
@@ -157,8 +168,8 @@ def start_training_for_version(
 
     if str(payload.taskType).strip().lower() == "classification":
         try:
-            dataset_path, _ = resolve_dataset_path(db, project_id, version_id)
-            df = load_dataframe(dataset_path)
+            path_to_load, _, _ = resolve_training_data_path(db, project_id, version_id)
+            df = load_dataframe(path_to_load)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -192,10 +203,14 @@ def start_training_for_version(
 
     active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
     models = crud_training.list_models_for_session(db, s.id)
-    return presenter.session_to_front(s, models, active_model_id=active_model_id)
+    return presenter.session_to_response(s, models, active_model_id=active_model_id)
 
 
-@router.post("/automl", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/automl",
+    response_model=TrainingSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def start_automl_training(
     project_id: int,
     payload: AutoMLConfigIn,
@@ -228,14 +243,14 @@ def start_automl_training(
     background.add_task(run_automl_session, s.id)
 
     models = crud_training.list_models_for_session(db, s.id)
-    return presenter.session_to_front(s, models)
+    return presenter.session_to_response(s, models)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Session CRUD
 # ──────────────────────────────────────────────────────────────────────────────
 
-@router.get("/sessions")
+@router.get("/sessions", response_model=list[TrainingSessionResponse])
 def list_sessions(
     project_id: int,
     db: Session = Depends(get_db),
@@ -245,12 +260,12 @@ def list_sessions(
     sessions = crud_training.list_sessions_for_project(db, project_id)
     active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
     return [
-        presenter.session_to_front(s, crud_training.list_models_for_session(db, s.id), active_model_id=active_model_id)
+        presenter.session_to_response(s, crud_training.list_models_for_session(db, s.id), active_model_id=active_model_id)
         for s in sessions
     ]
 
 
-@router.get("/sessions/{session_id}")
+@router.get("/sessions/{session_id}", response_model=TrainingSessionResponse)
 def get_session(
     project_id: int,
     session_id: int,
@@ -264,7 +279,7 @@ def get_session(
 
     active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
     models = crud_training.list_models_for_session(db, s.id)
-    return presenter.session_to_front(s, models, active_model_id=active_model_id)
+    return presenter.session_to_response(s, models, active_model_id=active_model_id)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -305,10 +320,76 @@ def rename_session(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Model detail endpoints (DÉCISION 3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/sessions/{session_id}/models/{model_id}/details",
+    response_model=ModelResultDetailResponse,
+)
+def get_model_details(
+    project_id: int,
+    session_id: int,
+    model_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Full model result including metrics détaillées, analyse et preprocessing."""
+    project = ensure_project_owner(db, project_id, current_user.id)
+    m = crud_training.get_model(db, model_id, session_id=session_id, project_id=project_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
+    is_active = bool(active_model_id is not None and int(m.id) == active_model_id)
+    return presenter.model_to_detail_result(m, is_active=is_active)
+
+
+@router.get(
+    "/sessions/{session_id}/models/{model_id}/explainability",
+    response_model=ExplainabilityResponse,
+)
+def get_model_explainability(
+    project_id: int,
+    session_id: int,
+    model_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """SHAP global, permutation importance et feature importance — chargés à la demande."""
+    ensure_project_owner(db, project_id, current_user.id)
+    m = crud_training.get_model(db, model_id, session_id=session_id, project_id=project_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    return presenter.model_to_explainability(m)
+
+
+@router.get(
+    "/sessions/{session_id}/models/{model_id}/curves",
+    response_model=CurvesResponse,
+)
+def get_model_curves(
+    project_id: int,
+    session_id: int,
+    model_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Courbes ROC, PR, calibration et d'apprentissage — chargées à la demande."""
+    ensure_project_owner(db, project_id, current_user.id)
+    m = crud_training.get_model(db, model_id, session_id=session_id, project_id=project_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    return presenter.model_to_curves(m)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Saved models
 # ──────────────────────────────────────────────────────────────────────────────
 
-@router.get("/saved-models")
+@router.get("/saved-models", response_model=list[SavedModelResponse])
 def list_saved_models(
     project_id: int,
     db: Session = Depends(get_db),
@@ -323,12 +404,10 @@ def list_saved_models(
     if not models:
         return []
 
-    out = []
+    out: list[SavedModelResponse] = []
     for m in models:
-        artifacts = m.artifacts_json if isinstance(m.artifacts_json, dict) else {}
-        is_saved = bool(getattr(m, "is_saved", None) or artifacts.get("saved", False))
         is_active = bool(active_id is not None and int(m.id) == active_id)
-        if not is_saved and not is_active:
+        if not bool(m.is_saved) and not is_active:
             continue
 
         session = sessions_by_id.get(int(m.session_id))
@@ -338,26 +417,27 @@ def list_saved_models(
             else None
         )
 
-        front_result = presenter.model_to_front_result(m)
-        out.append({
-            "id": str(m.id),
-            "modelType": str(m.model_type),
-            "taskType": str(m.task_type),
-            "sessionId": str(m.session_id),
-            "datasetVersionId": str(dataset_version_id) if dataset_version_id is not None else None,
-            "datasetVersionName": version_name_by_id.get(dataset_version_id) if dataset_version_id else None,
-            "isActive": is_active,
-            "isSaved": is_saved,
-            "featureNames": presenter.extract_feature_names_for_prediction(artifacts),
-            "threshold": presenter.extract_threshold(artifacts),
-            "trainedAt": m.created_at.isoformat() if m.created_at else "",
-            "testScore": front_result.get("testScore"),
-            "primaryMetric": front_result.get("primaryMetric"),
-            "trainingTime": front_result.get("trainingTime"),
-        })
+        artifacts = m.artifacts_json if isinstance(m.artifacts_json, dict) else {}
+        list_result = presenter.model_to_list_result(m, is_active=is_active)
 
-    out.sort(key=lambda item: str(item.get("trainedAt") or ""), reverse=True)
-    out.sort(key=lambda item: not bool(item.get("isActive")))
+        out.append(SavedModelResponse(
+            id=str(m.id),
+            modelType=str(m.model_type),
+            taskType=str(m.task_type),
+            sessionId=str(m.session_id),
+            datasetVersionId=str(dataset_version_id) if dataset_version_id is not None else None,
+            datasetVersionName=version_name_by_id.get(dataset_version_id) if dataset_version_id else None,
+            isActive=is_active,
+            isSaved=bool(m.is_saved),
+            featureNames=presenter.extract_feature_names_for_prediction(artifacts),
+            threshold=presenter.extract_threshold(artifacts),
+            trainedAt=m.created_at.isoformat() if m.created_at else "",
+            primaryMetric=list_result.primaryMetric,
+            trainingTime=list_result.trainingTime,
+        ))
+
+    out.sort(key=lambda item: str(item.trainedAt or ""), reverse=True)
+    out.sort(key=lambda item: not item.isActive)
     return out
 
 
@@ -440,8 +520,8 @@ def download_results(
 
     active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
     models = crud_training.list_models_for_session(db, s.id)
-    payload = presenter.session_to_front(s, models, active_model_id=active_model_id)
-    content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    payload = presenter.session_to_response(s, models, active_model_id=active_model_id)
+    content = json.dumps(payload.model_dump(), ensure_ascii=False, indent=2).encode("utf-8")
 
     return _StreamingResponse(
         io.BytesIO(content),
