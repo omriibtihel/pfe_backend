@@ -82,46 +82,72 @@ No log, no warning, artifacts did not show the value actually used.
 
 ---
 
-## CHAIN 4 — Frontend silent errors (OPEN — out of scope for Chain 3 session)
+## ~~CHAIN 4 — Frontend silent errors~~ ✅ FIXED
 
-These frontend locations silently swallow errors. No user feedback, no console warning.
-Must be fixed before the next release.
+All four silent-error locations now have visible, distinguishable error states.
+Core principle enforced: loading / error / legitimately-empty are visually distinct.
 
-### FE-01: PredictionResultsPage.tsx:296 — empty catch on JSON.parse
+### ~~FE-01: PredictionResultsPage.tsx — parse error now surfaced~~ ✅ FIXED
 
-```typescript
-try {
-  data = JSON.parse(raw);
-} catch {
-  // silent — user sees stale or empty data
-}
-```
-
-Fix: log the parse error and show an error toast.
-
----
-
-### FE-02: useNettoyageData.ts:235-243 — `.catch(() => null)` on column metadata
-
-Column metadata fetch silently returns `null` on failure. The cleaning UI loads with
-no column info and no indication that something failed.
-
-Fix: surface the error to the user instead of swallowing it.
+**Fixed in:** `src/pages/project/PredictionResultsPage.tsx`
+- `parseError: boolean` state added, reset to false before each sessionStorage read
+- `catch (e)` logs + `toast({ variant: "destructive" })` + `setParseError(true)`
+- New `data-testid="prediction-parse-error"` render state shows distinct error UI
+  (AlertTriangle icon, message, "Nouvelle prédiction" button)
+- `data-testid="prediction-empty"` marks the legitimate "no prediction yet" state
+- Three states now visually distinct: loading (Loader2 spinner) / error (red alert)
+  / empty (Target icon + muted message)
 
 ---
 
-### FE-03: TrainingPage.tsx:247 — silent history load failure
+### ~~FE-02: useNettoyageData.ts — column metadata error surfaced~~ ✅ FIXED
 
-Training history load failure is caught and discarded. The page renders as if there
-is no history rather than indicating a fetch problem.
-
-Fix: show an error state or retry indicator.
+**Fixed in:** `src/pages/project/nettoyage/useNettoyageData.ts` +
+             `src/pages/project/NettoyagePage.tsx`
+- `columnsError: string | null` state added to hook
+- `.catch(() => null)` replaced with flag-based tracking: `metaFetchFailed` captured
+  in `refreshProcessing`, `setColumnsError` called after `Promise.all`
+- `retryColumnsLoad` callback added — clears error and re-calls `refreshProcessing`
+- Hook return shape extended with `columnsError` and `retryColumnsLoad`
+- `NettoyagePage` shows persistent inline error banner (`data-testid="columns-error-banner"`)
+  with "Réessayer" button (`data-testid="columns-error-retry"`) — NOT a toast (blocking failure)
 
 ---
 
-### FE-04: trainingService.ts:507 — unhandled rejection on download
+### ~~FE-03: TrainingPage.tsx — history failure shows soft non-blocking indicator~~ ✅ FIXED
 
-The download promise rejection is not caught. This can produce an unhandled promise
-rejection in the browser console with no user-visible feedback.
+**Fixed in:** `src/pages/project/TrainingPage.tsx`
+- `historyLoadFailed: boolean` state added
+- `.catch(() => {})` replaced with `console.warn` + `setHistoryLoadFailed(true)`
+- Small muted banner rendered when `historyLoadFailed` (`data-testid="history-load-failed"`):
+  History icon + "Historique indisponible" + compact "Réessayer" button
+  (`data-testid="history-retry-btn"`)
+- Training launch wizard is NOT blocked — wizard stepper and buttons remain active
 
-Fix: add `.catch()` with a toast or error state.
+---
+
+### ~~FE-04: trainingService.ts — downloadResults never rejects~~ ✅ FIXED
+
+**Fixed in:** `src/services/trainingService.ts`
+- `downloadResults()` return type changed from `Promise<Blob>` to
+  `Promise<{ success: true; blob: Blob } | { success: false; error: string }>`
+- Both the primary `/download` and fallback `/export` paths are wrapped in
+  `try/catch` — if both fail, resolves `{ success: false, error: String(e) }`,
+  never throws
+- `downloadResultsAndSaveToDisk()` checks `result.success` and throws
+  `new Error(result.error)` on failure so `TrainingResultsPage`'s existing
+  `catch + toast` still fires
+
+---
+
+## DECEPTION AUDIT — Formal Closure
+
+| Chain | Theme | Count | Severity | Status |
+|---|---|---|---|---|
+| Chain 1 | Cleaning illusion (raw CSV loaded after cleaning) | 3 | CRITICAL | ✅ FIXED |
+| Chain 1+ | Clone call sites (automl, validation preview, balance check) | 3 | WARNING | ✅ FIXED |
+| Chain 2 | Metrics integrity (presenter, testScore overload) | 2 | CRITICAL | ✅ FIXED |
+| Chain 3 | Parameter integrity (falsy-default, bool audit, validate()) | 3 | CRITICAL | ✅ FIXED |
+| Chain 4 | Frontend silences (4 locations, 13 tests) | 4 | WARNING | ✅ FIXED |
+
+**Total issues resolved:** 15 across 5 chains, 58 new regression tests added.
