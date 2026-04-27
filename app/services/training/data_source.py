@@ -20,14 +20,19 @@ def resolve_training_data_path(
     """
     Return (path_to_load, resolved_dv_id, data_source).
 
-    data_source is 'processed' when the ephemeral cleaned file was used,
-    'RAW_ORIGINAL' when falling back to the DatasetVersion file.
+    data_source values:
+      - "version_snapshot": the user-selected DatasetVersion has its own committed
+        CSV (distinct from the raw source). This is the normal path — the version
+        is the source of truth and may contain cleaning operations.
+      - "processed": the version's snapshot was missing, so we fell back to the
+        shared ephemeral processed_dataset_<source_id>.csv file.
+      - "raw_original": the version's CSV path is literally the same physical
+        file as the source dataset's raw file (no cleaning was committed for
+        this version). Only this case warrants a "data not cleaned" warning.
 
-    Prefers processed_dataset_<source_id>.csv over the raw DatasetVersion
-    path when the file exists — consistent with run_training_session Fix C.
-    All training-adjacent routes that load data for validation, preview, or
-    pre-flight checks must go through this function so their data source
-    matches what the actual training background task will use.
+    Prefers the version's own CSV over the shared processed file because the
+    shared file is keyed by source_dataset_id and may contain data from other
+    versions sharing the same source.
     """
     dataset_path, dv_id = resolve_dataset_path(db, project_id, version_id)
 
@@ -35,13 +40,36 @@ def resolve_training_data_path(
     src_ds = dv.source_dataset if dv is not None else None
     if src_ds is not None:
         processed = processed_path_for(src_ds.file_path, src_ds.id)
-        path_to_load = processed if processed.exists() else dataset_path
+
+        if Path(dataset_path).exists():
+            path_to_load = dataset_path
+        elif processed.exists():
+            path_to_load = processed
+        else:
+            raise FileNotFoundError(
+                f"No data file found for DatasetVersion id={dv_id}. "
+                f"Expected: {dataset_path}"
+            )
     else:
         path_to_load = dataset_path
 
-    data_source = "processed" if path_to_load != dataset_path else "RAW_ORIGINAL"
+    if path_to_load != dataset_path:
+        data_source = "processed"
+    elif src_ds is not None and _same_file(path_to_load, Path(src_ds.file_path)):
+        data_source = "raw_original"
+    else:
+        data_source = "version_snapshot"
+
     logger.info(
         "training_data_source | project_id=%s | dataset_version_id=%s | file=%s | source=%s",
         project_id, dv_id, Path(path_to_load).name, data_source,
     )
     return path_to_load, int(dv_id), data_source
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True when both paths resolve to the same file on disk."""
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return str(a) == str(b)

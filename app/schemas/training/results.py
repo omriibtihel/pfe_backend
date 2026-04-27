@@ -62,7 +62,7 @@ class ActiveModelOut(BaseModel):
     modelId: int
     sessionId: int
     modelType: str
-    taskType: str
+    taskType: Literal["classification", "regression"]
     featureNames: List[str]
     threshold: float
     trainedAt: str
@@ -79,6 +79,7 @@ class PrimaryMetric(BaseModel):
     value: Optional[float] = None
     displayName: str
     status: Literal["success", "not_applicable", "error"] = "success"
+    direction: Literal["higher_is_better", "lower_is_better"] = "higher_is_better"
 
 
 class MetricsSummary(BaseModel):
@@ -91,6 +92,7 @@ class MetricsSummary(BaseModel):
     r2: Optional[float] = None
     rmse: Optional[float] = None
     mae: Optional[float] = None
+    mse: Optional[float] = None
 
 
 class SplitSummary(BaseModel):
@@ -117,16 +119,37 @@ class AutoMLInfo(BaseModel):
 # ModelResultResponse — réponse légère (liste de modèles)
 # ──────────────────────────────────────────────────────────────────────────────
 
+class EvaluationSource(BaseModel):
+    type: Literal[
+        "holdout_test", "cv_mean", "loo", "validation", "train_only", "unknown"
+    ] = "unknown"
+    label: str = "Inconnu"
+    isIndependentTest: bool = False
+    nSamples: Optional[int] = None
+
+
 class ModelResultResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     id: str
     modelType: str
-    taskType: str
+    taskType: Literal["classification", "regression"]
     primaryMetric: PrimaryMetric
     metrics: MetricsSummary
-    trainScore: float
-    testScore: float
+    # trainScore is populated for ALL models, including train_only sessions.
+    # For train_only sessions it is the sole numeric score (testScore is null);
+    # for holdout sessions the train/test gap indicates overfitting.
+    # Always check evaluationSource.type before interpreting this value.
+    trainScore: Optional[float] = Field(
+        default=None,
+        description=(
+            "Training-set metric value for the primary metric. "
+            "Populated even when evaluationSource.type == 'train_only'; "
+            "in that case testScore is null and this is the only score available. "
+            "Check evaluationSource.type before treating this as a generalisation score."
+        ),
+    )
+    testScore: Optional[float] = None
     trainingTime: float
     isSaved: bool
     isActive: bool
@@ -136,6 +159,8 @@ class ModelResultResponse(BaseModel):
     testLabel: Optional[str] = None
     splitInfo: Optional[SplitSummary] = None
     automl: Optional[AutoMLInfo] = None
+    evaluationSource: EvaluationSource = Field(default_factory=EvaluationSource)
+    warnings: List[str] = Field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,6 +220,7 @@ class AnalysisBlock(BaseModel):
     classDistribution: Optional[Dict[str, Any]] = None
     baselineMajority: Optional[float] = None
     metricsWarnings: List[str] = Field(default_factory=list)
+    artifactWarnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ModelResultDetailResponse(ModelResultResponse):
@@ -223,6 +249,7 @@ class ExplainabilityResponse(BaseModel):
     featureImportance: List[FeatureImportanceItem] = Field(default_factory=list)
     permutationImportance: Optional[List[Dict[str, Any]]] = None
     shapGlobal: Optional[Dict[str, Any]] = None
+    artifactWarnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class CurvesResponse(BaseModel):
@@ -232,6 +259,7 @@ class CurvesResponse(BaseModel):
     pr: Optional[List[Any]] = None
     calibration: Optional[Dict[str, Any]] = None
     learningCurves: Optional[Dict[str, Any]] = None
+    artifactWarnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -266,7 +294,7 @@ class SavedModelResponse(BaseModel):
 
     id: str
     modelType: str
-    taskType: str
+    taskType: Literal["classification", "regression"]
     sessionId: str
     datasetVersionId: Optional[str] = None
     datasetVersionName: Optional[str] = None
@@ -276,4 +304,5 @@ class SavedModelResponse(BaseModel):
     threshold: float
     trainedAt: str
     primaryMetric: Optional[PrimaryMetric] = None
+    testScore: Optional[float] = None
     trainingTime: Optional[float] = None

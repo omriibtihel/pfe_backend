@@ -22,8 +22,8 @@ class HoldoutSplit:
     y_train: np.ndarray
     X_val: Optional[pd.DataFrame]
     y_val: Optional[np.ndarray]
-    X_test: pd.DataFrame
-    y_test: np.ndarray
+    X_test: Optional[pd.DataFrame]
+    y_test: Optional[np.ndarray]
     warnings: tuple[str, ...] = ()
     attempts: int = 1
     random_state_used: int = 42
@@ -79,6 +79,13 @@ def make_holdout_split(
             train_ratio, val_ratio, test_ratio = train_ratio / 100.0, val_ratio / 100.0, test_ratio / 100.0
         else:
             raise RuntimeError("train/val/test ratios must sum to 1.0 (or 100)")
+
+    if train_ratio >= 1.0 or test_ratio <= 0:
+        return HoldoutSplit(
+            X_train=X, y_train=y,
+            X_val=None, y_val=None,
+            X_test=None, y_test=None,
+        )
 
     n = len(X)
     if n < 10:

@@ -21,7 +21,7 @@ NumericImputationMethod = Literal["none", "median", "mean", "most_frequent", "co
 CategoricalImputationMethod = Literal["none", "most_frequent", "constant"]
 CategoricalEncodingMethod = Literal["none", "onehot", "label", "ordinal"]
 NumericScalingMethod = Literal["none", "standard", "minmax", "robust", "maxabs"]
-NumericPowerTransformMethod = Literal["none", "yeo_johnson", "box_cox"]
+NumericPowerTransformMethod = Literal["none", "log", "sqrt", "yeo_johnson", "box_cox"]
 ColumnType = Literal["numeric", "categorical", "ordinal"]
 ThresholdStrategy = Literal[
     "maximize_f1",

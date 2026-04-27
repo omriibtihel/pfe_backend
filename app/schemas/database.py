@@ -86,13 +86,23 @@ class CategoricalSummary(BaseModel):
     top_values: List[ColumnTopValue]
 
 
+class ParasiteInfo(BaseModel):
+    count: int
+    distinct: List[str]
+    convertible_ratio: float
+
+
 class ColumnProfile(BaseModel):
     name: str
     kind: Literal["numeric", "categorical", "datetime", "text", "unknown"]
     missing: int
+    missing_pct: float = 0.0
+    unique: int = 0
+    unique_pct: float = 0.0
     dtype: str
     numeric: Optional[NumericSummary] = None
     categorical: Optional[CategoricalSummary] = None
+    parasites: Optional[ParasiteInfo] = None
 
 
 class DatasetProfileOut(BaseModel):
@@ -101,18 +111,10 @@ class DatasetProfileOut(BaseModel):
     profiles: List[ColumnProfile]
 
 
-# -------- Target + Active dataset --------
+# -------- Target --------
 class TargetOut(BaseModel):
     target_column: str | None = None
 
 
 class TargetIn(BaseModel):
     target_column: str | None = None
-
-
-class ActiveDatasetOut(BaseModel):
-    active_dataset_id: int | None = None
-
-
-class ActiveDatasetIn(BaseModel):
-    dataset_id: int

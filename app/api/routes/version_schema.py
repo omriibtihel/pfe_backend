@@ -9,7 +9,7 @@ from app.api.deps import get_current_user, get_db, ensure_project_owner
 from app.api.utils_shared.datasets import get_dataset_or_404
 from app.services.nettoyage.df_utils import load_current_df
 from app.api.utils_shared.versions import load_version_df
-from app.services.data.column_inference import infer_kind_for_series
+from app.services.data.column_inference import infer_kind_for_series, detect_parasites, numeric_extra_stats
 from app.crud import version_column_schema as crud_schema
 from app.schemas.version_column_schema import ColumnsMetaOut, ColumnKindsIn
 
@@ -32,7 +32,14 @@ def _build_columns_meta(df: pd.DataFrame, schema_map: dict) -> dict:
             effective = "other"
         counts[effective] += 1
 
-        non_null = s.dropna()
+        s2 = s.replace([np.inf, -np.inf], np.nan)
+        non_null = s2.dropna()
+        from app.services.data.column_inference import _ALL_NONE
+        extra = (
+            numeric_extra_stats(non_null)
+            if pd.api.types.is_numeric_dtype(s2)
+            else dict(_ALL_NONE)
+        )
         cols_out.append({
             "name": str(c),
             "dtype": str(s.dtype),
@@ -41,10 +48,12 @@ def _build_columns_meta(df: pd.DataFrame, schema_map: dict) -> dict:
             "override_kind": override_kind,
             "confidence": float(getattr(row, "confidence", 0.0) or 0.0),
 
-            "missing": int(s.isna().sum()),
+            "missing": int(s2.isna().sum()),
             "unique": int(non_null.nunique(dropna=True)) if len(non_null) else 0,
-            "total": int(len(s)),
+            "total": int(len(s2)),
             "sample": non_null.astype(str).head(12).tolist(),
+            "parasites": detect_parasites(s2),
+            **extra,
         })
 
     return {"columns": cols_out, "counts": counts, "total_rows": total_rows}

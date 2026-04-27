@@ -37,6 +37,59 @@ from app.schemas.training.results import (
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Metric direction and evaluation source helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+_LOWER_IS_BETTER = {"rmse", "mae", "mse", "log_loss", "brier_score"}
+
+
+def _metric_direction(name: str) -> str:
+    return "lower_is_better" if (name or "").lower() in _LOWER_IS_BETTER else "higher_is_better"
+
+
+def _build_evaluation_source(metrics_json: dict) -> dict:
+    has_holdout = metrics_json.get("has_holdout_test", False)
+    test_is_cv_mean = metrics_json.get("test_is_cv_mean", False)
+    test_label = metrics_json.get("test_label")
+    test_n = metrics_json.get("test_n")
+
+    if has_holdout:
+        return {
+            "type": "holdout_test",
+            "label": test_label or "Holdout test set",
+            "isIndependentTest": True,
+            "nSamples": test_n,
+        }
+    if metrics_json.get("evaluation_strategy") == "loo":
+        return {
+            "type": "loo",
+            "label": test_label or "LOO validation",
+            "isIndependentTest": False,
+            "nSamples": None,
+        }
+    if test_is_cv_mean:
+        return {
+            "type": "cv_mean",
+            "label": test_label or "Moyenne CV",
+            "isIndependentTest": False,
+            "nSamples": None,
+        }
+    if metrics_json.get("evaluation_strategy") == "train_only":
+        return {
+            "type": "train_only",
+            "label": "Entraînement uniquement — aucun jeu de test",
+            "isIndependentTest": False,
+            "nSamples": None,
+        }
+    return {
+        "type": "unknown",
+        "label": test_label or "Inconnu",
+        "isIndependentTest": False,
+        "nSamples": None,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Metric display names
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -73,9 +126,23 @@ def _resolve_metrics(metrics_all: dict) -> tuple[dict, callable]:
 
     flat_metrics_dict is the test-metrics dict with common sub-dicts merged in.
     mget_fn(key) returns the first non-None float found across all metric dicts.
+
+    Train-only guard: when evaluation_strategy is "train_only" or no test block
+    exists, return an empty mget so primary_value resolves to None — never to a
+    train metric value (which would mislabel a train score as a test score).
     """
+    strategy = metrics_all.get("evaluation_strategy", "")
     test_block = metrics_all.get("test")
-    metrics: dict = test_block if isinstance(test_block, dict) else metrics_all
+
+    if strategy == "train_only" or not (isinstance(test_block, dict) and test_block):
+        empty: dict = {}
+
+        def mget_none(_k: str) -> Optional[float]:
+            return None
+
+        return empty, mget_none
+
+    metrics: dict = test_block
 
     legacy = metrics.get("legacy_flat") if isinstance(metrics.get("legacy_flat"), dict) else {}
     global_ = metrics.get("global") if isinstance(metrics.get("global"), dict) else {}
@@ -103,16 +170,32 @@ def _extract_training_time(metrics_all: dict) -> float:
         return 0.0
 
 
-def _extract_train_score(metrics_all: dict, primary_name: Optional[str]) -> float:
+def _extract_train_score(metrics_all: dict, primary_name: Optional[str]) -> Optional[float]:
+    """Return the training-set metric value for the given primary metric name.
+
+    This value is populated for **all** models, including those whose
+    evaluation_strategy is "train_only".  That is intentional: for train-only
+    sessions, trainScore is the *only* numeric score available (testScore and
+    primaryMetric.value are both null), so suppressing it would remove the sole
+    data point consumers have.
+
+    Callers that want evaluation scores should read ``testScore``/``primaryMetric``
+    and check ``evaluationSource.type`` before interpreting ``trainScore``:
+
+    * evaluationSource.type == "train_only"  → trainScore is a training metric,
+      not a generalisation score.  Treat it as indicative only.
+    * evaluationSource.type == "holdout_test" → both trainScore and testScore are
+      meaningful; their gap indicates overfitting.
+    """
     if not primary_name:
-        return 0.0
+        return None
     train_block = metrics_all.get("train")
     if isinstance(train_block, dict) and primary_name in train_block:
         try:
             return float(train_block[primary_name])
         except Exception:
             pass
-    return 0.0
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -149,6 +232,7 @@ def get_primary_metric(
                         name=str(stored_name),
                         value=float(stored_value),
                         displayName=_METRIC_DISPLAY.get(str(stored_name), str(stored_name).upper()),
+                        direction=_metric_direction(str(stored_name)),
                     )
                 except Exception:
                     pass  # stored value uncastable — fall through to next priority
@@ -166,6 +250,7 @@ def get_primary_metric(
                     name=key,
                     value=val,
                     displayName=_METRIC_DISPLAY.get(key, key.upper()),
+                    direction=_metric_direction(key),
                 )
 
         # 3. First available metric
@@ -177,6 +262,7 @@ def get_primary_metric(
                         name=key,
                         value=float(raw),
                         displayName=_METRIC_DISPLAY.get(key, key.upper()),
+                        direction=_metric_direction(key),
                     )
                 except Exception:
                     continue
@@ -222,18 +308,18 @@ def _build_automl_info(metrics_all: dict, artifacts: dict) -> Optional[AutoMLInf
     )
 
 
-def _build_cv_info(metrics_all: dict, *, primary_name: Optional[str]) -> tuple[Optional[CVInfo], float, bool, bool]:
+def _build_cv_info(metrics_all: dict, *, primary_name: Optional[str]) -> tuple[Optional[CVInfo], Optional[float], bool, bool]:
     """Returns (cv_info | None, test_score_override, is_cv, has_holdout)."""
     is_cv = bool(metrics_all.get("cv", False))
     if not is_cv:
-        return None, 0.0, False, False
+        return None, None, False, False
 
     has_holdout = bool(metrics_all.get("has_holdout_test", False))
     cv_summary = metrics_all.get("cv_summary") if isinstance(metrics_all.get("cv_summary"), dict) else None
     holdout_metrics = metrics_all.get("holdout_test_metrics") if isinstance(metrics_all.get("holdout_test_metrics"), dict) else None
     cv_mean = metrics_all.get("cv_mean") if isinstance(metrics_all.get("cv_mean"), dict) else None
 
-    test_score_override = 0.0
+    test_score_override: Optional[float] = None
     if primary_name:
         if has_holdout and isinstance(holdout_metrics, dict):
             raw = holdout_metrics.get(primary_name)
@@ -334,6 +420,7 @@ def _build_metrics_summary(mget: callable, task_type: str) -> MetricsSummary:
         r2=mget("r2") if task_type == "regression" else None,
         rmse=mget("rmse") if task_type == "regression" else None,
         mae=mget("mae") if task_type == "regression" else None,
+        mse=mget("mse") if task_type == "regression" else None,
     )
 
 
@@ -364,7 +451,7 @@ def model_to_list_result(
     # Determine test_score: CV override > primary_score > 0
     ps_block = metrics_all.get("primary_score") if isinstance(metrics_all.get("primary_score"), dict) else {}
     raw_test = ps_block.get("value")
-    test_score = cv_test_score if is_cv and cv_test_score else (float(raw_test) if raw_test is not None else primary.value)
+    test_score = cv_test_score if is_cv and cv_test_score is not None else (float(raw_test) if raw_test is not None else primary.value)
 
     return ModelResultResponse(
         id=str(m.id),
@@ -383,6 +470,8 @@ def model_to_list_result(
         testLabel=metrics_all.get("test_label") or None,
         splitInfo=_build_split_summary(metrics_all, artifacts),
         automl=_build_automl_info(metrics_all, artifacts),
+        evaluationSource=_build_evaluation_source(metrics_all),
+        warnings=flat_metrics.get("warnings", []) if isinstance(flat_metrics.get("warnings"), list) else [],
     )
 
 
@@ -408,9 +497,10 @@ def model_to_detail_result(
 
     ps_block = metrics_all.get("primary_score") if isinstance(metrics_all.get("primary_score"), dict) else {}
     raw_test = ps_block.get("value")
-    test_score = cv_test_score if is_cv and cv_test_score else (float(raw_test) if raw_test is not None else primary.value)
+    test_score = cv_test_score if is_cv and cv_test_score is not None else (float(raw_test) if raw_test is not None else primary.value)
 
     baseline = artifacts.get("baseline_majority")
+    raw_artifact_warnings = artifacts.get("artifact_warnings") or []
     analysis = AnalysisBlock(
         crossValidation=cv_info,
         thresholding=_build_threshold_info(artifacts),
@@ -420,6 +510,7 @@ def model_to_detail_result(
         classDistribution=artifacts.get("class_distribution"),
         baselineMajority=float(baseline) if baseline is not None else None,
         metricsWarnings=flat_metrics.get("warnings", []) if isinstance(flat_metrics.get("warnings"), list) else [],
+        artifactWarnings=[w for w in raw_artifact_warnings if isinstance(w, dict) and w.get("artifact") in {"residual_analysis"}],
     )
 
     return ModelResultDetailResponse(
@@ -439,6 +530,7 @@ def model_to_detail_result(
         testLabel=metrics_all.get("test_label") or None,
         splitInfo=_build_split_summary(metrics_all, artifacts),
         automl=_build_automl_info(metrics_all, artifacts),
+        evaluationSource=_build_evaluation_source(metrics_all),
         metricsDetailed=flat_metrics,
         analysis=analysis,
         preprocessing=artifacts.get("preprocessing"),
@@ -466,10 +558,13 @@ def model_to_explainability(m: TrainedModel) -> ExplainabilityResponse:
                 except Exception:
                     pass
 
+    raw_artifact_warnings = artifacts.get("artifact_warnings") or []
+    explainability_artifacts = {"permutation_importance", "shap"}
     return ExplainabilityResponse(
         featureImportance=feature_importance,
         permutationImportance=artifacts.get("permutation_importance"),
         shapGlobal=artifacts.get("shap"),
+        artifactWarnings=[w for w in raw_artifact_warnings if isinstance(w, dict) and w.get("artifact") in explainability_artifacts],
     )
 
 
@@ -477,11 +572,13 @@ def model_to_curves(m: TrainedModel) -> CurvesResponse:
     """Serialise les courbes ROC, PR, calibration et d'apprentissage."""
     artifacts: dict = m.artifacts_json or {}
     curves = artifacts.get("curves") if isinstance(artifacts.get("curves"), dict) else {}
+    raw_artifact_warnings = artifacts.get("artifact_warnings") or []
     return CurvesResponse(
         roc=curves.get("roc"),
         pr=curves.get("pr"),
         calibration=curves.get("calibration"),
         learningCurves=artifacts.get("learning_curves"),
+        artifactWarnings=[w for w in raw_artifact_warnings if isinstance(w, dict) and w.get("artifact") == "learning_curves"],
     )
 
 

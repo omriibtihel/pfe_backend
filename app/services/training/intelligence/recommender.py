@@ -92,8 +92,8 @@ def _recommend_k_folds(profile: DatasetProfile) -> int:
 
 
 def _col_power_transform(col_stat: dict[str, Any]) -> str:
-    """Non-normal → yeo_johnson. Normal → none. Box-Cox never auto-recommended (requires X > 0)."""
-    return "none" if col_stat["is_normal"] else "yeo_johnson"
+    """Non-normal (practical) → yeo_johnson. Normal → none."""
+    return "none" if col_stat["is_normal_practical"] else "yeo_johnson"
 
 
 def _col_scaling(col_stat: dict[str, Any]) -> str:
@@ -101,7 +101,7 @@ def _col_scaling(col_stat: dict[str, Any]) -> str:
     After yeo_johnson the distribution is ~Gaussian → standard is optimal.
     For already-normal data: robust if |sk| ≥ 1.0 (outliers), else standard.
     """
-    if not col_stat["is_normal"]:
+    if not col_stat["is_normal_practical"]:
         return "standard"          # post-transform data is ~Gaussian
     if col_stat["abs_skewness"] >= 1.0:
         return "robust"            # normal but with notable outlier influence

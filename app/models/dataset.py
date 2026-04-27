@@ -43,6 +43,13 @@ class Dataset(Base):
         nullable=True,
         index=True,
     )
+    # raw_workspace: dataset source dont ce workspace est une copie isolée
+    workspace_source_dataset_id = Column(
+        Integer,
+        ForeignKey("datasets.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     is_workspace_active = Column(Boolean, nullable=False, default=True)
     workspace_expires_at = Column(DateTime, nullable=True)
@@ -51,7 +58,6 @@ class Dataset(Base):
     # relationships
     # =========================
 
-    # ⚠️ IMPORTANT: préciser foreign_keys car Project a active_dataset_id -> datasets.id
     project = relationship(
         "Project",
         back_populates="datasets",

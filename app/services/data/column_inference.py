@@ -1,6 +1,101 @@
 import pandas as pd
+import numpy as np
 
 KINDS = {"numeric","categorical","text","binary","datetime","id","other"}
+
+
+_ALL_NONE = {
+    "skewness": None, "outlier_count": None, "outlier_ratio": None, "has_negative": None,
+    "min_val": None, "max_val": None, "mean_val": None, "median_val": None,
+    "q1_val": None, "q3_val": None,
+}
+
+def numeric_extra_stats(non_null: pd.Series) -> dict:
+    """Full numeric summary for a series (already stripped of NaN/inf by caller).
+
+    Basic stats (min/max/mean/median/quartiles/has_negative) require ≥ 1 value.
+    Skewness and IQR-based outlier detection require ≥ 4 values.
+    Returns all-None for an empty series.
+    """
+    from scipy.stats import skew as _skew  # lazy import
+
+    data = non_null.to_numpy(dtype=float)
+    if len(data) == 0:
+        return dict(_ALL_NONE)
+
+    q1 = float(np.percentile(data, 25))
+    q3 = float(np.percentile(data, 75))
+    basic = {
+        "min_val":    float(data.min()),
+        "max_val":    float(data.max()),
+        "mean_val":   float(data.mean()),
+        "median_val": float(np.median(data)),
+        "q1_val":     q1,
+        "q3_val":     q3,
+        "has_negative": bool(float(data.min()) <= 0),
+    }
+
+    if len(data) < 4:
+        return {**basic, "skewness": None, "outlier_count": None, "outlier_ratio": None}
+
+    skewness = float(_skew(data))
+    iqr = q3 - q1
+    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    outlier_count = int(((data < lower) | (data > upper)).sum())
+    return {
+        **basic,
+        "skewness":     skewness,
+        "outlier_count": outlier_count,
+        "outlier_ratio": float(outlier_count / len(data)),
+    }
+
+
+
+def detect_parasites(s: pd.Series) -> dict | None:
+    """
+    Detect non-numeric parasitic values in a column that should be numeric.
+
+    A column is "suspicious" when its dtype is object but >= 50% of non-null
+    values convert to a number. The non-convertible values are the parasites.
+
+    Returns:
+        {"count": int, "distinct": list[str] (max 5), "convertible_ratio": float}
+        or None if the column is already numeric / not suspicious / no parasites.
+    """
+    if (
+        pd.api.types.is_numeric_dtype(s)
+        or pd.api.types.is_datetime64_any_dtype(s)
+        or pd.api.types.is_bool_dtype(s)
+    ):
+        return None
+
+    non_null = s.dropna()
+    if len(non_null) == 0:
+        return None
+
+    converted = pd.to_numeric(non_null, errors="coerce")
+    convertible_ratio = float(converted.notna().mean())
+
+    if convertible_ratio < 0.50:
+        return None
+
+    parasite_mask = converted.isna()
+    count = int(parasite_mask.sum())
+    if count == 0:
+        return None
+
+    distinct = (
+        non_null[parasite_mask]
+        .astype(str)
+        .value_counts()
+        .head(5)
+        .index.tolist()
+    )
+    return {
+        "count": count,
+        "distinct": distinct,
+        "convertible_ratio": round(convertible_ratio, 4),
+    }
 
 _BIN_STR = {"0","1","true","false","yes","no","y","n","oui","non","vrai","faux"}
 

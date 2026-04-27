@@ -101,9 +101,6 @@ def delete_project(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
 
     try:
-        project.active_dataset_id = None
-        db.flush()
-
         db.delete(project)
         db.commit()
         return None

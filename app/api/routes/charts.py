@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import ensure_project_owner, get_current_user, get_db
 from app.api.utils_shared.datasets import get_dataset_or_404
 from app.api.utils_shared.df import read_df
+from app.services.data.normality import NormalityAnalyzer, report_to_dict
 
 router = APIRouter()
 
@@ -301,12 +302,6 @@ def normality_test(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Test de normalité par colonne numérique.
-    - Shapiro-Wilk pour n <= 5000 (scipy.stats.shapiro)
-    - D'Agostino-Pearson pour n > 5000 (scipy.stats.normaltest)
-    Retourne stat, p_value, is_normal (seuil α = 0.05) + descriptives.
-    """
     ensure_project_owner(db, project_id, current_user.id)
     ds = get_dataset_or_404(db, project_id, dataset_id)
 
@@ -318,41 +313,5 @@ def normality_test(
     df.columns = df.columns.astype(str)
     _ensure_cols_exist(df, body.columns)
 
-    results = []
-    for col in body.columns:
-        s = pd.to_numeric(df[col], errors="coerce").dropna()
-
-        if len(s) < 3:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Column '{col}' has fewer than 3 non-null numeric values.",
-            )
-
-        data = s.to_numpy(dtype=float)
-        n = len(data)
-
-        if n <= 5000:
-            stat, p_value = stats.shapiro(data)
-            test_used = "shapiro"
-        else:
-            stat, p_value = stats.normaltest(data)
-            test_used = "dagostino"
-
-        skewness = float(stats.skew(data))
-        # scipy kurtosis() retourne l'excès de kurtosis (Fisher) → on ajoute 3 pour Pearson
-        kurtosis = float(stats.kurtosis(data) + 3)
-
-        results.append({
-            "col": col,
-            "n": n,
-            "mean": float(np.mean(data)),
-            "std": float(np.std(data, ddof=1)),
-            "skewness": skewness,
-            "kurtosis": kurtosis,
-            "test_used": test_used,
-            "stat": float(stat),
-            "p_value": float(p_value),
-            "is_normal": bool(p_value > 0.05),
-        })
-
-    return {"results": results}
+    report = NormalityAnalyzer().analyze_columns(df, body.columns)
+    return report_to_dict(report)

@@ -234,6 +234,44 @@ def _default_decision_for_non_classification() -> BalancingDecision:
     )
 
 
+def _smote_minority_guard(
+    decision: BalancingDecision,
+    y_train_fold: np.ndarray,
+) -> tuple[BalancingDecision, Optional[str]]:
+    """Downgrade a SMOTE decision to "no resampling" when the minority class
+    is too small for ``k_neighbors``-based interpolation.
+
+    SMOTE / SMOTETomek require at least ``k_neighbors + 1`` minority samples
+    to draw nearest neighbours from; on smaller folds the resampler will
+    either raise (failing the fold) or generate degenerate synthetic samples
+    that all collapse onto the same point. The LOO and K-Fold pipelines
+    share this guard so behaviour is consistent across CV strategies.
+
+    Returns ``(decision, warning)``:
+      * ``warning is None`` — no guard triggered, original decision returned.
+      * ``warning`` is a structured string suitable for logging and for the
+        per-fold ``warnings`` list surfaced to the frontend.
+    """
+    strategy = str(getattr(decision, "strategy", "") or "").lower()
+    if strategy not in {"smote", "smote_tomek"}:
+        return decision, None
+    y_arr = np.asarray(y_train_fold)
+    if y_arr.size == 0:
+        return decision, None
+    _, counts = np.unique(y_arr, return_counts=True)
+    if counts.size == 0:
+        return decision, None
+    min_count = int(counts.min())
+    k = int(getattr(decision, "smote_k_neighbors", None) or 5)
+    if min_count <= k:
+        warning = (
+            f"smote_skipped_minority_too_small "
+            f"(strategy={strategy}, min_count={min_count}, k_neighbors={k})"
+        )
+        return _default_decision_for_non_classification(), warning
+    return decision, None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CV helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -438,7 +476,7 @@ def _run_holdout(
             random_state_used=split.random_state_used,
             train=class_counts(np.asarray(split.y_train)),
             val=class_counts(np.asarray(split.y_val)) if split.y_val is not None else {},
-            test=class_counts(np.asarray(split.y_test)),
+            test=class_counts(np.asarray(split.y_test)) if split.y_test is not None else {},
         )
 
     if split.X_train is None or len(split.X_train) == 0:
@@ -700,7 +738,11 @@ def _run_holdout(
     else:
         val_eval = None
 
-    test_eval = evaluator.evaluate(fitted_pipe, split.X_test, np.asarray(split.y_test), threshold=optimal_threshold)
+    test_eval = (
+        evaluator.evaluate(fitted_pipe, split.X_test, np.asarray(split.y_test), threshold=optimal_threshold)
+        if split.X_test is not None and split.y_test is not None and len(split.X_test) > 0
+        else None
+    )
 
     class_distribution = None
     confusion_matrix = None
@@ -708,19 +750,19 @@ def _run_holdout(
         class_distribution = {
             "train": class_counts(np.asarray(split.y_train)),
             "val": class_counts(np.asarray(split.y_val)) if split.y_val is not None else {},
-            "test": class_counts(np.asarray(split.y_test)),
+            "test": class_counts(np.asarray(split.y_test)) if split.y_test is not None else {},
             "train_minority_ratio": minority_ratio(np.asarray(split.y_train)),
             "val_minority_ratio": minority_ratio(np.asarray(split.y_val)) if split.y_val is not None else None,
-            "test_minority_ratio": minority_ratio(np.asarray(split.y_test)),
+            "test_minority_ratio": minority_ratio(np.asarray(split.y_test)) if split.y_test is not None else None,
         }
-        confusion_matrix = test_eval.confusion_matrix
+        confusion_matrix = test_eval.confusion_matrix if test_eval is not None else None
         _log_event(
             "training.class_distribution",
             model_type=model_type_norm,
             class_distribution=class_distribution,
         )
 
-        eval_blocks: Dict[str, Any] = {"train": train_eval.metrics, "test": test_eval.metrics}
+        eval_blocks: Dict[str, Any] = {"train": train_eval.metrics, "test": test_eval.metrics if test_eval is not None else {}}
         if val_metrics is not None:
             eval_blocks["val"] = val_metrics
         for split_name, split_metrics in eval_blocks.items():
@@ -792,18 +834,22 @@ def _run_holdout(
     artifacts["hyperparams"] = hyperparams_artifacts
 
     # Bootstrap confidence intervals on the test set (skipped if test set < 10 samples)
-    _ci_y_proba, _ci_y_score = get_proba_or_score(fitted_pipe, split.X_test)
-    _ci_score_vec: Optional[np.ndarray] = None
-    if _ci_y_proba is not None and _ci_y_proba.ndim == 2 and _ci_y_proba.shape[1] == 2:
-        _ci_score_vec = _ci_y_proba[:, 1]
-    elif _ci_y_score is not None and _ci_y_score.ndim == 1:
-        _ci_score_vec = _ci_y_score
-    bootstrap_cis = compute_bootstrap_cis(
-        split.y_test,
-        test_eval.predictions,
-        y_score=_ci_score_vec,
-        task_type=cfg.task_type,
-    )
+    bootstrap_cis = None
+    if test_eval is not None and split.X_test is not None and split.y_test is not None:
+        _ci_y_proba, _ci_y_score = get_proba_or_score(fitted_pipe, split.X_test)
+        _ci_score_vec: Optional[np.ndarray] = None
+        if _ci_y_proba is not None and _ci_y_proba.ndim == 2 and _ci_y_proba.shape[1] == 2:
+            _ci_score_vec = _ci_y_proba[:, 1]
+        elif _ci_y_score is not None and _ci_y_score.ndim == 1:
+            _ci_score_vec = _ci_y_score
+        bootstrap_cis = compute_bootstrap_cis(
+            split.y_test,
+            test_eval.predictions,
+            y_score=_ci_score_vec,
+            task_type=cfg.task_type,
+        )
+
+    artifact_warnings: list[dict] = []
 
     # Learning curves on preprocessed training data (fresh model, no SMOTE).
     # Skipped when training time is slow (search_type != "none") to avoid doubling runtime.
@@ -817,15 +863,16 @@ def _run_holdout(
                 np.asarray(split.y_train),
                 task_type=cfg.task_type,
             )
-        except Exception:
+        except Exception as e:
             _lc_result = None
+            artifact_warnings.append({"artifact": "learning_curves", "error": type(e).__name__, "detail": str(e)})
 
     if _lc_result is not None:
         artifacts["learning_curves"] = _lc_result
 
     # Permutation importance + residual analysis on the test set.
     # Only computed when the test set is large enough to be meaningful.
-    if len(np.asarray(split.y_test)) >= 20:
+    if test_eval is not None and split.X_test is not None and split.y_test is not None and len(np.asarray(split.y_test)) >= 20:
         try:
             _pi_result = compute_permutation_importance(
                 fitted_pipe,
@@ -836,8 +883,8 @@ def _run_holdout(
             )
             if _pi_result is not None:
                 artifacts["permutation_importance"] = _pi_result
-        except Exception:
-            pass
+        except Exception as e:
+            artifact_warnings.append({"artifact": "permutation_importance", "error": type(e).__name__, "detail": str(e)})
 
         try:
             _ra_result = compute_residuals(
@@ -847,8 +894,8 @@ def _run_holdout(
             )
             if _ra_result is not None:
                 artifacts["residual_analysis"] = _ra_result
-        except Exception:
-            pass
+        except Exception as e:
+            artifact_warnings.append({"artifact": "residual_analysis", "error": type(e).__name__, "detail": str(e)})
 
         # Global SHAP — computed after permutation importance.
         # KernelExplainer can be slow; skipped for search_type != "none"
@@ -863,19 +910,34 @@ def _run_holdout(
             ) if _shap_allowed else None
             if _shap_result is not None:
                 artifacts["shap"] = _shap_result
-        except Exception:
-            pass
+        except Exception as e:
+            artifact_warnings.append({"artifact": "shap", "error": type(e).__name__, "detail": str(e)})
 
+    if artifact_warnings:
+        artifacts["artifact_warnings"] = artifact_warnings
+
+    has_real_test = test_eval is not None
     metrics_json: Dict[str, Any] = {
         "train": train_eval.metrics,
-        "test": test_eval.metrics,
+        "test": test_eval.metrics if has_real_test else {},
         "training_time_sec": float(time.perf_counter() - t0),
         "threshold_used": optimal_threshold,
         "threshold_source": threshold_source,
         "confidence_intervals": bootstrap_cis,
     }
-    if hp_warnings:
-        metrics_json["warnings"] = list(hp_warnings)
+    metrics_json["has_holdout_test"] = has_real_test
+    metrics_json["test_is_cv_mean"] = False
+    if has_real_test:
+        metrics_json["test_label"] = "Holdout test set"
+    else:
+        metrics_json["test_label"] = "Entraînement uniquement — aucun jeu de test"
+        metrics_json["evaluation_strategy"] = "train_only"
+    postfit_w: list[str] = list(executor.postfit_warnings or [])
+    all_warnings: list[str] = list(hp_warnings) + postfit_w + [
+        f"Artefact {w['artifact']} non calculé ({w['error']})" for w in artifact_warnings
+    ]
+    if all_warnings:
+        metrics_json["warnings"] = all_warnings
     if val_metrics is not None:
         metrics_json["val"] = val_metrics
 
@@ -1139,6 +1201,9 @@ def _run_kfold_cv(
 
     actual_k = len(folds_list)
     fold_results: List[Dict[str, Any]] = []
+    # OOF predictions accumulated for leakage-free threshold calibration.
+    oof_proba_parts: list = []
+    oof_true_parts: list = []
 
     # ── Per-fold loop ─────────────────────────────────────────────────────────
     for fold_idx, (train_idx, val_idx) in enumerate(folds_list):
@@ -1207,7 +1272,21 @@ def _run_kfold_cv(
             X_f = X_train_prep
             y_f = np.asarray(y_train_fold)
             fold_fit_params: Dict[str, Any] = {}
+            fold_warnings: list[str] = []
             if cfg.task_type == "classification":
+                # SMOTE guard: when the minority class on this fold is too
+                # small for k_neighbors interpolation, fall back to "no
+                # resampling" instead of letting imblearn raise. Mirrors the
+                # LOO guard so behaviour is consistent across CV strategies.
+                fold_decision, _smote_warn = _smote_minority_guard(fold_decision, y_train_fold)
+                if _smote_warn is not None:
+                    fold_warnings.append(_smote_warn)
+                    _log_event(
+                        "training.cv.fold_smote_skipped",
+                        fold=fold_num,
+                        model_type=model_type_norm,
+                        reason=_smote_warn,
+                    )
                 # Convert sparse → dense ONLY when resampler requires it
                 if fold_decision.strategy in {"smote", "smote_tomek", "random_undersampling"}:
                     if hasattr(X_train_prep, "toarray"):
@@ -1263,6 +1342,16 @@ def _run_kfold_cv(
             )
             val_eval = evaluator.evaluate(fold_pipeline, X_val_prep, np.asarray(y_val_fold))
 
+            # Collect OOF predictions for leakage-free threshold calibration.
+            if cfg.task_type == "classification":
+                _pp_fn = getattr(fold_pipeline, "predict_proba", None)
+                if callable(_pp_fn):
+                    try:
+                        oof_proba_parts.append(np.asarray(_pp_fn(X_val_prep)))
+                        oof_true_parts.append(np.asarray(y_val_fold))
+                    except Exception:
+                        pass
+
             smote_added: Optional[int] = None
             if cfg.task_type == "classification" and fold_decision.strategy in {"smote", "smote_tomek"}:
                 smote_added = int(len(y_f) - len(y_train_fold))
@@ -1287,6 +1376,7 @@ def _run_kfold_cv(
                 "smote_samples_added": smote_added,
                 "class_distribution": fold_class_dist,
                 "best_inner_params": fold_best_inner_params,
+                "warnings": list(fold_warnings),
             })
             _log_event("training.cv.fold_ok", fold=fold_num, model_type=model_type_norm)
 
@@ -1438,18 +1528,49 @@ def _run_kfold_cv(
         fe_transformer=final_fe,
     )
 
-    # Threshold + audit — calibrated on X_refit (never on test set)
+    # Threshold + audit — prefer OOF predictions for leakage-free calibration.
     optimal_threshold = 0.5
     threshold_f1_gain: Optional[float] = None
+    threshold_calibration_source = "not_applicable"
     if cfg.task_type == "classification":
         # Threshold optimization is binary-only: disable it for multiclass with explicit warning.
         _cv_multiclass_threshold_disabled = False
         if final_decision.apply_threshold and len(np.unique(np.asarray(y_refit))) > 2:
             final_decision.apply_threshold = False
             _cv_multiclass_threshold_disabled = True
-        optimal_threshold = final_executor.apply_postfit(
-            fitted_pipe, X_refit, y_refit, final_decision
+
+        # Build OOF arrays from per-fold predictions accumulated above.
+        oof_proba_arr: Optional[np.ndarray] = None
+        oof_true_arr: Optional[np.ndarray] = None
+        if oof_proba_parts and oof_true_parts:
+            try:
+                oof_proba_arr = np.vstack(oof_proba_parts)
+                oof_true_arr = np.concatenate(oof_true_parts)
+            except Exception:
+                oof_proba_arr = None
+                oof_true_arr = None
+
+        oof_available = (
+            oof_proba_arr is not None
+            and oof_true_arr is not None
+            and oof_proba_arr.shape[0] > 0
         )
+        if oof_available:
+            optimal_threshold = final_executor.apply_postfit_from_oof(
+                y_true=oof_true_arr,
+                y_proba=oof_proba_arr,
+                decision=final_decision,
+                model_classes=getattr(final_fitted_model, "classes_", None),
+            )
+            threshold_calibration_source = "oof"
+        else:
+            optimal_threshold = final_executor.apply_postfit(
+                fitted_pipe, X_refit, y_refit, final_decision
+            )
+            threshold_calibration_source = "train_refit"
+            final_executor.postfit_warnings.append(
+                "threshold_calibrated_on_train_data_may_be_optimistic"
+            )
         if final_executor.last_threshold_result is not None:
             threshold_f1_gain = float(final_executor.last_threshold_result.improvement_delta)
         if _cv_multiclass_threshold_disabled:
@@ -1561,8 +1682,10 @@ def _run_kfold_cv(
     }
     if has_holdout_test and holdout_test_metrics is not None:
         metrics_json["holdout_test_metrics"] = holdout_test_metrics
+    metrics_json["threshold_source"] = threshold_calibration_source
     cv_instability = cv_summary.get("instability_warnings", [])
-    all_warnings: list[str] = list(hp_warnings) + list(cv_instability)
+    postfit_w = list(getattr(final_executor, "postfit_warnings", None) or [])
+    all_warnings: list[str] = list(hp_warnings) + list(cv_instability) + postfit_w
     if all_warnings:
         metrics_json["warnings"] = all_warnings
 
@@ -1723,6 +1846,7 @@ def _run_loo(
             y_f = np.asarray(y_train_fold)
             fold_fit_params: Dict[str, Any] = {}
 
+            fold_warnings: list[str] = []
             if cfg.task_type == "classification":
                 fold_profile = profile_binary_dataset(y_train_fold, X_train_fold.shape)
                 fold_decision = resolve(
@@ -1733,13 +1857,17 @@ def _run_loo(
                     model_supports_sample_weight=capabilities["supports_sample_weight"],
                     random_state=cfg.random_state,
                 )
-                # SMOTE guard: disable when minority class too small for k_neighbors
-                if fold_decision.strategy in {"smote", "smote_tomek"}:
-                    _vals, _cts = np.unique(y_train_fold, return_counts=True)
-                    _min_ct = int(_cts.min()) if len(_cts) else 0
-                    _k = int(getattr(fold_decision, "smote_k_neighbors", None) or 5)
-                    if _min_ct <= _k:
-                        fold_decision = _default_decision_for_non_classification()
+                # SMOTE guard: shared with the K-Fold path so behaviour is
+                # identical when the minority class is too small for SMOTE.
+                fold_decision, _smote_warn = _smote_minority_guard(fold_decision, y_train_fold)
+                if _smote_warn is not None:
+                    fold_warnings.append(_smote_warn)
+                    _log_event(
+                        "training.loo.fold_smote_skipped",
+                        fold=fold_num,
+                        model_type=model_type_norm,
+                        reason=_smote_warn,
+                    )
                 if fold_decision.strategy in {"smote", "smote_tomek", "random_undersampling"}:
                     if hasattr(X_train_prep, "toarray"):
                         X_train_prep = X_train_prep.toarray()
@@ -1775,6 +1903,7 @@ def _run_loo(
                 "status": "ok",
                 "train_size": int(len(y_train_fold)),
                 "val_size": 1,
+                "warnings": list(fold_warnings),
             })
             n_ok += 1
 
@@ -1794,26 +1923,7 @@ def _run_loo(
     y_proba_arr = np.asarray(y_proba_loo) if y_proba_loo else None
 
     if cfg.task_type == "classification":
-        from app.services.training.pipeline.metrics import get_class_labels as _gcl
-        # Fit a quick dummy model on all data to extract class labels
-        _dummy_schema = build_training_schema(
-            X=X_all, target=cfg.target_column,
-            preprocessing_config=effective_preprocessing.as_dict(),
-        )
-        _dummy_aligner = ColumnAligner(
-            feature_names=_dummy_schema["feature_names"],
-            dtypes=_dummy_schema["dtypes"],
-        )
-        _dummy_spec = build_preprocessor(X_all, effective_preprocessing, kind_overrides=kind_overrides)
-        _X_prep = _dummy_spec.preprocessor.fit_transform(
-            _dummy_aligner.fit_transform(X_all), y_all
-        )
-        if model_type_norm in _DENSE_REQUIRED_MODELS:
-            _X_prep = _ensure_dense_matrix(_X_prep)
-        _dummy_model = build_model(model_type_norm, cfg.task_type, base_estimator_hp)
-        _dummy_pipe = Pipeline([("model", _dummy_model)])
-        _dummy_pipe.fit(_X_prep, y_all)
-        _labels = _gcl(_dummy_pipe)
+        _labels = np.unique(y_all)
 
         y_score_loo = None
         if y_proba_arr is not None:
@@ -1827,7 +1937,7 @@ def _run_loo(
             y_proba=y_proba_arr,
             y_score=y_score_loo,
             labels=_labels,
-            estimator=_dummy_pipe,
+            estimator=None,
             positive_label=resolved_positive_label,
             requested_metrics=list(cfg.metrics),
             task_type=cfg.task_type,
@@ -1944,10 +2054,45 @@ def _run_loo(
 
     optimal_threshold = 0.5
     threshold_f1_gain: Optional[float] = None
+    threshold_calibration_source = "disabled"
     if cfg.task_type == "classification":
         if final_decision.apply_threshold and len(np.unique(y_all)) > 2:
             final_decision.apply_threshold = False
-        optimal_threshold = final_executor.apply_postfit(fitted_pipe, X_all, y_all, final_decision)
+
+        # Prefer leakage-free OOF threshold calibration: y_true_loo and
+        # y_proba_loo were collected per fold and contain only out-of-sample
+        # predictions — the closest analogue of a validation set available in
+        # the LOO regime. Fall back to (X_all, y_all) only when those arrays
+        # are unavailable, and surface a warning when the fallback fires
+        # (mirrors the holdout pattern at orchestrator.py:673).
+        oof_proba_arr = np.asarray(y_proba_loo) if y_proba_loo else None
+        oof_true_arr = np.asarray(y_true_loo) if y_true_loo else None
+        oof_available = (
+            final_decision.apply_threshold
+            and oof_proba_arr is not None
+            and oof_true_arr is not None
+            and oof_true_arr.size > 0
+            and oof_proba_arr.size > 0
+        )
+
+        if oof_available:
+            optimal_threshold = final_executor.apply_postfit_from_oof(
+                y_true=oof_true_arr,
+                y_proba=oof_proba_arr,
+                decision=final_decision,
+                model_classes=getattr(final_fitted_model, "classes_", None),
+            )
+            threshold_calibration_source = "loo_oof"
+        else:
+            optimal_threshold = final_executor.apply_postfit(
+                fitted_pipe, X_all, y_all, final_decision
+            )
+            if final_decision.apply_threshold:
+                threshold_calibration_source = "train_fallback"
+                if optimal_threshold != 0.5:
+                    final_executor.postfit_warnings.append(
+                        "threshold_calibrated_on_train_data_may_be_optimistic"
+                    )
         if final_executor.last_threshold_result is not None:
             threshold_f1_gain = float(final_executor.last_threshold_result.improvement_delta)
         if final_profile is not None:
@@ -1965,7 +2110,11 @@ def _run_loo(
                 postfit_warnings=list(final_executor.postfit_warnings or []),
             )
 
-    _log_event("training.loo.refit_end", model_type=model_type_norm)
+    _log_event(
+        "training.loo.refit_end",
+        model_type=model_type_norm,
+        threshold_calibration_source=threshold_calibration_source,
+    )
 
     # ── Artifacts and metrics_json ────────────────────────────────────────────
     reporter = Reporter()
@@ -2002,14 +2151,21 @@ def _run_loo(
         "loo_metrics": loo_metrics,
         "cv_mean": loo_flat,
         "test": loo_metrics,
+        "test_is_cv_mean": True,
+        "test_label": "LOO validation",
+        "evaluation_strategy": "loo",
         "has_holdout_test": False,
         "fold_results": fold_results,
         "cv_summary": cv_summary,
         "training_time_sec": float(time.perf_counter() - t0),
         "threshold_used": optimal_threshold,
+        "threshold_source": threshold_calibration_source,
     }
     loo_instability = cv_summary.get("instability_warnings", [])
-    loo_all_warnings: list[str] = list(hp_warnings) + list(loo_instability)
+    # Include postfit_warnings (e.g. threshold_calibrated_on_train_data_may_be_optimistic)
+    # so the frontend can surface threshold-related issues alongside the others.
+    loo_postfit_warnings = list(final_executor.postfit_warnings or [])
+    loo_all_warnings: list[str] = list(hp_warnings) + list(loo_instability) + loo_postfit_warnings
     if loo_all_warnings:
         metrics_json["warnings"] = loo_all_warnings
 

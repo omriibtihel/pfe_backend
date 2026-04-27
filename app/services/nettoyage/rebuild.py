@@ -23,9 +23,10 @@ ALLOWED_CLEANING_ACTIONS = {
     "drop_columns",
     "drop_duplicates",
     "drop_empty_rows",
+    "drop_empty_cols",
     "rename_columns",
     "strip_whitespace",
-    "substitute_values",  # ✅ added
+    "substitute_values",
 }
 
 STRICT_REBUILD = False
@@ -86,6 +87,32 @@ def _drop_empty_rows(
 
     mask_empty = work.isna().all(axis=1)
     return df.loc[~mask_empty].copy()
+
+
+def _drop_empty_cols(
+    df: pd.DataFrame,
+    cols: list[str] | None = None,
+    *,
+    strict: bool = STRICT_REBUILD,
+) -> tuple[pd.DataFrame, dict]:
+    candidates = df.columns.tolist()
+    if cols:
+        present, missing = _split_existing_missing(df, cols)
+        if missing and strict:
+            raise ValueError(f"Colonnes introuvables: {missing}")
+        candidates = present
+
+    empty_cols = []
+    for c in candidates:
+        s = df[c]
+        if pd.api.types.is_string_dtype(s) or pd.api.types.is_object_dtype(s):
+            s = s.astype("string").str.strip().replace("", pd.NA)
+        if s.isna().all():
+            empty_cols.append(c)
+
+    if not empty_cols:
+        return df, {"dropped_cols": []}
+    return df.drop(columns=empty_cols), {"dropped_cols": empty_cols}
 
 
 def _rename_columns(
@@ -392,6 +419,16 @@ def _apply_one(
             if missing:
                 extra["ignored_missing_cols"] = missing
         return _drop_empty_rows(df, cols=subset, strict=STRICT_REBUILD), extra
+
+    if action == "drop_empty_cols":
+        subset = cols if cols else None
+        if subset:
+            present, missing = _split_existing_missing(df, subset)
+            if missing:
+                extra["ignored_missing_cols"] = missing
+        df2, eff = _drop_empty_cols(df, cols=subset, strict=STRICT_REBUILD)
+        extra.update(eff)
+        return df2, extra
 
     if action == "rename_columns":
         mapping = params.get("mapping") or {}

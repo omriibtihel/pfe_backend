@@ -9,30 +9,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.api.utils_shared.df import read_df
 from app.schemas.database import CorrelationOut
+from app.services.data.column_inference import detect_parasites
 from app.schemas.dataset import DatasetPreviewOut, DatasetColumnOut
 from fastapi.encoders import jsonable_encoder
-from app.api.utils_shared.datasets import get_dataset_or_404
+from app.api.utils_shared.datasets import get_dataset_or_404, get_project_source_dataset_or_404
 import numpy as np
 
 
-
-
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.models.dataset import Dataset
 from app.schemas.database import (
     DatasetOverviewOut,
     DatasetProfileOut,
     TargetIn,
     TargetOut,
-    ActiveDatasetIn,
-    ActiveDatasetOut,
 )
 
 router = APIRouter()
-
-
-
-
 
 
 @router.get("/datasets/{dataset_id}/columns", response_model=List[DatasetColumnOut])
@@ -76,13 +68,9 @@ def dataset_preview(
     start = (page - 1) * page_size
     end = start + page_size
 
-
     chunk = df.iloc[start:end].copy()
-
     chunk = chunk.replace([np.inf, -np.inf], np.nan)
-
     chunk = chunk.where(pd.notnull(chunk), None)
-
 
     rows = jsonable_encoder(chunk.to_dict(orient="records"))
 
@@ -135,12 +123,6 @@ def dataset_profile(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Profil simple type Dataiku:
-    - numeric: count/mean/std/min/percentiles/max
-    - categorical/text: unique + top values
-    - datetime: unique + top values (string)
-    """
     ensure_project_owner(db, project_id, current_user.id)
     dataset = get_dataset_or_404(db, project_id, dataset_id)
 
@@ -219,14 +201,13 @@ def dataset_profile(
                 "name": name,
                 "kind": kind,
                 "dtype": dtype,
-
                 "missing": missing,
                 "missing_pct": round(missing_pct, 4),
                 "unique": unique,
                 "unique_pct": round(unique_pct, 4),
-
                 "numeric": numeric,
                 "categorical": categorical,
+                "parasites": detect_parasites(s),
             }
         )
 
@@ -236,6 +217,7 @@ def dataset_profile(
         "profiles": profiles,
     }
 
+
 @router.get("/datasets/{dataset_id}/correlation", response_model=CorrelationOut)
 def dataset_correlation(
     project_id: int,
@@ -244,21 +226,14 @@ def dataset_correlation(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Matrice de corrélation (Pearson) pour colonnes numériques.
-    Exemple:
-      /correlation?columns=age&columns=chol&columns=trestbps
-    """
     ensure_project_owner(db, project_id, current_user.id)
     dataset = get_dataset_or_404(db, project_id, dataset_id)
 
     df = read_df(Path(dataset.file_path))
 
-    # normaliser colonnes (backend travaille en str)
     df_cols = df.columns.astype(str).tolist()
     cols = [str(c) for c in columns]
 
-    # 1) vérifier existence
     missing_cols = [c for c in cols if c not in df_cols]
     if missing_cols:
         raise HTTPException(
@@ -266,15 +241,11 @@ def dataset_correlation(
             detail=f"Columns not found in dataset: {', '.join(missing_cols)}",
         )
 
-    # 2) extraire + forcer numérique
     sub = df[cols].copy()
 
-    # Si des colonnes sont "object" mais contiennent des nombres en texte,
-    # on tente de convertir. Si ça échoue (trop de NaN), on refuse.
     for c in cols:
         if not pd.api.types.is_numeric_dtype(sub[c]):
             converted = pd.to_numeric(sub[c], errors="coerce")
-            # si quasi tout devient NaN => pas une vraie colonne numérique
             if converted.notna().sum() < max(3, int(0.1 * len(converted))):
                 raise HTTPException(
                     status_code=400,
@@ -282,58 +253,21 @@ def dataset_correlation(
                 )
             sub[c] = converted
 
-    # 3) corr
     corr = sub.corr(method="pearson").fillna(0.0)
-
-    # 4) output
     matrix = corr.to_numpy(dtype=float).tolist()
     return {"columns": cols, "matrix": matrix}
 
-# ---------- Active dataset ----------
-@router.get("/datasets/active", response_model=ActiveDatasetOut)
-def get_active_dataset(
-    project_id: int,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    project = ensure_project_owner(db, project_id, current_user.id)
-    return {"active_dataset_id": project.active_dataset_id}
 
-
-@router.post("/datasets/active", response_model=ActiveDatasetOut)
-def set_active_dataset(
-    project_id: int,
-    payload: ActiveDatasetIn,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    project = ensure_project_owner(db, project_id, current_user.id)
-
-    ds = (
-        db.query(Dataset)
-        .filter(Dataset.id == payload.dataset_id, Dataset.project_id == project_id)
-        .first()
-    )
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-
-    project.active_dataset_id = payload.dataset_id
-    db.add(project)
-    db.commit()
-    db.refresh(project)
-
-    return {"active_dataset_id": project.active_dataset_id}
-
-
-# ---------- Target column ----------
+# ---------- Target column (résolu sur le dataset source du projet) ----------
 @router.get("/target", response_model=TargetOut)
 def get_target(
     project_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    project = ensure_project_owner(db, project_id, current_user.id)
-    return {"target_column": project.target_column}
+    ensure_project_owner(db, project_id, current_user.id)
+    ds = get_project_source_dataset_or_404(db, project_id)
+    return {"target_column": ds.target_column}
 
 
 @router.put("/target", response_model=TargetOut)
@@ -343,19 +277,17 @@ def set_target(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    project = ensure_project_owner(db, project_id, current_user.id)
+    ensure_project_owner(db, project_id, current_user.id)
+    ds = get_project_source_dataset_or_404(db, project_id)
 
-    # validation: si on a un active dataset, vérifier que la colonne existe
-    if payload.target_column and project.active_dataset_id:
-        ds = get_dataset_or_404(db, project_id, project.active_dataset_id)
+    if payload.target_column:
         df = read_df(Path(ds.file_path))
         cols = {str(c) for c in df.columns}
         if payload.target_column not in cols:
-            raise HTTPException(status_code=400, detail="Target column not found in active dataset")
+            raise HTTPException(status_code=400, detail="Target column not found in source dataset")
 
-    project.target_column = payload.target_column
-    db.add(project)
+    ds.target_column = payload.target_column
+    db.add(ds)
     db.commit()
-    db.refresh(project)
-
-    return {"target_column": project.target_column}
+    db.refresh(ds)
+    return {"target_column": ds.target_column}

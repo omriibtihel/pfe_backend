@@ -12,6 +12,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .normality import NormalityAnalyzer
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public dataclass
@@ -35,11 +37,14 @@ class DatasetProfile:
     recommended_resampling: str | None    # None | one of BalancingStrategy values
     recommended_metric: str               # primary metric key
     meta_features: dict[str, Any] = field(default_factory=dict)
-    # Distribution analysis — populated by _distribution_stats
-    non_normal_ratio: float = 0.0         # fraction of numeric cols that failed normality test (p ≤ 0.05)
+    # Distribution analysis — populated by NormalityAnalyzer
+    non_normal_ratio: float = 0.0         # fraction of numeric cols that failed normality (practical)
     avg_skewness: float = 0.0             # mean |skewness| across tested numeric cols
     highly_skewed_count: int = 0          # number of cols with |skewness| ≥ 1.5
-    # Per-column distribution stats: {col: {is_normal, skewness, abs_skewness, n, test_used, p_value, has_missing}}
+    columns_capped: bool = False          # True when numeric cols exceeded the 50-col cap
+    columns_capped_count: int = 0         # number of cols that were dropped due to cap
+    transform_suggestions: dict[str, str] = field(default_factory=dict)  # col → recommended_transform
+    # Per-column distribution stats matching ColumnDistributionStat TypeScript interface
     column_distribution: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -68,11 +73,9 @@ def _training_speed(size_cat: str, n_features: int) -> str:
 def _infer_task_type(y: pd.Series) -> tuple[str, int | None]:
     """Return (task_type, n_classes).  Uses dtype + cardinality heuristic."""
     if pd.api.types.is_float_dtype(y):
-        # Could still be integer-valued floats used as labels
         unique_vals = y.dropna().unique()
         if len(unique_vals) > 20:
             return "regression", None
-        # Small number of float values → treat as categorical
         n = len(unique_vals)
         if n == 2:
             return "binary_classification", 2
@@ -167,85 +170,84 @@ def _missing_stats(df: pd.DataFrame) -> tuple[bool, float]:
     return bool(missing > 0), float(ratio)
 
 
-def _distribution_stats(df: pd.DataFrame, target_col: str) -> dict[str, Any]:
+_COL_CAP = 50
+
+
+def _distribution_stats(
+    df: pd.DataFrame, target_col: str
+) -> tuple[dict[str, dict[str, Any]], float, float, int, bool, int, dict[str, str]]:
     """
-    Normality analysis across numeric feature columns — mirrors /normality-test exactly.
-
-    Per-column decision (same as charts page):
-    - Shapiro-Wilk       when column n ≤ 5 000
-    - D'Agostino-Pearson when column n > 5 000
-
-    Caps at 50 columns for performance.
+    Run NormalityAnalyzer on numeric feature columns (capped at _COL_CAP).
 
     Returns:
-        non_normal_ratio    : fraction of tested cols that failed normality (p ≤ 0.05)
+        column_distribution : {col: ColumnDistributionStat-compatible dict}
+        non_normal_ratio    : fraction of tested cols that are not normal (practical)
         avg_skewness        : mean |skewness| across tested cols
         highly_skewed_count : cols with |skewness| ≥ 1.5
-        columns             : per-column stats dict used for individual recommendations
+        columns_capped      : True when col count exceeded cap
+        columns_capped_count: number of cols excluded
+        transform_suggestions: {col: recommended_transform} for non-"none" transforms
     """
-    from scipy import stats as _stats  # lazy import — scipy may be heavy in some envs
-
     features = df.drop(columns=[target_col], errors="ignore")
     num_cols = features.select_dtypes(include=[np.number]).columns.tolist()
 
     if not num_cols:
-        return {
-            "non_normal_ratio": 0.0, "avg_skewness": 0.0,
-            "highly_skewed_count": 0, "columns": {},
-        }
+        return {}, 0.0, 0.0, 0, False, 0, {}
 
-    num_cols = num_cols[:50]  # cap for performance
-    col_stats: dict[str, dict[str, Any]] = {}
-    non_normal = 0
+    columns_capped = len(num_cols) > _COL_CAP
+    columns_capped_count = max(0, len(num_cols) - _COL_CAP)
+    num_cols = num_cols[:_COL_CAP]
+
+    analyzer = NormalityAnalyzer()
+    report = analyzer.analyze_columns(features[num_cols], num_cols)
+
+    col_dist: dict[str, dict[str, Any]] = {}
     skewness_vals: list[float] = []
+    non_normal_count = 0
     highly_skewed = 0
+    transform_suggestions: dict[str, str] = {}
 
-    for col in num_cols:
-        series = features[col]
-        has_missing = bool(series.isnull().any())
-        data = series.dropna().to_numpy(dtype=float)
-        n = len(data)
-        if n < 8:  # too few values to test reliably
+    for r in report.results:
+        if r.error:
             continue
-
-        sk = float(_stats.skew(data))
-        abs_sk = abs(sk)
+        has_missing = bool(features[r.col].isnull().any())
+        abs_sk = abs(r.skewness) if r.skewness is not None else 0.0
         skewness_vals.append(abs_sk)
         if abs_sk >= 1.5:
             highly_skewed += 1
+        if not r.is_normal_practical:
+            non_normal_count += 1
+        if r.recommended_transform != "none":
+            transform_suggestions[r.col] = r.recommended_transform
 
-        if n <= 5_000:
-            _, p = _stats.shapiro(data)
-            test_used = "shapiro"
-        else:
-            _, p = _stats.normaltest(data)
-            test_used = "dagostino"
-
-        is_normal = bool(float(p) > 0.05)
-        if not is_normal:
-            non_normal += 1
-
-        # Box-Cox requires strictly positive values — flag columns that violate this
-        has_negative = bool(float(data.min()) <= 0)
-
-        col_stats[col] = {
-            "is_normal": is_normal,
-            "skewness": sk,
+        col_dist[r.col] = {
+            "is_normal_practical": r.is_normal_practical,
+            "skewness": r.skewness,
             "abs_skewness": abs_sk,
-            "n": n,
-            "test_used": test_used,
-            "p_value": float(p),
+            "excess_kurtosis": r.excess_kurtosis,
+            "n": r.n,
+            "test_used": r.test_used,
+            "p_value": r.p_value_corrected if r.p_value_corrected is not None else r.p_value,
             "has_missing": has_missing,
-            "has_negative": has_negative,
+            "has_non_positive": r.has_non_positive,
+            "skewness_level": r.skewness_level,
+            "distribution_shape": r.distribution_shape,
+            "recommended_transform": r.recommended_transform,
         }
 
     tested = len(skewness_vals)
-    return {
-        "non_normal_ratio": non_normal / tested if tested > 0 else 0.0,
-        "avg_skewness": float(np.mean(skewness_vals)) if skewness_vals else 0.0,
-        "highly_skewed_count": highly_skewed,
-        "columns": col_stats,
-    }
+    non_normal_ratio = non_normal_count / tested if tested > 0 else 0.0
+    avg_skewness = float(np.mean(skewness_vals)) if skewness_vals else 0.0
+
+    return (
+        col_dist,
+        non_normal_ratio,
+        avg_skewness,
+        highly_skewed,
+        columns_capped,
+        columns_capped_count,
+        transform_suggestions,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -283,7 +285,16 @@ class DatasetProfiler:
         cv_strategy = _recommended_cv(size_cat, task_type, n_samples, ir)
         resampling = _recommended_resampling(task_type, ir, mr)
         metric = _recommended_metric(task_type, ir)
-        dist = _distribution_stats(df_clean, target_column)
+
+        (
+            col_dist,
+            non_normal_ratio,
+            avg_skewness,
+            highly_skewed_count,
+            columns_capped,
+            columns_capped_count,
+            transform_suggestions,
+        ) = _distribution_stats(df_clean, target_column)
 
         meta: dict[str, Any] = {
             "class_distribution": (
@@ -313,8 +324,11 @@ class DatasetProfiler:
             recommended_resampling=resampling,
             recommended_metric=metric,
             meta_features=meta,
-            non_normal_ratio=dist["non_normal_ratio"],
-            avg_skewness=dist["avg_skewness"],
-            highly_skewed_count=dist["highly_skewed_count"],
-            column_distribution=dist["columns"],
+            non_normal_ratio=non_normal_ratio,
+            avg_skewness=avg_skewness,
+            highly_skewed_count=highly_skewed_count,
+            columns_capped=columns_capped,
+            columns_capped_count=columns_capped_count,
+            transform_suggestions=transform_suggestions,
+            column_distribution=col_dist,
         )

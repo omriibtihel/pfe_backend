@@ -26,6 +26,9 @@ class DatasetVersion(Base):
 
     operations_json = Column(Text, nullable=False, default="[]")
 
+    # Config de préparation ML (split, preprocessing, balancing…) sauvegardée depuis PreparationPage
+    preparation_config_json = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     source_dataset = relationship(

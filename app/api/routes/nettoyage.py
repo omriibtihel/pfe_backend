@@ -13,7 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.services.data.column_inference import infer_kind_for_series, detect_parasites
+from app.services.data.column_inference import infer_kind_for_series, detect_parasites, numeric_extra_stats
 from app.api.utils_shared.datasets import get_dataset_or_404
 from app.api.utils_shared.workspaces import create_fresh_workspace_for_dataset
 from app.services.nettoyage.df_utils import load_current_df, processed_path_for
@@ -57,33 +57,6 @@ def df_preview_payload(df: pd.DataFrame, page: int, page_size: int):
 # Columns meta
 # -----------------------------
 
-def _numeric_extra_stats(non_null: pd.Series) -> dict:
-    """Return skewness, IQR-based outlier stats, and has_negative for a numeric series.
-
-    Returns a dict with nullable values so non-numeric columns can pass None.
-    Requires at least 4 non-null values to produce meaningful results.
-    """
-    from scipy.stats import skew as _skew  # lazy import
-
-    data = non_null.to_numpy(dtype=float)
-    if len(data) < 4:
-        return {"skewness": None, "outlier_count": None, "outlier_ratio": None, "has_negative": None}
-
-    skewness = float(_skew(data))
-    q1, q3 = float(np.percentile(data, 25)), float(np.percentile(data, 75))
-    iqr = q3 - q1
-    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    outlier_count = int(((data < lower) | (data > upper)).sum())
-    outlier_ratio = float(outlier_count / len(data))
-    has_negative = bool(float(data.min()) <= 0)
-
-    return {
-        "skewness": skewness,
-        "outlier_count": outlier_count,
-        "outlier_ratio": outlier_ratio,
-        "has_negative": has_negative,
-    }
-
 
 def _columns_meta_payload(df: pd.DataFrame):
     cols = [str(c) for c in df.columns]
@@ -117,10 +90,11 @@ def _columns_meta_payload(df: pd.DataFrame):
         except Exception:
             sample_vals = []
 
+        from app.services.data.column_inference import _ALL_NONE
         extra = (
-            _numeric_extra_stats(non_null)
+            numeric_extra_stats(non_null)
             if pd.api.types.is_numeric_dtype(s2)
-            else {"skewness": None, "outlier_count": None, "outlier_ratio": None, "has_negative": None}
+            else dict(_ALL_NONE)
         )
 
         out_cols.append(
@@ -212,6 +186,32 @@ def _validate_cleaning_payload(payload: OperationIn, df_current: pd.DataFrame) -
             raise HTTPException(status_code=400, detail="substitute_values: 'case_sensitive' doit être un bool.")
 
     return action
+
+
+# -----------------------------
+# Alert configuration
+# -----------------------------
+
+class AlertConfigOut(BaseModel):
+    missing_high: float = 0.20
+    missing_low: float = 0.05
+    high_cardinality_ratio: float = 0.90
+    high_cardinality_min_uniq: int = 10
+    outlier_high: float = 0.15
+    outlier_moderate: float = 0.05
+    skewness: float = 2.0
+
+
+@router.get("/datasets/{dataset_id}/nettoyage/alert-config", response_model=AlertConfigOut)
+def get_alert_config(
+    project_id: int,
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+    get_dataset_or_404(db, project_id, dataset_id)
+    return AlertConfigOut()
 
 
 # -----------------------------
@@ -487,6 +487,43 @@ def processing_columns_meta(
             col["kind"] = overrides[name]
 
     return payload
+
+
+@router.get("/datasets/{dataset_id}/nettoyage/column-distribution")
+def get_column_distribution(
+    project_id: int,
+    dataset_id: int,
+    column: str = Query(..., description="Column name"),
+    max_bins: int = Query(default=20, ge=2, le=100),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+    ds = get_dataset_or_404(db, project_id, dataset_id)
+    df = load_current_df(ds.file_path, dataset_id)
+    if column not in df.columns:
+        raise HTTPException(status_code=404, detail=f"Column '{column}' not found")
+
+    series = df[column].dropna()
+    total = len(series)
+    n_unique = series.nunique()
+
+    if n_unique <= max_bins or not pd.api.types.is_numeric_dtype(series):
+        counts = series.astype(str).value_counts().head(max_bins)
+        bars = [{"label": str(lbl), "count": int(cnt)} for lbl, cnt in counts.items()]
+        return {"type": "categorical", "column": column, "total": total, "bars": bars}
+
+    hist_counts, edges = np.histogram(series.astype(float).dropna(), bins=max_bins)
+    bars = [
+        {
+            "label": f"{edges[i]:.2g}–{edges[i+1]:.2g}",
+            "count": int(hist_counts[i]),
+            "rangeMin": float(edges[i]),
+            "rangeMax": float(edges[i + 1]),
+        }
+        for i in range(len(hist_counts))
+    ]
+    return {"type": "histogram", "column": column, "total": total, "bars": bars}
 
 
 @router.get("/datasets/{dataset_id}/nettoyage/export")

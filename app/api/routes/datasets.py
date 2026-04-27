@@ -17,7 +17,6 @@ from app.models.dataset_version import DatasetVersion
 from app.api.utils_shared.datasets import get_dataset_or_404
 
 from app.schemas.dataset import DatasetOut, DatasetPreviewOut, DatasetTargetIn, DatasetTargetOut
-from app.schemas.dataset_active import ActiveDatasetIn, ActiveDatasetOut
 
 
 router = APIRouter()
@@ -64,7 +63,19 @@ async def upload_dataset(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    project = ensure_project_owner(db, project_id, current_user.id)
+    ensure_project_owner(db, project_id, current_user.id)
+
+    # 409 si un dataset source existe déjà pour ce projet
+    existing_source = (
+        db.query(Dataset)
+        .filter(Dataset.project_id == project_id, Dataset.kind == "source")
+        .first()
+    )
+    if existing_source is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Project already has a source dataset",
+        )
 
     original_name = sanitize_filename(file.filename or "file")
     ext = Path(original_name).suffix.lower()
@@ -102,27 +113,22 @@ async def upload_dataset(
         file_path=str(dst_path),
         content_type=file.content_type,
         size_bytes=size,
-        target_column=None,  # ✅ target par dataset
+        kind="source",
+        target_column=None,
     )
 
     db.add(dataset)
-    db.commit()
-    db.refresh(dataset)
+    db.flush()  # obtenir dataset.id sans commit
 
-    # ✅ si le projet n'a pas encore de dataset actif => mettre celui-ci actif
-    if getattr(project, "active_dataset_id", None) is None:
-        project.active_dataset_id = dataset.id
-        db.add(project)
-        db.commit()
+    # Créer la version initiale dans la même transaction.
+    # Si elle échoue, on rollback ET on supprime le fichier déjà écrit.
+    versions_dir = PROJECTS_PATH / str(project_id) / "dataset_versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
 
-    # Créer une version initiale "brute" utilisable directement pour l'entraînement
+    raw_stored_name = f"{uuid4().hex}.csv"
+    raw_path = versions_dir / raw_stored_name
+
     try:
-        versions_dir = PROJECTS_PATH / str(project_id) / "dataset_versions"
-        versions_dir.mkdir(parents=True, exist_ok=True)
-
-        raw_stored_name = f"{uuid4().hex}.csv"
-        raw_path = versions_dir / raw_stored_name
-
         df_raw = read_df(dst_path, nrows=None)
         df_raw.to_csv(raw_path, index=False)
 
@@ -141,9 +147,17 @@ async def upload_dataset(
         )
         db.add(raw_version)
         db.commit()
-    except Exception:
-        pass  # non-fatal : le dataset reste utilisable, juste sans version initiale
+    except Exception as exc:
+        db.rollback()
+        # Nettoyer les fichiers écrits sur disque
+        dst_path.unlink(missing_ok=True)
+        raw_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create initial dataset version — upload aborted: {exc}",
+        ) from exc
 
+    db.refresh(dataset)
     return dataset
 
 
@@ -179,7 +193,7 @@ def delete_dataset(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    project = ensure_project_owner(db, project_id, current_user.id)
+    ensure_project_owner(db, project_id, current_user.id)
 
     dataset = (
         db.query(Dataset)
@@ -189,15 +203,9 @@ def delete_dataset(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    # remove file
     path = Path(dataset.file_path)
     if path.exists():
         path.unlink()
-
-    # ✅ si on supprime le dataset actif => active_dataset_id = None
-    if getattr(project, "active_dataset_id", None) == dataset.id:
-        project.active_dataset_id = None
-        db.add(project)
 
     db.delete(dataset)
     db.commit()
@@ -262,44 +270,7 @@ def dataset_overview(
 
 
 # -------------------------
-# ACTIVE DATASET (project-level)
-# -------------------------
-@router.get("/active", response_model=ActiveDatasetOut)
-def get_active_dataset(
-    project_id: int,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    project = ensure_project_owner(db, project_id, current_user.id)
-    return {"active_dataset_id": project.active_dataset_id}
-
-
-@router.post("/active", response_model=ActiveDatasetOut)
-def set_active_dataset(
-    project_id: int,
-    payload: ActiveDatasetIn,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    project = ensure_project_owner(db, project_id, current_user.id)
-
-    ds = (
-        db.query(Dataset)
-        .filter(Dataset.id == payload.dataset_id, Dataset.project_id == project_id)
-        .first()
-    )
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-
-    project.active_dataset_id = payload.dataset_id
-    db.add(project)
-    db.commit()
-    db.refresh(project)
-    return {"active_dataset_id": project.active_dataset_id}
-
-
-# -------------------------
-# TARGET (dataset-level ✅)
+# TARGET (dataset-level)
 # -------------------------
 @router.get("/{dataset_id}/target", response_model=DatasetTargetOut)
 def get_dataset_target(
@@ -324,7 +295,6 @@ def set_dataset_target(
     ensure_project_owner(db, project_id, current_user.id)
     ds = get_dataset_or_404(db, project_id, dataset_id)
 
-    # ✅ validation si target non vide: doit exister dans le dataset
     value = (payload.target_column or "").strip() or None
     if value:
         df = read_df(Path(ds.file_path), nrows=None)

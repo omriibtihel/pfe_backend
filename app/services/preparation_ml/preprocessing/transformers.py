@@ -7,6 +7,34 @@ import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
 
+class LogTransformer(BaseEstimator, TransformerMixin):
+    """log(x) transform — clips négatifs à ε pour robustesse à l'inférence."""
+
+    def fit(self, X: Any, y: Any = None) -> "LogTransformer":
+        return self
+
+    def transform(self, X: Any) -> np.ndarray:
+        arr = np.asarray(X, dtype=float)
+        return np.log(np.clip(arr, 1e-10, None))
+
+    def inverse_transform(self, X: Any) -> np.ndarray:
+        return np.exp(np.asarray(X, dtype=float))
+
+
+class SqrtTransformer(BaseEstimator, TransformerMixin):
+    """√x transform — clips négatifs à 0 pour robustesse à l'inférence."""
+
+    def fit(self, X: Any, y: Any = None) -> "SqrtTransformer":
+        return self
+
+    def transform(self, X: Any) -> np.ndarray:
+        arr = np.asarray(X, dtype=float)
+        return np.sqrt(np.clip(arr, 0.0, None))
+
+    def inverse_transform(self, X: Any) -> np.ndarray:
+        return np.asarray(X, dtype=float) ** 2
+
+
 class ColumnAligner(BaseEstimator, TransformerMixin):
     """
     Align raw inference/train data to the training feature schema.

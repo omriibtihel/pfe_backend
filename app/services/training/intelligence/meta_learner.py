@@ -21,6 +21,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_LOWER_IS_BETTER_METRICS = {"rmse", "mae", "mse", "log_loss", "brier_score"}
+
+
+def _is_better_score(metric_name: str, challenger: float, champion: float) -> bool:
+    if (metric_name or "").lower() in _LOWER_IS_BETTER_METRICS:
+        return challenger < champion
+    return challenger > champion
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Record dataclass
@@ -122,17 +130,25 @@ class MetaLearner:
         Return the best-performing algorithm seen for similar profiles.
         Returns None if no matching history found.
         """
+        import math
+
         records = self.load_records(project_id)
         candidates = [
             r for r in records
             if r.task_type == task_type
             and r.dataset_size_category == size_category
             and r.metric_used == metric
-            and r.best_score > 0
+            and isinstance(r.best_score, (int, float))
+            and math.isfinite(r.best_score)
         ]
         if not candidates:
             return None
-        best = max(candidates, key=lambda r: r.best_score)
+
+        best = candidates[0]
+        for r in candidates[1:]:
+            if _is_better_score(metric, r.best_score, best.best_score):
+                best = r
+
         logger.info(
             "MetaLearner warm-start: suggest '%s' (score=%.4f) from %d matching records.",
             best.best_algorithm, best.best_score, len(candidates),

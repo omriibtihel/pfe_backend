@@ -441,6 +441,7 @@ def list_saved_models(
             threshold=presenter.extract_threshold(artifacts),
             trainedAt=m.created_at.isoformat() if m.created_at else "",
             primaryMetric=list_result.primaryMetric,
+            testScore=list_result.testScore,
             trainingTime=list_result.trainingTime,
         ))
 
@@ -529,6 +530,15 @@ def download_results(
     active_model_id = int(project.active_model_id) if project.active_model_id is not None else None
     models = crud_training.list_models_for_session(db, s.id)
     payload = presenter.session_to_response(s, models, active_model_id=active_model_id)
+    # The exported JSON is the full TrainingSessionResponse schema.
+    # Each model result includes:
+    #   • evaluationSource.type — the canonical field for consumers to determine
+    #     whether scores are from a holdout test, CV mean, or train-only run.
+    #     The raw internal "evaluation_strategy" string is NOT included directly;
+    #     evaluationSource.type is the structured, typed equivalent.
+    #   • trainScore — populated for ALL models including train_only sessions.
+    #     When evaluationSource.type == "train_only", testScore is null and
+    #     trainScore is the only numeric score available (see ModelResultResponse).
     content = json.dumps(payload.model_dump(), ensure_ascii=False, indent=2).encode("utf-8")
 
     return _StreamingResponse(

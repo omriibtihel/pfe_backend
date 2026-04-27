@@ -613,7 +613,7 @@ def run_automl(
 
     metrics_json: Dict[str, Any] = {
         "automl": True,
-        "test": eval_test.metrics if eval_test is not None else None,
+        "test": eval_test.metrics if eval_test is not None else {},
         "has_test": has_test,
         "train": eval_train.metrics,
         "best_estimator": best_estimator,
@@ -628,6 +628,17 @@ def run_automl(
         "threshold_optimized": threshold_optimized,
         "features_added": 0,
     }
+
+    if has_test:
+        metrics_json["has_holdout_test"] = True
+        metrics_json["test_is_cv_mean"] = False
+        metrics_json["test_label"] = "Holdout test set (AutoML)"
+        metrics_json["evaluation_strategy"] = "holdout_test"
+    else:
+        metrics_json["has_holdout_test"] = False
+        metrics_json["test_is_cv_mean"] = False
+        metrics_json["test_label"] = "Entraînement uniquement (pas de test)"
+        metrics_json["evaluation_strategy"] = "train_only"
 
     # ── 15. Build artifacts_json ──────────────────────────────────────────────
     confusion_matrix_data: List[List[int]] = []
@@ -702,7 +713,7 @@ def run_automl(
             est_eval_test = (
                 evaluator.evaluate(est_learner, X_test_prep, y_test, threshold=0.5)
                 if has_test and X_test_prep is not None
-                else evaluator.evaluate(est_learner, X_train_prep_for_eval, y_train_for_eval, threshold=0.5)
+                else None
             )
             est_eval_train = evaluator.evaluate(
                 est_learner, X_train_prep_for_eval, y_train_for_eval, threshold=0.5
@@ -711,12 +722,13 @@ def run_automl(
             est_loss = per_estimator_losses.get(est_name)
 
             est_cm: List[List[int]] = []
-            if est_eval_test.confusion_matrix is not None:
+            if est_eval_test is not None and est_eval_test.confusion_matrix is not None:
                 est_cm = [list(row) for row in est_eval_test.confusion_matrix]
 
             est_metrics_json: Dict[str, Any] = {
                 "automl": True,
-                "test": est_eval_test.metrics,
+                "test": est_eval_test.metrics if est_eval_test is not None else {},
+                "has_test": has_test,
                 "train": est_eval_train.metrics,
                 "best_estimator": est_name,
                 "best_loss": float(est_loss) if est_loss is not None else None,
@@ -729,6 +741,16 @@ def run_automl(
                 "threshold_optimized": False,
                 "features_added": 0,
             }
+            if has_test:
+                est_metrics_json["has_holdout_test"] = True
+                est_metrics_json["test_is_cv_mean"] = False
+                est_metrics_json["test_label"] = "Holdout test set (AutoML)"
+                est_metrics_json["evaluation_strategy"] = "holdout_test"
+            else:
+                est_metrics_json["has_holdout_test"] = False
+                est_metrics_json["test_is_cv_mean"] = False
+                est_metrics_json["test_label"] = "Aucun jeu de test disponible"
+                est_metrics_json["evaluation_strategy"] = "train_only"
 
             est_artifacts_json: Dict[str, Any] = {
                 "automl": {

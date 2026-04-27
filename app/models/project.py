@@ -36,7 +36,6 @@ class Project(Base):
 
     owner = relationship("User", back_populates="projects")
 
-    # ⚠️ IMPORTANT : préciser foreign_keys car Project a aussi active_dataset_id -> datasets.id
     datasets = relationship(
         "Dataset",
         back_populates="project",
@@ -44,23 +43,13 @@ class Project(Base):
         foreign_keys="Dataset.project_id",
         passive_deletes=True,
     )
-    
+
     version_column_schemas = relationship(
         "VersionColumnSchema",
         back_populates="project",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
-
-
-    active_dataset_id = Column(
-        Integer,
-        ForeignKey("datasets.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-
-    # IMPORTANT : préciser foreign_keys ici aussi
-    active_dataset = relationship("Dataset", foreign_keys=[active_dataset_id])
 
     active_model_id = Column(
         Integer,

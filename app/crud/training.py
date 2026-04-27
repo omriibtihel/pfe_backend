@@ -125,9 +125,6 @@ def save_model(
     """Mark model as saved, set it as project's active model. Returns previous active_model_id."""
     previous_active_model_id = project.active_model_id
 
-    artifacts = dict(model.artifacts_json) if isinstance(model.artifacts_json, dict) else {}
-    artifacts["saved"] = True
-    model.artifacts_json = artifacts
     model.is_saved = True
     db.add(model)
 
@@ -143,9 +140,6 @@ def unsave_model(
     model: TrainedModel,
     project: Project,
 ) -> None:
-    artifacts = dict(model.artifacts_json) if isinstance(model.artifacts_json, dict) else {}
-    artifacts["saved"] = False
-    model.artifacts_json = artifacts
     model.is_saved = False
     db.add(model)
 

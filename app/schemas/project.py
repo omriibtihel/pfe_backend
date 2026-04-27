@@ -17,7 +17,6 @@ class ProjectOut(BaseModel):
     name: str
     description: str | None
     owner_id: int
-    active_dataset_id: int | None = None
     project_type: str = "tabular"
 
     created_at: datetime

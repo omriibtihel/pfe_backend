@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from sqlalchemy.orm import Session
 
@@ -26,6 +26,8 @@ from app.services.training.automl_runner import run_automl
 logger = logging.getLogger(__name__)
 
 _meta_learner = MetaLearner(PROJECTS_PATH)
+
+_LOWER_IS_BETTER_METRICS: frozenset[str] = frozenset({"rmse", "mae", "mse", "log_loss", "brier_score"})
 
 
 def _now():
@@ -92,7 +94,7 @@ def run_training_session(session_id: int) -> None:
             db, s.project_id, s.dataset_version_id)
         df = load_dataframe(path_to_load)
 
-        if _data_source == "RAW_ORIGINAL":
+        if _data_source == "raw_original":
             _append_session_message(
                 db, s,
                 "WARNING: Training used the original unprocessed dataset. "
@@ -104,6 +106,7 @@ def run_training_session(session_id: int) -> None:
         total = max(1, len(cfg.models))
         success_count = 0
         best_result: Any = None
+        best_metric_name: str = "accuracy"
         best_score: float = -1.0
 
         _update_session(db, s, dataset_version_id=dv_id, progress=10, current_model=None)
@@ -165,11 +168,23 @@ def run_training_session(session_id: int) -> None:
 
                 success_count += 1
 
-                # Track best result for meta-learning
-                primary_score = _extract_primary_score(res.metrics_json)
-                if primary_score > best_score:
-                    best_score = primary_score
-                    best_result = (model_type, res)
+                # Track best result for meta-learning.
+                # Skip train-only results: no real evaluation, must not be recorded as best.
+                evaluation_strategy = res.metrics_json.get("evaluation_strategy", "")
+                primary_metric_name, primary_score = _extract_primary_score(res.metrics_json)
+                if (
+                    evaluation_strategy != "train_only"
+                    and primary_metric_name is not None
+                    and primary_score is not None
+                ):
+                    is_lower = primary_metric_name in _LOWER_IS_BETTER_METRICS
+                    is_first = best_result is None
+                    is_new_best = is_lower and primary_score < best_score
+                    is_new_best = is_new_best or (not is_lower and primary_score > best_score)
+                    if is_first or is_new_best:
+                        best_score = primary_score
+                        best_metric_name = primary_metric_name
+                        best_result = (model_type, res)
 
                 # Advance progress to end of this model’s range after success.
                 _update_session(db, s, progress=progress_end)
@@ -246,16 +261,29 @@ def run_training_session(session_id: int) -> None:
         db.close()
 
 
-def _extract_primary_score(metrics_json: Dict[str, Any]) -> float:
-    """Extract the best available scalar score from metrics_json."""
+def _extract_primary_score(
+    metrics_json: Dict[str, Any],
+) -> tuple[Optional[str], Optional[float]]:
+    """Return (metric_name, score) for direction-aware best-model selection.
+
+    Returns (None, None) when no real evaluation metric is available — caller
+    must skip such results (do not record them as 'best' in meta-learning).
+    """
     for key in ("roc_auc", "f1", "pr_auc", "accuracy", "r2", "f1_weighted", "f1_macro"):
         val = metrics_json.get("test", {}).get(key) or metrics_json.get(key)
         if val is not None:
             try:
-                return float(val)
+                return key, float(val)
             except Exception:
                 pass
-    return 0.0
+    for key in ("rmse", "mae", "mse"):
+        val = metrics_json.get("test", {}).get(key) or metrics_json.get(key)
+        if val is not None:
+            try:
+                return key, float(val)
+            except Exception:
+                pass
+    return None, None
 
 
 def _record_meta_learning(

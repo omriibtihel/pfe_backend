@@ -45,6 +45,23 @@ from app.schemas.training.results import (  # noqa: F401
     TrainingValidateOut,
     ManualPredictIn,
     ActiveModelOut,
+    # New structured response schemas
+    PrimaryMetric,
+    MetricsSummary,
+    SplitSummary,
+    AutoMLInfo,
+    ModelResultResponse,
+    CVInfo,
+    ThresholdInfo,
+    GridSearchInfo,
+    BalancingInfo,
+    AnalysisBlock,
+    ModelResultDetailResponse,
+    FeatureImportanceItem,
+    ExplainabilityResponse,
+    CurvesResponse,
+    TrainingSessionResponse,
+    SavedModelResponse,
 )
 from app.schemas.training.intelligence import (  # noqa: F401
     RecommendIn,

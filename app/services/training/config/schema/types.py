@@ -49,7 +49,7 @@ NUMERIC_IMPUTATION_METHODS = ["none", "median", "mean", "most_frequent", "consta
 CATEGORICAL_IMPUTATION_METHODS = ["none", "most_frequent", "constant"]
 CATEGORICAL_ENCODING_METHODS = ["none", "onehot", "label", "ordinal"]
 NUMERIC_SCALING_METHODS = ["none", "standard", "minmax", "robust", "maxabs"]
-NUMERIC_POWER_TRANSFORM_METHODS = ["none", "yeo_johnson", "box_cox"]
+NUMERIC_POWER_TRANSFORM_METHODS = ["none", "log", "sqrt", "yeo_johnson", "box_cox"]
 
 DEFAULT_NUMERIC_IMPUTATION = "none"
 DEFAULT_CATEGORICAL_IMPUTATION = "none"

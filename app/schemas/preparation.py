@@ -129,5 +129,8 @@ class DatasetProfileOut(BaseModel):
     non_normal_ratio: float = 0.0
     avg_skewness: float = 0.0
     highly_skewed_count: int = 0
-    # Per-column: {colName: {is_normal, skewness, abs_skewness, n, test_used, p_value, has_missing}}
+    columns_capped: bool = False
+    columns_capped_count: int = 0
+    transform_suggestions: Dict[str, str] = Field(default_factory=dict)
+    # Per-column: matches ColumnDistributionStat TypeScript interface
     column_distribution: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

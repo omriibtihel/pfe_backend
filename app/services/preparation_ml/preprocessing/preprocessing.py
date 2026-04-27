@@ -18,6 +18,7 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 
+from app.services.preparation_ml.preprocessing.transformers import LogTransformer, SqrtTransformer
 from app.services.training.config.schema import PreprocessingConfig
 
 
@@ -40,6 +41,18 @@ class EffectivePreprocessing:
     column_types: dict[str, str]
     active_numeric_columns: List[str]
     active_categorical_columns: List[str]
+
+
+# Cleaning-page kind → preprocessing type (None = exclude from training)
+_KIND_TO_PP_TYPE: dict[str, str | None] = {
+    "numeric": "numeric",
+    "binary": "numeric",
+    "categorical": "categorical",
+    "text": None,
+    "id": None,
+    "other": None,
+    "datetime": None,
+}
 
 
 def infer_columns(X: pd.DataFrame, numeric_threshold: float = 0.85) -> Tuple[List[str], List[str]]:
@@ -133,10 +146,27 @@ def _build_categorical_encoder(method: str, ordinal_order: list[str] | None = No
     )
 
 
-def resolve_effective_preprocessing_by_column(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> EffectivePreprocessing:
+def resolve_effective_preprocessing_by_column(
+    X: pd.DataFrame,
+    prep_cfg: PreprocessingConfig,
+    kind_overrides: dict[str, str] | None = None,
+) -> EffectivePreprocessing:
+    # Priority 3: infer column types from pandas dtypes
     numeric_cols, categorical_cols = infer_columns(X)
     inferred_types: dict[str, str] = {col: "numeric" for col in numeric_cols}
     inferred_types.update({col: "categorical" for col in categorical_cols})
+
+    # Priority 2: kind_overrides from the cleaning/schema page.
+    # Injected only when the wizard (priority 1) has not explicitly configured the column.
+    schema_pp_types: dict[str, str] = {}
+    schema_excluded: set[str] = set()
+    if kind_overrides:
+        for _col, _kind in kind_overrides.items():
+            _pp = _KIND_TO_PP_TYPE.get(str(_kind).lower())
+            if _pp is None:
+                schema_excluded.add(str(_col))
+            else:
+                schema_pp_types[str(_col)] = _pp
 
     effective_by_column: dict[str, dict[str, Any]] = {}
     dropped_columns: List[str] = []
@@ -145,36 +175,51 @@ def resolve_effective_preprocessing_by_column(X: pd.DataFrame, prep_cfg: Preproc
     active_categorical_columns: List[str] = []
 
     for col in X.columns:
-        inferred = inferred_types.get(col, "categorical")
-        resolved = prep_cfg.resolve_column(str(col), inferred)
-        final_type = str(resolved.get("type", inferred))
+        col_str = str(col)
+        inferred = inferred_types.get(col_str, "categorical")
+
+        # Detect whether the wizard explicitly set type/use for this column (priority 1)
+        _wizard_cfg = (getattr(prep_cfg, "columns", {}) or {}).get(col_str) or {}
+        wizard_has_type = isinstance(_wizard_cfg, dict) and "type" in _wizard_cfg
+        wizard_has_use = isinstance(_wizard_cfg, dict) and "use" in _wizard_cfg
+
+        # Effective inferred: use schema override (P2) when wizard hasn't set a type
+        effective_inferred = schema_pp_types.get(col_str, inferred) if not wizard_has_type else inferred
+
+        resolved = prep_cfg.resolve_column(col_str, effective_inferred)
+
+        # Apply schema-based exclusion (P2) when wizard hasn't explicitly set use
+        if not wizard_has_use and col_str in schema_excluded:
+            resolved["use"] = False
+
+        final_type = str(resolved.get("type", effective_inferred))
         use = bool(resolved.get("use", True))
 
         if final_type not in {"numeric", "categorical", "ordinal"}:
-            final_type = inferred if inferred in {"numeric", "categorical"} else "categorical"
+            final_type = effective_inferred if effective_inferred in {"numeric", "categorical"} else "categorical"
             resolved["type"] = final_type
 
         passthrough = False
         if use:
             if final_type == "numeric":
-                active_numeric_columns.append(str(col))
+                active_numeric_columns.append(col_str)
                 passthrough = (
                     str(resolved.get("numericImputation", "none")) == "none"
                     and str(resolved.get("numericPowerTransform", "none")) == "none"
                     and str(resolved.get("numericScaling", "none")) == "none"
                 )
             else:
-                active_categorical_columns.append(str(col))
+                active_categorical_columns.append(col_str)
                 passthrough = (
                     str(resolved.get("categoricalImputation", "none")) == "none"
                     and str(resolved.get("categoricalEncoding", "none")) == "none"
                 )
         else:
-            dropped_columns.append(str(col))
+            dropped_columns.append(col_str)
 
         resolved["passthrough"] = bool(passthrough and use)
-        effective_by_column[str(col)] = resolved
-        column_types[str(col)] = final_type
+        effective_by_column[col_str] = resolved
+        column_types[col_str] = final_type
 
     return EffectivePreprocessing(
         effective_by_column=effective_by_column,
@@ -185,11 +230,15 @@ def resolve_effective_preprocessing_by_column(X: pd.DataFrame, prep_cfg: Preproc
     )
 
 
-def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> PreprocessSpec:
+def build_preprocessor(
+    X: pd.DataFrame,
+    prep_cfg: PreprocessingConfig,
+    kind_overrides: dict[str, str] | None = None,
+) -> PreprocessSpec:
     if X is None or len(X) == 0:
         raise RuntimeError("build_preprocessor expects a non-empty TRAIN split.")
 
-    effective = resolve_effective_preprocessing_by_column(X, prep_cfg)
+    effective = resolve_effective_preprocessing_by_column(X, prep_cfg, kind_overrides=kind_overrides)
     effective_by_column = effective.effective_by_column
 
     active_columns = [col for col in X.columns if bool(effective_by_column.get(str(col), {}).get("use", True))]
@@ -253,10 +302,15 @@ def build_preprocessor(X: pd.DataFrame, prep_cfg: PreprocessingConfig) -> Prepro
                 constant_fill=const_fill_num,
             )))
         if num_power != "none":
-            # standardize=False when a linear scaler follows; True when used standalone
-            standardize = num_scale == "none"
-            method = "yeo-johnson" if num_power == "yeo_johnson" else "box-cox"
-            steps.append(("power", PowerTransformer(method=method, standardize=standardize)))
+            if num_power == "log":
+                steps.append(("power", LogTransformer()))
+            elif num_power == "sqrt":
+                steps.append(("power", SqrtTransformer()))
+            else:
+                # yeo_johnson / box_cox — standardize=False when a linear scaler follows
+                standardize = num_scale == "none"
+                method = "yeo-johnson" if num_power == "yeo_johnson" else "box-cox"
+                steps.append(("power", PowerTransformer(method=method, standardize=standardize)))
         if num_scale != "none":
             steps.append(("scaler", _build_numeric_scaler(num_scale)))
         if steps:

@@ -50,6 +50,10 @@ class RenameVersionPayload(BaseModel):
     name: str
 
 
+class PrepConfigPayload(BaseModel):
+    config: dict
+
+
 @router.get("", response_model=list[dict])
 def list_versions(
     project_id: int,
@@ -174,6 +178,56 @@ def rename_version(
     db.add(v)
     db.commit()
     return {"ok": True, "id": v.id, "name": v.name}
+
+
+@router.get("/{version_id}/prep-config")
+def get_prep_config(
+    project_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+
+    v = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
+        .first()
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    if not v.preparation_config_json:
+        return None
+
+    try:
+        return json.loads(v.preparation_config_json)
+    except Exception:
+        return None
+
+
+@router.put("/{version_id}/prep-config")
+def save_prep_config(
+    project_id: int,
+    version_id: int,
+    payload: PrepConfigPayload,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    ensure_project_owner(db, project_id, current_user.id)
+
+    v = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.id == version_id, DatasetVersion.project_id == project_id)
+        .first()
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    v.preparation_config_json = json.dumps(payload.config, ensure_ascii=False)
+    db.add(v)
+    db.commit()
+    return {"ok": True}
 
 
 @router.delete("/{version_id}", status_code=status.HTTP_204_NO_CONTENT)

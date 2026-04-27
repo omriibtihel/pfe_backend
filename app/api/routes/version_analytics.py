@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
 from app.api.utils_shared.versions import load_version_df
+from app.services.data.normality import NormalityAnalyzer, report_to_dict
+from app.services.data.column_inference import detect_parasites
 
 router = APIRouter()
 
@@ -129,6 +131,7 @@ def version_profile(
             "unique_pct": round(unique_pct, 4),
             "numeric": numeric,
             "categorical": categorical,
+            "parasites": detect_parasites(s),
         })
 
     return {"shape": shape, "profiles": profiles}
@@ -351,32 +354,5 @@ def version_normality_test(
     df.columns = df.columns.astype(str)
     _ensure_cols(df, body.columns)
 
-    results = []
-    for col in body.columns:
-        s = pd.to_numeric(df[col], errors="coerce").dropna()
-        if len(s) < 3:
-            raise HTTPException(status_code=400, detail=f"Column '{col}' has fewer than 3 non-null numeric values.")
-
-        data = s.to_numpy(dtype=float)
-        n = len(data)
-        if n <= 5000:
-            stat, p_value = stats.shapiro(data)
-            test_used = "shapiro"
-        else:
-            stat, p_value = stats.normaltest(data)
-            test_used = "dagostino"
-
-        results.append({
-            "col": col,
-            "n": n,
-            "mean": float(np.mean(data)),
-            "std": float(np.std(data, ddof=1)),
-            "skewness": float(stats.skew(data)),
-            "kurtosis": float(stats.kurtosis(data) + 3),
-            "test_used": test_used,
-            "stat": float(stat),
-            "p_value": float(p_value),
-            "is_normal": bool(p_value > 0.05),
-        })
-
-    return {"results": results}
+    report = NormalityAnalyzer().analyze_columns(df, body.columns)
+    return report_to_dict(report)
