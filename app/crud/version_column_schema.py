@@ -64,13 +64,21 @@ def set_overrides(
     project_id: int,
     dataset_version_id: int,
     overrides: dict[str, str | None],
-) -> None:
+    commit: bool = True,
+) -> dict[str, str | None]:
+    """Persiste les overrides de kind. Retourne le diff effectivement appliqué
+    {col: new_kind_or_None_for_clear} — utile pour générer le journal d'ops.
+
+    Si `commit=False`, l'appelant gère la transaction (utile pour atomicité
+    avec d'autres écritures, ex. ProcessingOperation).
+    """
     rows = (
         db.query(VersionColumnSchema)
         .filter(VersionColumnSchema.dataset_version_id == dataset_version_id)
         .all()
     )
     mp = {r.column_name: r for r in rows}
+    applied: dict[str, str | None] = {}
 
     for col, kind in overrides.items():
         col = str(col)
@@ -80,6 +88,10 @@ def set_overrides(
                 continue
 
         r = mp.get(col)
+        prev = r.override_kind if r is not None else None
+        if prev == kind:
+            continue  # no-op, ne pas générer d'op pour rien
+
         if r is None:
             r = VersionColumnSchema(
                 project_id=project_id,
@@ -94,4 +106,10 @@ def set_overrides(
         else:
             r.override_kind = kind
 
-    db.commit()
+        applied[col] = kind
+
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return applied

@@ -21,6 +21,21 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# neg_* scoring helpers
+# ---------------------------------------------------------------------------
+
+def _is_neg_scoring(s: str) -> bool:
+    """Return True when the sklearn scoring string uses the neg_* convention."""
+    return str(s or "").startswith("neg_")
+
+
+def _clean_scoring_name(s: str) -> str:
+    """Strip the ``neg_`` prefix from a sklearn scoring name for human display."""
+    s = str(s or "")
+    return s[4:] if s.startswith("neg_") else s
+
+
+# ---------------------------------------------------------------------------
 # Metric / scoring helpers
 # ---------------------------------------------------------------------------
 
@@ -324,7 +339,7 @@ def _sanitize_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return {k: to_python_scalar(v) for k, v in params.items()}
 
 
-def _summarize_cv_results(cv_results: Dict[str, Any], max_rows: int = 20) -> list[Dict[str, Any]]:
+def _summarize_cv_results(cv_results: Dict[str, Any], max_rows: int = 20, *, is_neg: bool = False) -> list[Dict[str, Any]]:
     params = list(cv_results.get("params", []) or [])
     ranks = list(np.asarray(cv_results.get("rank_test_score", [])))
     means = list(np.asarray(cv_results.get("mean_test_score", [])))
@@ -346,20 +361,35 @@ def _summarize_cv_results(cv_results: Dict[str, Any], max_rows: int = 20) -> lis
 
     rows = []
     for i in range(min(len(params), len(ranks), len(means), len(stds))):
-        mean_test_score = to_python_scalar(means[i])
+        _raw_test = to_python_scalar(means[i])
+        # Convert neg_* scores to their positive natural value for display.
+        mean_test_score = (
+            -float(_raw_test) if (is_neg and _raw_test is not None)
+            else (float(_raw_test) if _raw_test is not None else None)
+        )
         std_test_score = to_python_scalar(stds[i])
         row: Dict[str, Any] = {
             "rank": int(ranks[i]),
-            "mean_test_score": float(mean_test_score) if mean_test_score is not None else None,
+            "mean_test_score": mean_test_score,
             "std_test_score": float(std_test_score) if std_test_score is not None else None,
             "params": {k: to_python_scalar(v) for k, v in dict(params[i]).items()},
         }
         if train_means is not None and i < len(train_means):
-            mean_train_score = to_python_scalar(train_means[i])
-            row["mean_train_score"] = float(mean_train_score) if mean_train_score is not None else None
+            _raw_train = to_python_scalar(train_means[i])
+            mean_train_score = (
+                -float(_raw_train) if (is_neg and _raw_train is not None)
+                else (float(_raw_train) if _raw_train is not None else None)
+            )
+            row["mean_train_score"] = mean_train_score
             if mean_train_score is not None and mean_test_score is not None:
-                # Positive gap = train > test = overfitting signal
-                row["overfit_gap"] = float(mean_train_score) - float(mean_test_score)
+                # Positive gap = overfitting signal.
+                # higher-is-better: train_score > test_score  → train − test > 0
+                # lower-is-better (neg_*): test_error > train_error → test − train > 0
+                row["overfit_gap"] = (
+                    float(mean_test_score) - float(mean_train_score)
+                    if is_neg
+                    else float(mean_train_score) - float(mean_test_score)
+                )
         if fit_times is not None and i < len(fit_times):
             fit_time = to_python_scalar(fit_times[i])
             row["mean_fit_time_s"] = float(fit_time) if fit_time is not None else None
@@ -393,19 +423,26 @@ def _extract_search_artifacts(
         for k, v in best_params_full.items()
         if k.startswith("model__")
     }
-    best_score = to_python_scalar(getattr(search, "best_score_", None))
+    _raw_best_score = to_python_scalar(getattr(search, "best_score_", None))
+    is_neg = _is_neg_scoring(refit_metric)
+    # Convert neg_* best_score to its natural positive value (e.g. RMSE, MAE, MSE).
+    best_score = (
+        -float(_raw_best_score) if (is_neg and _raw_best_score is not None)
+        else (float(_raw_best_score) if _raw_best_score is not None else None)
+    )
+    _clean_metric = _clean_scoring_name(refit_metric)
     return {
         "enabled": True,
         "search_type": search_type,
-        "refit_metric": refit_metric,
-        "scoring": refit_metric,
+        "refit_metric": _clean_metric,
+        "scoring": _clean_metric,
         "cv_splits": int(cv_splits),
-        "best_score": float(best_score) if best_score is not None else None,
+        "best_score": best_score,
         "best_params": best_params_model,
         "best_params_full": best_params_full,
         "param_grid": param_grid,
         "n_candidates": n_candidates,
-        "cv_results_summary": _summarize_cv_results(search.cv_results_),
+        "cv_results_summary": _summarize_cv_results(search.cv_results_, is_neg=is_neg),
         "sample_weight_used": bool(fit_sample_weight is not None),
         "all_nan_scores": all_nan,
     }

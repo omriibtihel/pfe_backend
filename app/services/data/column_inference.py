@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 import numpy as np
 
@@ -9,6 +11,12 @@ _ALL_NONE = {
     "min_val": None, "max_val": None, "mean_val": None, "median_val": None,
     "q1_val": None, "q3_val": None,
 }
+
+
+def _safe_float(value: float) -> float | None:
+    # NaN/Inf are not JSON-compliant under starlette's allow_nan=False.
+    return value if math.isfinite(value) else None
+
 
 def numeric_extra_stats(non_null: pd.Series) -> dict:
     """Full numeric summary for a series (already stripped of NaN/inf by caller).
@@ -26,19 +34,19 @@ def numeric_extra_stats(non_null: pd.Series) -> dict:
     q1 = float(np.percentile(data, 25))
     q3 = float(np.percentile(data, 75))
     basic = {
-        "min_val":    float(data.min()),
-        "max_val":    float(data.max()),
-        "mean_val":   float(data.mean()),
-        "median_val": float(np.median(data)),
-        "q1_val":     q1,
-        "q3_val":     q3,
+        "min_val":    _safe_float(float(data.min())),
+        "max_val":    _safe_float(float(data.max())),
+        "mean_val":   _safe_float(float(data.mean())),
+        "median_val": _safe_float(float(np.median(data))),
+        "q1_val":     _safe_float(q1),
+        "q3_val":     _safe_float(q3),
         "has_negative": bool(float(data.min()) <= 0),
     }
 
     if len(data) < 4:
         return {**basic, "skewness": None, "outlier_count": None, "outlier_ratio": None}
 
-    skewness = float(_skew(data))
+    skewness = _safe_float(float(_skew(data)))
     iqr = q3 - q1
     lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
     outlier_count = int(((data < lower) | (data > upper)).sum())
@@ -46,7 +54,7 @@ def numeric_extra_stats(non_null: pd.Series) -> dict:
         **basic,
         "skewness":     skewness,
         "outlier_count": outlier_count,
-        "outlier_ratio": float(outlier_count / len(data)),
+        "outlier_ratio": _safe_float(float(outlier_count / len(data))),
     }
 
 

@@ -442,6 +442,43 @@ def run_automl(
         X_test_arr = preprocessor.transform(X_test)
         X_test_prep = pd.DataFrame(X_test_arr, columns=pd.Index(prep_names, dtype=object), index=X_test.index)
 
+    # ── 3b. Threshold-calibration split (classification only) ───────────────
+    # The optimal decision threshold must be found on data the model has NOT
+    # been evaluated on, and the holdout test set must remain completely
+    # untouched for the final evaluation report.  We therefore carve a small
+    # stratified slice from the TRAINING data exclusively for threshold
+    # calibration.  FLAML trains only on X_train_main (the remaining 85 %),
+    # so X_thresh is genuinely out-of-sample for the threshold search, while
+    # X_test_prep stays clean as the independent evaluation set.
+    X_thresh: Optional[pd.DataFrame] = None
+    y_thresh: Optional[np.ndarray] = None
+    _thresh_split_warning: Optional[str] = None
+    _THRESH_MIN_SAMPLES = 100
+    if cfg.task_type == "classification":
+        if X_train_prep.shape[0] < _THRESH_MIN_SAMPLES:
+            _thresh_split_warning = (
+                "Dataset too small for threshold calibration split "
+                "— using default threshold 0.5"
+            )
+            logger.warning(
+                "MedAutoML: %s (n_train=%d)", _thresh_split_warning, X_train_prep.shape[0]
+            )
+        else:
+            try:
+                X_train_prep, X_thresh, y_train, y_thresh = train_test_split(
+                    X_train_prep, y_train,
+                    test_size=0.15,
+                    stratify=y_train,
+                    random_state=42,
+                )
+            except ValueError:
+                # stratify fails when a class has too few samples — fall back to unstratified
+                X_train_prep, X_thresh, y_train, y_thresh = train_test_split(
+                    X_train_prep, y_train,
+                    test_size=0.15,
+                    random_state=42,
+                )
+
     # ── 4. SMOTE oversampling (binary classification, severe imbalance only) ─
     # Check eligibility BEFORE copying — only copy if SMOTE will actually run.
     smote_applied = False
@@ -558,13 +595,15 @@ def run_automl(
     except OSError:
         pass
 
-    # ── 10. Threshold calibration on holdout test (post-fit) ──────────────────
+    # ── 10. Threshold calibration on dedicated calibration split (post-fit) ───
+    # X_thresh was carved from training data in step 3b — the test set is
+    # never touched here, preserving its independence for final evaluation.
     optimal_threshold = 0.5
     threshold_optimized = False
     if cfg.task_type == "classification":
-        if has_test and X_test_prep is not None:
+        if X_thresh is not None and y_thresh is not None:
             optimal_threshold = _find_optimal_threshold(
-                automl, X_test_prep, y_test,
+                automl, X_thresh, y_thresh,
                 positive_label=cfg.positive_label,
                 beta=float(getattr(cfg, "f_beta", 1.0)),
             )
@@ -626,8 +665,11 @@ def run_automl(
         "smote_applied": smote_applied,
         "threshold_used": optimal_threshold,
         "threshold_optimized": threshold_optimized,
+        "threshold_source": "thresh_split" if X_thresh is not None else "none",
         "features_added": 0,
     }
+    if _thresh_split_warning:
+        metrics_json["warnings"] = [_thresh_split_warning]
 
     if has_test:
         metrics_json["has_holdout_test"] = True

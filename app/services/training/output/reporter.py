@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +9,8 @@ import pandas as pd
 
 from app.services.training.config.schema import PREPROCESSING_CAPABILITIES, PREPROCESSING_EXECUTION_POLICY
 from app.services.training.utils import to_python_scalar, safe_json_value
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -229,6 +232,39 @@ def build_training_schema(*, X: pd.DataFrame, target: str, preprocessing_config:
     }
 
 
+def _compute_baseline(
+    task_type: str,
+    X_train: pd.DataFrame,
+    y_train: Any,
+    X_test: pd.DataFrame,
+    y_test: Any,
+    requested_metrics: Optional[list] = None,
+    positive_label: Any = None,
+) -> Optional[Dict[str, Any]]:
+    from sklearn.dummy import DummyClassifier, DummyRegressor
+    from app.services.training.pipeline.evaluator import Evaluator
+
+    try:
+        if task_type == "classification":
+            dummy = DummyClassifier(strategy="most_frequent", random_state=42)
+            strategy = "most_frequent"
+        else:
+            dummy = DummyRegressor(strategy="mean")
+            strategy = "mean"
+
+        dummy.fit(X_train, np.asarray(y_train))
+        evaluator = Evaluator(
+            task_type=task_type,
+            requested_metrics=requested_metrics,
+            positive_label=positive_label,
+        )
+        result = evaluator.evaluate(dummy, X_test, np.asarray(y_test))
+        return {"strategy": strategy, "metrics": result.metrics}
+    except Exception as exc:
+        logger.warning("Baseline computation failed: %s", exc)
+        return None
+
+
 class Reporter:
     def build_artifacts(
         self,
@@ -319,6 +355,20 @@ class Reporter:
         if curves is not None:
             artifacts["curves"] = curves
 
+        if split.X_test is not None and split.y_test is not None and len(split.X_test) > 0:
+            artifacts["baseline"] = _compute_baseline(
+                task_type=cfg.task_type,
+                X_train=split.X_train,
+                y_train=split.y_train,
+                X_test=split.X_test,
+                y_test=split.y_test,
+                requested_metrics=list(cfg.metrics) if cfg.metrics else None,
+                positive_label=resolved_positive_label,
+            )
+        else:
+            artifacts["baseline"] = None
+            logger.info("Baseline not computed — no holdout test set available")
+
         return artifacts
 
     def build_cv_artifacts(
@@ -332,7 +382,9 @@ class Reporter:
         X_all: pd.DataFrame,
         y_all: Any,
         X_cv: Optional[pd.DataFrame] = None,
+        y_cv: Optional[Any] = None,
         X_test_holdout: Optional[pd.DataFrame] = None,
+        y_test_holdout: Optional[Any] = None,
         final_spec: Any,
         fitted_pipeline: Any,
         balancing_audit: Dict[str, Any],
@@ -486,5 +538,21 @@ class Reporter:
 
         if curves is not None:
             artifacts["curves"] = curves
+
+        if has_holdout_test and X_test_holdout is not None and y_test_holdout is not None and len(X_test_holdout) > 0:
+            _train_X = X_cv if X_cv is not None else X_all
+            _train_y = y_cv if y_cv is not None else y_all
+            artifacts["baseline"] = _compute_baseline(
+                task_type=cfg.task_type,
+                X_train=_train_X,
+                y_train=_train_y,
+                X_test=X_test_holdout,
+                y_test=y_test_holdout,
+                requested_metrics=list(cfg.metrics) if cfg.metrics else None,
+                positive_label=resolved_positive_label,
+            )
+        else:
+            artifacts["baseline"] = None
+            logger.info("Baseline not computed — no holdout test set available")
 
         return artifacts

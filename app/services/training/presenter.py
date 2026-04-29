@@ -11,6 +11,7 @@ import logging
 from typing import Any, Optional
 
 from app.models.training import TrainedModel, TrainingSession
+from app.services.training.pipeline.cv_utils import _clean_scoring_name
 
 logger = logging.getLogger(__name__)
 
@@ -298,13 +299,14 @@ def _build_automl_info(metrics_all: dict, artifacts: dict) -> Optional[AutoMLInf
     if not bool(metrics_all.get("automl", False)):
         return None
     automl_artifacts = artifacts.get("automl") if isinstance(artifacts.get("automl"), dict) else {}
+    raw_metric = automl_artifacts.get("metric_optimized")
     return AutoMLInfo(
         isBest=bool(automl_artifacts.get("is_best", True)),
         bestEstimator=metrics_all.get("best_estimator"),
         nIterations=metrics_all.get("n_iterations"),
         totalTimeS=metrics_all.get("total_time_s"),
         timeBudgetS=automl_artifacts.get("time_budget_s"),
-        metricOptimized=automl_artifacts.get("metric_optimized"),
+        metricOptimized=_clean_scoring_name(str(raw_metric)) if raw_metric is not None else None,
     )
 
 
@@ -387,16 +389,36 @@ def _build_grid_search_info(artifacts: dict) -> Optional[GridSearchInfo]:
             mapped.append(entry)
         cv_results_summary = mapped or None
 
+    all_nan = bool(gs.get("all_nan_scores", False))
+    gs_warnings: list[dict] = []
+    if all_nan:
+        gs_warnings.append({
+            "severity": "error",
+            "code": "GS_ALL_NAN",
+            "message": (
+                "GridSearch produced no valid scores. "
+                "The model was trained without hyperparameter optimisation."
+            ),
+        })
+
     best_score = gs.get("best_score")
+    raw_scoring = gs.get("scoring") or gs.get("refit_metric")
     return GridSearchInfo(
         enabled=True,
         searchType=gs.get("search_type") or None,
         cvBestScore=float(best_score) if best_score is not None else None,
-        cvScoring=str(gs["scoring"]) if gs.get("scoring") else None,
+        cvScoring=_clean_scoring_name(str(raw_scoring)) if raw_scoring else None,
         bestParams=gs.get("best_params") if isinstance(gs.get("best_params"), dict) else None,
         cvSplits=int(gs["cv_splits"]) if gs.get("cv_splits") else None,
         nCandidates=int(gs["n_candidates"]) if gs.get("n_candidates") else None,
         cvResultsSummary=cv_results_summary,
+        gridSearchFailed=all_nan,
+        gridSearchFailureReason=(
+            "All candidate scores were NaN — "
+            "the parameter grid may be incompatible with this dataset or model."
+            if all_nan else None
+        ),
+        warnings=gs_warnings,
     )
 
 
@@ -405,22 +427,41 @@ def _build_balancing_info(artifacts: dict) -> Optional[BalancingInfo]:
     if not isinstance(bal, dict):
         return None
     ratio = bal.get("imbalance_ratio")
+    raw_refit = bal.get("refit_metric")
     return BalancingInfo(
         strategyApplied=str(bal["strategy_applied"]) if bal.get("strategy_applied") is not None else None,
-        refitMetric=str(bal["refit_metric"]) if bal.get("refit_metric") is not None else None,
+        refitMetric=_clean_scoring_name(str(raw_refit)) if raw_refit is not None else None,
         imbalanceRatio=float(ratio) if ratio is not None else None,
     )
 
 
 def _build_metrics_summary(mget: callable, task_type: str) -> MetricsSummary:
+    is_regression = task_type == "regression"
     return MetricsSummary(
-        accuracy=mget("accuracy"),
-        rocAuc=mget("roc_auc"),
-        f1=mget("f1") if task_type != "regression" else None,
-        r2=mget("r2") if task_type == "regression" else None,
-        rmse=mget("rmse") if task_type == "regression" else None,
-        mae=mget("mae") if task_type == "regression" else None,
-        mse=mget("mse") if task_type == "regression" else None,
+        accuracy=None if is_regression else mget("accuracy"),
+        precision=None if is_regression else mget("precision"),
+        recall=None if is_regression else mget("recall"),
+        f1=None if is_regression else mget("f1"),
+        rocAuc=None if is_regression else mget("roc_auc"),
+        prAuc=None if is_regression else mget("pr_auc"),
+        balancedAccuracy=None if is_regression else mget("balanced_accuracy"),
+        specificity=None if is_regression else mget("specificity"),
+        f1Pos=None if is_regression else mget("f1_pos"),
+        precisionPos=None if is_regression else mget("precision_pos"),
+        recallPos=None if is_regression else mget("recall_pos"),
+        precisionMacro=None if is_regression else mget("precision_macro"),
+        recallMacro=None if is_regression else mget("recall_macro"),
+        f1Macro=None if is_regression else mget("f1_macro"),
+        precisionWeighted=None if is_regression else mget("precision_weighted"),
+        recallWeighted=None if is_regression else mget("recall_weighted"),
+        f1Weighted=None if is_regression else mget("f1_weighted"),
+        precisionMicro=None if is_regression else mget("precision_micro"),
+        recallMicro=None if is_regression else mget("recall_micro"),
+        f1Micro=None if is_regression else mget("f1_micro"),
+        r2=mget("r2") if is_regression else None,
+        rmse=mget("rmse") if is_regression else None,
+        mae=mget("mae") if is_regression else None,
+        mse=mget("mse") if is_regression else None,
     )
 
 
@@ -499,7 +540,7 @@ def model_to_detail_result(
     raw_test = ps_block.get("value")
     test_score = cv_test_score if is_cv and cv_test_score is not None else (float(raw_test) if raw_test is not None else primary.value)
 
-    baseline = artifacts.get("baseline_majority")
+    baseline_data = artifacts.get("baseline")
     raw_artifact_warnings = artifacts.get("artifact_warnings") or []
     analysis = AnalysisBlock(
         crossValidation=cv_info,
@@ -508,7 +549,7 @@ def model_to_detail_result(
         residualAnalysis=artifacts.get("residual_analysis"),
         confusionMatrix=artifacts.get("confusion_matrix"),
         classDistribution=artifacts.get("class_distribution"),
-        baselineMajority=float(baseline) if baseline is not None else None,
+        baseline=baseline_data if isinstance(baseline_data, dict) else None,
         metricsWarnings=flat_metrics.get("warnings", []) if isinstance(flat_metrics.get("warnings"), list) else [],
         artifactWarnings=[w for w in raw_artifact_warnings if isinstance(w, dict) and w.get("artifact") in {"residual_analysis"}],
     )

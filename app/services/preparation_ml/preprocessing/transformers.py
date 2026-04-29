@@ -1,21 +1,91 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+import logging
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level clip-warning buffer
+# ---------------------------------------------------------------------------
+
+_clip_warnings: List[Dict] = []
+
+
+def get_clip_warnings() -> List[Dict]:
+    """Return a copy of all clip events recorded since the last clear."""
+    return list(_clip_warnings)
+
+
+def clear_clip_warnings() -> None:
+    """Reset the clip-warning buffer."""
+    _clip_warnings.clear()
+
+
+def _record_clip_event(
+    transformer_name: str,
+    col_name: str,
+    n_clipped: int,
+    min_observed: float,
+    clip_floor: float,
+    transform_name: str,
+) -> None:
+    logger.warning(
+        "[%s] Clipping %d negative/zero value(s) in column '%s' before %s transform. "
+        "Min value observed: %.6g. These values will be treated as %g.",
+        transformer_name, n_clipped, col_name, transform_name, min_observed, clip_floor,
+    )
+    _clip_warnings.append({
+        "transformer": transformer_name,
+        "column": col_name,
+        "n_clipped": n_clipped,
+        "min_observed": min_observed,
+        "clip_floor": clip_floor,
+        "transform": transform_name,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Transformers
+# ---------------------------------------------------------------------------
 
 class LogTransformer(BaseEstimator, TransformerMixin):
     """log(x) transform — clips négatifs à ε pour robustesse à l'inférence."""
 
     def fit(self, X: Any, y: Any = None) -> "LogTransformer":
+        if isinstance(X, pd.DataFrame):
+            self.column_names_: Optional[List[str]] = [str(c) for c in X.columns]
+        else:
+            self.column_names_ = None
         return self
 
     def transform(self, X: Any) -> np.ndarray:
         arr = np.asarray(X, dtype=float)
-        return np.log(np.clip(arr, 1e-10, None))
+        clip_min = 1e-10
+        col_names = getattr(self, "column_names_", None)
+
+        if arr.ndim == 1:
+            n_neg = int(np.sum(arr < clip_min))
+            if n_neg > 0:
+                name = col_names[0] if col_names else "col_0"
+                _record_clip_event("LogTransformer", name, n_neg, float(arr.min()), clip_min, "log")
+        else:
+            for i in range(arr.shape[1]):
+                col = arr[:, i]
+                n_neg = int(np.sum(col < clip_min))
+                if n_neg > 0:
+                    name = (
+                        col_names[i]
+                        if col_names and i < len(col_names)
+                        else f"col_{i}"
+                    )
+                    _record_clip_event("LogTransformer", name, n_neg, float(col.min()), clip_min, "log")
+
+        return np.log(np.clip(arr, clip_min, None))
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         return np.exp(np.asarray(X, dtype=float))
@@ -25,11 +95,35 @@ class SqrtTransformer(BaseEstimator, TransformerMixin):
     """√x transform — clips négatifs à 0 pour robustesse à l'inférence."""
 
     def fit(self, X: Any, y: Any = None) -> "SqrtTransformer":
+        if isinstance(X, pd.DataFrame):
+            self.column_names_: Optional[List[str]] = [str(c) for c in X.columns]
+        else:
+            self.column_names_ = None
         return self
 
     def transform(self, X: Any) -> np.ndarray:
         arr = np.asarray(X, dtype=float)
-        return np.sqrt(np.clip(arr, 0.0, None))
+        clip_min = 0.0
+        col_names = getattr(self, "column_names_", None)
+
+        if arr.ndim == 1:
+            n_neg = int(np.sum(arr < clip_min))
+            if n_neg > 0:
+                name = col_names[0] if col_names else "col_0"
+                _record_clip_event("SqrtTransformer", name, n_neg, float(arr.min()), clip_min, "sqrt")
+        else:
+            for i in range(arr.shape[1]):
+                col = arr[:, i]
+                n_neg = int(np.sum(col < clip_min))
+                if n_neg > 0:
+                    name = (
+                        col_names[i]
+                        if col_names and i < len(col_names)
+                        else f"col_{i}"
+                    )
+                    _record_clip_event("SqrtTransformer", name, n_neg, float(col.min()), clip_min, "sqrt")
+
+        return np.sqrt(np.clip(arr, clip_min, None))
 
     def inverse_transform(self, X: Any) -> np.ndarray:
         return np.asarray(X, dtype=float) ** 2

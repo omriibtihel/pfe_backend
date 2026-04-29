@@ -51,7 +51,11 @@ from app.services.preparation_ml.splitters import (
 from app.services.training.pipeline.trainer import Trainer
 from app.services.training.pipeline.cv_utils import _build_cv_splitter, _choose_refit_metric
 from sklearn.model_selection import GridSearchCV as _GridSearchCV
-from app.services.preparation_ml.preprocessing.transformers import ColumnAligner
+from app.services.preparation_ml.preprocessing.transformers import (
+    ColumnAligner,
+    get_clip_warnings,
+    clear_clip_warnings,
+)
 
 logger = logging.getLogger(__name__)
 _DENSE_REQUIRED_MODELS = {"naivebayes", "mlp"}
@@ -156,18 +160,43 @@ def _ensure_dense_matrix(X: Any) -> Any:
     return X.toarray() if hasattr(X, "toarray") else X
 
 
-def _log_variance_threshold(model_type: str, n_before: int, n_after: int, threshold: float) -> None:
+def _log_variance_threshold(
+    model_type: str,
+    n_before: int,
+    n_after: int,
+    threshold: float,
+    feature_selector: Any = None,
+    feature_names_before: Optional[list] = None,
+) -> list[str]:
     n_removed = n_before - n_after
-    if n_removed > 0:
-        logger.info(
-            "VarianceThreshold(thr=%.4f) model=%s: %d/%d features supprimées (variance < seuil).",
-            threshold, model_type, n_removed, n_before,
-        )
-    else:
+    if n_removed == 0:
         logger.debug(
-            "VarianceThreshold(thr=%.4f) model=%s: aucune feature supprimée (%d features conservées).",
+            "VarianceThreshold(thr=%.4g) model=%s: no features removed (%d kept).",
             threshold, model_type, n_before,
         )
+        return []
+    dropped_names: list = []
+    if feature_selector is not None and feature_names_before:
+        try:
+            mask = feature_selector.get_support()
+            dropped_names = [n for n, kept in zip(feature_names_before, mask) if not kept]
+        except Exception:
+            pass
+    if dropped_names:
+        names_str = ", ".join(str(n) for n in dropped_names[:20])
+        if len(dropped_names) > 20:
+            names_str += f", … (+{len(dropped_names) - 20} more)"
+        msg = (
+            f"[VarianceThreshold] Removed {n_removed} constant feature(s) for model={model_type}: "
+            f"{names_str}. Set variance_threshold=0.0 to keep all non-constant features."
+        )
+    else:
+        msg = (
+            f"[VarianceThreshold] Removed {n_removed}/{n_before} feature(s) for model={model_type} "
+            f"(variance < {threshold:.4g}). Set variance_threshold=0.0 to keep all non-constant features."
+        )
+    logger.warning(msg)
+    return [msg]
 
 
 def _build_inference_pipeline(
@@ -389,6 +418,27 @@ def _aggregate_cv_metrics(fold_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _compute_oof_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """Compute regression metrics on pooled out-of-fold predictions.
+
+    Aggregating RMSE per fold via the arithmetic mean is biased by Jensen's
+    inequality: ``mean(sqrt(MSE_i)) < sqrt(mean(MSE_i))``. R² aggregated per
+    fold also diverges from the pooled OOF R² when fold sizes or target
+    variances differ. This helper recomputes both on the concatenated OOF
+    predictions, which is the statistically correct CV estimate.
+    """
+    from sklearn.metrics import mean_squared_error, r2_score
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    mse = float(mean_squared_error(y_true, y_pred))
+    return {
+        "rmse": float(np.sqrt(mse)),
+        "mse":  mse,
+        "r2":   float(r2_score(y_true, y_pred)),
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Holdout pipeline (original, preserved)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -521,14 +571,31 @@ def _run_holdout(
     fe_transformer = FeatureEngineeringTransformer(fe_defs)
     X_train_fe = fe_transformer.fit_transform(X_train_aligned)
     spec = build_preprocessor(X_train_fe, effective_preprocessing, kind_overrides=kind_overrides)
+    clear_clip_warnings()
     X_train_prepared = spec.preprocessor.fit_transform(X_train_fe, np.asarray(split.y_train))
+    _prep_clip_warnings = get_clip_warnings()
+    clear_clip_warnings()
 
-    # Fit VarianceThreshold on prepared train data, then apply to remove zero-variance features.
+    # VarianceThreshold after StandardScaler: threshold=0.0 removes only
+    # perfectly constant features. Higher values (e.g. 0.01) would
+    # incorrectly drop rare binary features (prevalence ~1%) whose
+    # clinical relevance may be high.
+    _vt_holdout_w: list[str] = []
     if spec.feature_selector is not None:
         _vt_n_before = X_train_prepared.shape[1] if hasattr(X_train_prepared, "shape") else 0
+        _vt_names_before: list = []
+        try:
+            _vt_names_before = list(spec.preprocessor.get_feature_names_out())
+        except Exception:
+            pass
         spec.feature_selector.fit(X_train_prepared)
         X_train_prepared = spec.feature_selector.transform(X_train_prepared)
-        _log_variance_threshold(model_type_norm, _vt_n_before, X_train_prepared.shape[1], cfg.preprocessing.variance_threshold)
+        _vt_holdout_w = _log_variance_threshold(
+            model_type_norm, _vt_n_before, X_train_prepared.shape[1],
+            cfg.preprocessing.variance_threshold,
+            feature_selector=spec.feature_selector,
+            feature_names_before=_vt_names_before,
+        )
         if X_train_prepared.shape[1] == 0:
             raise RuntimeError(
                 f"Preprocessing a supprimé toutes les features pour le modèle '{model_type_norm}'. "
@@ -933,11 +1000,20 @@ def _run_holdout(
         metrics_json["test_label"] = "Entraînement uniquement — aucun jeu de test"
         metrics_json["evaluation_strategy"] = "train_only"
     postfit_w: list[str] = list(executor.postfit_warnings or [])
-    all_warnings: list[str] = list(hp_warnings) + postfit_w + [
+    _clip_strs = [
+        f"CLIP_NEGATIVE in '{w['column']}': {w['n_clipped']} value(s) clipped before "
+        f"{w['transform']} transform (min={w['min_observed']:.6g})"
+        for w in _prep_clip_warnings
+    ]
+    all_warnings: list[str] = list(hp_warnings) + postfit_w + _clip_strs + _vt_holdout_w + [
         f"Artefact {w['artifact']} non calculé ({w['error']})" for w in artifact_warnings
     ]
     if all_warnings:
         metrics_json["warnings"] = all_warnings
+    if _prep_clip_warnings:
+        metrics_json["clip_warnings"] = [
+            {"severity": "warning", "code": "CLIP_NEGATIVE", **w} for w in _prep_clip_warnings
+        ]
     if val_metrics is not None:
         metrics_json["val"] = val_metrics
 
@@ -963,6 +1039,82 @@ def _run_holdout(
 # ──────────────────────────────────────────────────────────────────────────────
 # K-Fold / Stratified K-Fold CV pipeline
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _collect_fold_warnings(
+    fold_results: list[dict],
+    *,
+    collapse_threshold: int = 3,
+) -> tuple[list[dict], list[str]]:
+    """
+    Surface per-fold warnings that were previously stored in fold_results but
+    never propagated to metrics_json["warnings"].
+
+    Each entry in fold_results["warnings"] is normalised to a dict and enriched
+    with "fold" and "context" fields.  When the same (code, message) pair
+    appears in more than *collapse_threshold* folds it is collapsed into a
+    single FOLD_WARNING_REPEATED summary to prevent warning overload for large K.
+
+    Returns:
+        structured  — list[dict] suitable for metrics_json["fold_warnings"]
+        string_list — list[str]  to append to the existing all_warnings string list
+    """
+    raw: list[dict] = []
+    n_folds_total = len(fold_results)
+    for fr in fold_results:
+        fold_num = fr.get("fold", "?")
+        for w in fr.get("warnings", []):
+            if isinstance(w, str):
+                entry: dict[str, Any] = {
+                    "severity": "warning",
+                    "code": "FOLD_WARNING",
+                    "message": w,
+                }
+            elif isinstance(w, dict):
+                entry = dict(w)
+            else:
+                continue
+            entry["fold"] = fold_num
+            entry["context"] = "cv_fold"
+            raw.append(entry)
+
+    if not raw:
+        return [], []
+
+    # Group by (code, message) to detect same-warning repetition across folds.
+    groups: dict[tuple, list[dict]] = {}
+    for entry in raw:
+        key = (entry.get("code", "FOLD_WARNING"), entry.get("message", ""))
+        groups.setdefault(key, []).append(entry)
+
+    structured: list[dict] = []
+    for (code, message), entries in groups.items():
+        if len(entries) > collapse_threshold:
+            affected = sorted(
+                e["fold"] for e in entries if e.get("fold") is not None
+            )
+            structured.append({
+                "severity": entries[0].get("severity", "warning"),
+                "code": "FOLD_WARNING_REPEATED",
+                "message": (
+                    f"'{code}' appeared in {len(entries)}/{n_folds_total} folds "
+                    f"(folds {','.join(str(f) for f in affected)}): {message}"
+                ),
+                "affected_folds": affected,
+                "context": "cv_fold",
+            })
+        else:
+            structured.extend(entries)
+
+    string_list: list[str] = []
+    for s in structured:
+        if s.get("code") == "FOLD_WARNING_REPEATED":
+            string_list.append(s["message"])
+        else:
+            f_num = s.get("fold", "?")
+            string_list.append(f"fold {f_num}: {s.get('message', s.get('code', ''))}")
+
+    return structured, string_list
+
 
 def _run_kfold_cv(
     df: pd.DataFrame,
@@ -1204,6 +1356,11 @@ def _run_kfold_cv(
     # OOF predictions accumulated for leakage-free threshold calibration.
     oof_proba_parts: list = []
     oof_true_parts: list = []
+    # OOF predicted class labels (classification) for pooled bootstrap CIs.
+    oof_y_pred_class_parts: list = []
+    # OOF predictions (regression only) for unbiased pooled RMSE/R² recomputation.
+    oof_y_true_reg: list = []
+    oof_y_pred_reg: list = []
 
     # ── Per-fold loop ─────────────────────────────────────────────────────────
     for fold_idx, (train_idx, val_idx) in enumerate(folds_list):
@@ -1237,12 +1394,24 @@ def _run_kfold_cv(
             X_val_prep = fold_spec.preprocessor.transform(X_val_fe)
 
             # ② b) Fit VarianceThreshold on train_fold ONLY, then apply to both (no leakage)
+            # threshold=0.0: removes only perfectly constant features (see PreprocessingConfig).
+            _vt_fold_w: list[str] = []
             if fold_spec.feature_selector is not None:
                 _vt_n_before = X_train_prep.shape[1] if hasattr(X_train_prep, "shape") else 0
+                _vt_fold_names: list = []
+                try:
+                    _vt_fold_names = list(fold_spec.preprocessor.get_feature_names_out())
+                except Exception:
+                    pass
                 fold_spec.feature_selector.fit(X_train_prep)
                 X_train_prep = fold_spec.feature_selector.transform(X_train_prep)
                 X_val_prep = fold_spec.feature_selector.transform(X_val_prep)
-                _log_variance_threshold(model_type_norm, _vt_n_before, X_train_prep.shape[1], cfg.preprocessing.variance_threshold)
+                _vt_fold_w = _log_variance_threshold(
+                    model_type_norm, _vt_n_before, X_train_prep.shape[1],
+                    cfg.preprocessing.variance_threshold,
+                    feature_selector=fold_spec.feature_selector,
+                    feature_names_before=_vt_fold_names,
+                )
                 if X_train_prep.shape[1] == 0:
                     raise RuntimeError(
                         f"Preprocessing a supprimé toutes les features pour le modèle '{model_type_norm}'. "
@@ -1272,7 +1441,7 @@ def _run_kfold_cv(
             X_f = X_train_prep
             y_f = np.asarray(y_train_fold)
             fold_fit_params: Dict[str, Any] = {}
-            fold_warnings: list[str] = []
+            fold_warnings: list[str] = list(_vt_fold_w)
             if cfg.task_type == "classification":
                 # SMOTE guard: when the minority class on this fold is too
                 # small for k_neighbors interpolation, fall back to "no
@@ -1351,6 +1520,20 @@ def _run_kfold_cv(
                         oof_true_parts.append(np.asarray(y_val_fold))
                     except Exception:
                         pass
+                # Pooled OOF y_pred (classes) feeds the bootstrap CI step below.
+                try:
+                    oof_y_pred_class_parts.append(np.asarray(val_eval.predictions))
+                except Exception:
+                    pass
+
+            # Collect OOF predictions (regression) for unbiased pooled metrics.
+            # Skipped for classification to avoid unnecessary memory use.
+            if cfg.task_type == "regression":
+                try:
+                    oof_y_pred_reg.append(np.asarray(val_eval.predictions))
+                    oof_y_true_reg.append(np.asarray(y_val_fold))
+                except Exception:
+                    pass
 
             smote_added: Optional[int] = None
             if cfg.task_type == "classification" and fold_decision.strategy in {"smote", "smote_tomek"}:
@@ -1404,6 +1587,87 @@ def _run_kfold_cv(
         )
 
     cv_summary = _aggregate_cv_metrics(fold_results)
+
+    # ── Pooled OOF recomputation for regression (unbiased RMSE/MSE/R²) ────────
+    # _aggregate_cv_metrics averages each metric across folds — correct for MAE
+    # but biased for RMSE (Jensen) and divergent for R².  We recompute these
+    # three on the concatenated OOF predictions and override them in
+    # cv_summary["mean"]; MAE and all other entries stay untouched.
+    if cfg.task_type == "regression" and oof_y_true_reg and oof_y_pred_reg:
+        try:
+            _oof_y_true = np.concatenate(oof_y_true_reg)
+            _oof_y_pred = np.concatenate(oof_y_pred_reg)
+            _pooled = _compute_oof_regression_metrics(_oof_y_true, _oof_y_pred)
+            _mean_block = cv_summary.get("mean") if isinstance(cv_summary.get("mean"), dict) else {}
+            _mean_block["rmse"] = _pooled["rmse"]
+            _mean_block["mse"]  = _pooled["mse"]
+            _mean_block["r2"]   = _pooled["r2"]
+            _mean_block["oof_sample_count"] = int(len(_oof_y_true))
+            cv_summary["mean"] = _mean_block
+            logger.info(
+                "CV regression metrics recomputed on %d OOF predictions (pooled): "
+                "RMSE=%.4f, R²=%.4f",
+                len(_oof_y_true), _pooled["rmse"], _pooled["r2"],
+            )
+        except Exception as exc:
+            _log_event(
+                "training.cv.oof_regression_recompute_failed",
+                model_type=model_type_norm,
+                reason=str(exc),
+            )
+
+    # ── Bootstrap confidence intervals on pooled OOF predictions ──────────────
+    # Mirrors the holdout path so the frontend reads the same shape under
+    # metrics_json["confidence_intervals"] regardless of split method.
+    bootstrap_cis_cv: Optional[Dict[str, Any]] = None
+    _ci_y_true: Optional[np.ndarray] = None
+    _ci_y_pred: Optional[np.ndarray] = None
+    _ci_y_score: Optional[np.ndarray] = None
+    if cfg.task_type == "regression" and oof_y_true_reg and oof_y_pred_reg:
+        try:
+            _ci_y_true = np.concatenate(oof_y_true_reg)
+            _ci_y_pred = np.concatenate(oof_y_pred_reg)
+        except Exception:
+            _ci_y_true = None
+            _ci_y_pred = None
+    elif cfg.task_type == "classification" and oof_true_parts and oof_y_pred_class_parts:
+        try:
+            _ci_y_true = np.concatenate([np.asarray(a) for a in oof_true_parts])
+            _ci_y_pred = np.concatenate([np.asarray(a) for a in oof_y_pred_class_parts])
+        except Exception:
+            _ci_y_true = None
+            _ci_y_pred = None
+        if oof_proba_parts:
+            try:
+                _proba_pooled = np.vstack(oof_proba_parts)
+                if _proba_pooled.ndim == 2 and _proba_pooled.shape[1] == 2:
+                    _ci_y_score = _proba_pooled[:, 1]
+                elif _proba_pooled.ndim == 1:
+                    _ci_y_score = _proba_pooled
+            except Exception:
+                _ci_y_score = None
+
+    if _ci_y_true is not None and _ci_y_pred is not None:
+        _n_ci = int(len(_ci_y_true))
+        if _n_ci < 30:
+            logger.warning(
+                "Skipping bootstrap CIs in CV mode — fewer than 30 OOF samples (%d)",
+                _n_ci,
+            )
+        else:
+            try:
+                bootstrap_cis_cv = compute_bootstrap_cis(
+                    _ci_y_true, _ci_y_pred,
+                    y_score=_ci_y_score,
+                    task_type=cfg.task_type,
+                )
+            except Exception as exc:
+                _log_event(
+                    "training.cv.bootstrap_ci_failed",
+                    model_type=model_type_norm,
+                    reason=str(exc),
+                )
+
     _log_event(
         "training.cv.end",
         model_type=model_type_norm,
@@ -1440,14 +1704,31 @@ def _run_kfold_cv(
     final_fe = FeatureEngineeringTransformer(fe_defs)
     X_refit_fe = final_fe.fit_transform(X_refit_aligned)
     final_spec = build_preprocessor(X_refit_fe, effective_preprocessing, kind_overrides=kind_overrides)
+    clear_clip_warnings()
     X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_fe, y_refit)
+    _prep_clip_warnings = get_clip_warnings()
+    clear_clip_warnings()
 
-    # Fit VarianceThreshold on refit data, then apply (anti-leakage: test set transforms later via pipeline)
+    # VarianceThreshold after StandardScaler: threshold=0.0 removes only
+    # perfectly constant features. Higher values (e.g. 0.01) would
+    # incorrectly drop rare binary features (prevalence ~1%) whose
+    # clinical relevance may be high.
+    _vt_refit_w: list[str] = []
     if final_spec.feature_selector is not None:
         _vt_n_before = X_refit_prep.shape[1] if hasattr(X_refit_prep, "shape") else 0
+        _vt_refit_names: list = []
+        try:
+            _vt_refit_names = list(final_spec.preprocessor.get_feature_names_out())
+        except Exception:
+            pass
         final_spec.feature_selector.fit(X_refit_prep)
         X_refit_prep = final_spec.feature_selector.transform(X_refit_prep)
-        _log_variance_threshold(model_type_norm, _vt_n_before, X_refit_prep.shape[1], cfg.preprocessing.variance_threshold)
+        _vt_refit_w = _log_variance_threshold(
+            model_type_norm, _vt_n_before, X_refit_prep.shape[1],
+            cfg.preprocessing.variance_threshold,
+            feature_selector=final_spec.feature_selector,
+            feature_names_before=_vt_refit_names,
+        )
 
     if model_type_norm in _DENSE_REQUIRED_MODELS:
         X_refit_prep = _ensure_dense_matrix(X_refit_prep)
@@ -1634,7 +1915,9 @@ def _run_kfold_cv(
         X_all=X_all,
         y_all=y_all,
         X_cv=X_cv,
+        y_cv=y_cv,
         X_test_holdout=X_test_holdout,
+        y_test_holdout=y_test_holdout,
         final_spec=final_spec,
         fitted_pipeline=fitted_pipe,
         balancing_audit=balancing_audit,
@@ -1682,12 +1965,28 @@ def _run_kfold_cv(
     }
     if has_holdout_test and holdout_test_metrics is not None:
         metrics_json["holdout_test_metrics"] = holdout_test_metrics
+    metrics_json["threshold_used"] = optimal_threshold
     metrics_json["threshold_source"] = threshold_calibration_source
+    metrics_json["confidence_intervals"] = bootstrap_cis_cv
     cv_instability = cv_summary.get("instability_warnings", [])
     postfit_w = list(getattr(final_executor, "postfit_warnings", None) or [])
-    all_warnings: list[str] = list(hp_warnings) + list(cv_instability) + postfit_w
+    _clip_strs = [
+        f"CLIP_NEGATIVE in '{w['column']}': {w['n_clipped']} value(s) clipped before "
+        f"{w['transform']} transform (min={w['min_observed']:.6g})"
+        for w in _prep_clip_warnings
+    ]
+    _fold_structured, _fold_strs = _collect_fold_warnings(fold_results)
+    all_warnings: list[str] = (
+        list(hp_warnings) + list(cv_instability) + postfit_w + _clip_strs + _vt_refit_w + _fold_strs
+    )
     if all_warnings:
         metrics_json["warnings"] = all_warnings
+    if _prep_clip_warnings:
+        metrics_json["clip_warnings"] = [
+            {"severity": "warning", "code": "CLIP_NEGATIVE", **w} for w in _prep_clip_warnings
+        ]
+    if _fold_structured:
+        metrics_json["fold_warnings"] = _fold_structured
 
     return ModelRunResult(
         model_type=model_type_norm,
@@ -1828,12 +2127,27 @@ def _run_loo(
             X_val_fe = fold_fe.transform(X_val_aligned)
             X_val_prep = fold_spec.preprocessor.transform(X_val_fe)
 
+            # VarianceThreshold after StandardScaler: threshold=0.0 removes only
+            # perfectly constant features. Higher values (e.g. 0.01) would
+            # incorrectly drop rare binary features (prevalence ~1%) whose
+            # clinical relevance may be high.
+            _vt_loo_fold_w: list[str] = []
             if fold_spec.feature_selector is not None:
                 _vt_n_before = X_train_prep.shape[1] if hasattr(X_train_prep, "shape") else 0
+                _vt_loo_fold_names: list = []
+                try:
+                    _vt_loo_fold_names = list(fold_spec.preprocessor.get_feature_names_out())
+                except Exception:
+                    pass
                 fold_spec.feature_selector.fit(X_train_prep)
                 X_train_prep = fold_spec.feature_selector.transform(X_train_prep)
                 X_val_prep = fold_spec.feature_selector.transform(X_val_prep)
-                _log_variance_threshold(model_type_norm, _vt_n_before, X_train_prep.shape[1], cfg.preprocessing.variance_threshold)
+                _vt_loo_fold_w = _log_variance_threshold(
+                    model_type_norm, _vt_n_before, X_train_prep.shape[1],
+                    cfg.preprocessing.variance_threshold,
+                    feature_selector=fold_spec.feature_selector,
+                    feature_names_before=_vt_loo_fold_names,
+                )
 
             if model_type_norm in _DENSE_REQUIRED_MODELS:
                 X_train_prep = _ensure_dense_matrix(X_train_prep)
@@ -1846,7 +2160,7 @@ def _run_loo(
             y_f = np.asarray(y_train_fold)
             fold_fit_params: Dict[str, Any] = {}
 
-            fold_warnings: list[str] = []
+            fold_warnings: list[str] = list(_vt_loo_fold_w)
             if cfg.task_type == "classification":
                 fold_profile = profile_binary_dataset(y_train_fold, X_train_fold.shape)
                 fold_decision = resolve(
@@ -1922,10 +2236,12 @@ def _run_loo(
     y_pred_arr = np.asarray(y_pred_loo)
     y_proba_arr = np.asarray(y_proba_loo) if y_proba_loo else None
 
+    # Initialise outside the if/else so it remains in scope for the
+    # bootstrap CI block below regardless of task type.
+    y_score_loo: Optional[np.ndarray] = None
     if cfg.task_type == "classification":
         _labels = np.unique(y_all)
 
-        y_score_loo = None
         if y_proba_arr is not None:
             if y_proba_arr.ndim == 2 and y_proba_arr.shape[1] == 2:
                 y_score_loo = y_proba_arr[:, 1]
@@ -1944,6 +2260,28 @@ def _run_loo(
         )
     else:
         loo_metrics = regression_metrics(y_true_arr, y_pred_arr)
+
+    # ── Bootstrap confidence intervals on pooled LOO predictions ──────────────
+    bootstrap_cis_loo: Optional[Dict[str, Any]] = None
+    _n_loo_ci = int(len(y_true_arr))
+    if _n_loo_ci < 30:
+        logger.warning(
+            "Skipping bootstrap CIs in CV mode — fewer than 30 OOF samples (%d)",
+            _n_loo_ci,
+        )
+    else:
+        try:
+            bootstrap_cis_loo = compute_bootstrap_cis(
+                y_true_arr, y_pred_arr,
+                y_score=(y_score_loo if cfg.task_type == "classification" else None),
+                task_type=cfg.task_type,
+            )
+        except Exception as exc:
+            _log_event(
+                "training.loo.bootstrap_ci_failed",
+                model_type=model_type_norm,
+                reason=str(exc),
+            )
 
     # cv_summary-compatible structure for reporter reuse
     loo_flat = _extract_scalar_metrics(loo_metrics)
@@ -1979,12 +2317,30 @@ def _run_loo(
     final_fe = FeatureEngineeringTransformer(fe_defs)
     X_refit_fe = final_fe.fit_transform(X_refit_aligned)
     final_spec = build_preprocessor(X_refit_fe, effective_preprocessing, kind_overrides=kind_overrides)
+    clear_clip_warnings()
     X_refit_prep = final_spec.preprocessor.fit_transform(X_refit_fe, y_all)
+    _prep_clip_warnings = get_clip_warnings()
+    clear_clip_warnings()
+    # VarianceThreshold after StandardScaler: threshold=0.0 removes only
+    # perfectly constant features. Higher values (e.g. 0.01) would
+    # incorrectly drop rare binary features (prevalence ~1%) whose
+    # clinical relevance may be high.
+    _vt_loo_refit_w: list[str] = []
     if final_spec.feature_selector is not None:
         _vt_n_before = X_refit_prep.shape[1] if hasattr(X_refit_prep, "shape") else 0
+        _vt_loo_refit_names: list = []
+        try:
+            _vt_loo_refit_names = list(final_spec.preprocessor.get_feature_names_out())
+        except Exception:
+            pass
         final_spec.feature_selector.fit(X_refit_prep)
         X_refit_prep = final_spec.feature_selector.transform(X_refit_prep)
-        _log_variance_threshold(model_type_norm, _vt_n_before, X_refit_prep.shape[1], cfg.preprocessing.variance_threshold)
+        _vt_loo_refit_w = _log_variance_threshold(
+            model_type_norm, _vt_n_before, X_refit_prep.shape[1],
+            cfg.preprocessing.variance_threshold,
+            feature_selector=final_spec.feature_selector,
+            feature_names_before=_vt_loo_refit_names,
+        )
     if model_type_norm in _DENSE_REQUIRED_MODELS:
         X_refit_prep = _ensure_dense_matrix(X_refit_prep)
 
@@ -2127,7 +2483,9 @@ def _run_loo(
         X_all=X_all,
         y_all=y_all,
         X_cv=X_all,
+        y_cv=y_all,
         X_test_holdout=None,
+        y_test_holdout=None,
         final_spec=final_spec,
         fitted_pipeline=fitted_pipe,
         balancing_audit=balancing_audit,
@@ -2160,14 +2518,30 @@ def _run_loo(
         "training_time_sec": float(time.perf_counter() - t0),
         "threshold_used": optimal_threshold,
         "threshold_source": threshold_calibration_source,
+        "confidence_intervals": bootstrap_cis_loo,
     }
     loo_instability = cv_summary.get("instability_warnings", [])
     # Include postfit_warnings (e.g. threshold_calibrated_on_train_data_may_be_optimistic)
     # so the frontend can surface threshold-related issues alongside the others.
     loo_postfit_warnings = list(final_executor.postfit_warnings or [])
-    loo_all_warnings: list[str] = list(hp_warnings) + list(loo_instability) + loo_postfit_warnings
+    _loo_clip_strs = [
+        f"CLIP_NEGATIVE in '{w['column']}': {w['n_clipped']} value(s) clipped before "
+        f"{w['transform']} transform (min={w['min_observed']:.6g})"
+        for w in _prep_clip_warnings
+    ]
+    _loo_fold_structured, _loo_fold_strs = _collect_fold_warnings(fold_results)
+    loo_all_warnings: list[str] = (
+        list(hp_warnings) + list(loo_instability) + loo_postfit_warnings
+        + _loo_clip_strs + _vt_loo_refit_w + _loo_fold_strs
+    )
     if loo_all_warnings:
         metrics_json["warnings"] = loo_all_warnings
+    if _prep_clip_warnings:
+        metrics_json["clip_warnings"] = [
+            {"severity": "warning", "code": "CLIP_NEGATIVE", **w} for w in _prep_clip_warnings
+        ]
+    if _loo_fold_structured:
+        metrics_json["fold_warnings"] = _loo_fold_structured
 
     return ModelRunResult(
         model_type=model_type_norm,

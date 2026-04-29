@@ -141,8 +141,9 @@ def create_fresh_workspace_for_dataset(
     if not raw:
         raise ValueError(f"Dataset source introuvable (id={dataset_id})")
 
+    src_suffix = Path(raw.file_path).suffix.lower() or ".csv"
     stored_name = f"rws_d{dataset_id}_u{user_id}_{uuid4().hex}"
-    ws_path = str(_workspace_dir(project_id) / f"{stored_name}.csv")
+    ws_path = str(_workspace_dir(project_id) / f"{stored_name}{src_suffix}")
 
     ws_dataset = Dataset(
         project_id=project_id,

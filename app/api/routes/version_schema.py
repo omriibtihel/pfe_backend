@@ -11,6 +11,8 @@ from app.services.nettoyage.df_utils import load_current_df
 from app.api.utils_shared.versions import load_version_df
 from app.services.data.column_inference import infer_kind_for_series, detect_parasites, numeric_extra_stats
 from app.crud import version_column_schema as crud_schema
+from app.crud import nettoyage as crud_nettoyage
+from app.models.dataset import Dataset
 from app.schemas.version_column_schema import ColumnsMetaOut, ColumnKindsIn
 
 router = APIRouter()
@@ -167,6 +169,60 @@ def set_version_column_kinds(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
+    """Persiste les overrides de kind sur la version + journalise une op
+    `set_kind`/`clear_kind` dans le workspace actif (s'il existe).
+
+    Les deux écritures sont effectuées dans une même transaction : si l'une
+    échoue, l'autre est annulée. Cela garantit la cohérence entre la
+    `VersionColumnSchema` (lue par `getVersionColumnsMeta`) et l'historique
+    d'opérations (`ProcessingOperation`, sérialisé dans `operations_json` au
+    commit du workspace).
+    """
     ensure_project_owner(db, project_id, current_user.id)
-    crud_schema.set_overrides(db, project_id, version_id, payload.overrides)
-    return {"ok": True}
+
+    try:
+        applied = crud_schema.set_overrides(
+            db, project_id, version_id, payload.overrides, commit=False
+        )
+
+        if applied:
+            ws = (
+                db.query(Dataset)
+                .filter(
+                    Dataset.project_id == project_id,
+                    Dataset.kind == "workspace",
+                    Dataset.workspace_owner_version_id == version_id,
+                    Dataset.workspace_owner_user_id == current_user.id,
+                    Dataset.is_workspace_active.is_(True),
+                )
+                .order_by(Dataset.id.desc())
+                .first()
+            )
+
+            if ws is not None:
+                for col, kind in applied.items():
+                    if kind is None:
+                        params = {"schema_action": "clear_kind", "column": col}
+                        desc = f"Schema: clear override ({col})"
+                    else:
+                        params = {"schema_action": "set_kind", "column": col, "kind": kind}
+                        desc = f"Schema: {col} → {kind}"
+
+                    crud_nettoyage.create_operation(
+                        db=db,
+                        project_id=project_id,
+                        dataset_id=ws.id,
+                        user_id=current_user.id,
+                        op_type="schema",
+                        description=desc,
+                        columns=[col],
+                        params=params,
+                        flush_only=True,
+                    )
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Schema persistence failed: {e}") from e
+
+    return {"ok": True, "applied": applied}

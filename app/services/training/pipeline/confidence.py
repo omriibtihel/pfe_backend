@@ -121,13 +121,16 @@ def _bootstrap_regression(
 
     mae_s: List[float] = []
     mse_s: List[float] = []
+    rmse_s: List[float] = []
     r2_s: List[float] = []
 
     for _ in range(n_bootstrap):
         idx = rng.integers(0, n, size=n)
         yt, yp = y_true[idx], y_pred[idx]
         mae_s.append(float(mean_absolute_error(yt, yp)))
-        mse_s.append(float(mean_squared_error(yt, yp)))
+        mse_iter = float(mean_squared_error(yt, yp))
+        mse_s.append(mse_iter)
+        rmse_s.append(float(np.sqrt(mse_iter)))
         try:
             r2_s.append(float(r2_score(yt, yp)))
         except Exception:
@@ -138,6 +141,8 @@ def _bootstrap_regression(
         metrics["mae"] = _ci_entry(np.array(mae_s), ci_level)
     if mse_s:
         metrics["mse"] = _ci_entry(np.array(mse_s), ci_level)
+    if rmse_s:
+        metrics["rmse"] = _ci_entry(np.array(rmse_s), ci_level)
     if r2_s:
         metrics["r2"] = _ci_entry(np.array(r2_s), ci_level)
 

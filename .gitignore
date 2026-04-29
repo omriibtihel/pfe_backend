@@ -25,3 +25,6 @@ storage/
 models/*.pth
 *.pth
 
+# Claude Code (local only)
+.claude/
+

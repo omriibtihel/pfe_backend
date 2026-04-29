@@ -227,13 +227,17 @@ def _run_inference(
         except Exception:
             pass
 
-    # Apply threshold for binary classification when we have probabilities
+    # Apply threshold for binary classification when we have probabilities.
+    # Note: when the pipeline is a ThresholdedClassifier the threshold has
+    # already been embedded at save time, so pipeline.predict(X) is correct
+    # and returns the original class labels — we don't enter this branch
+    # because threshold == 0.5 is the *unwrapped* default.
     if task_type == "classification" and y_score is not None and threshold != 0.5:
         classes = getattr(pipeline, "classes_", None)
         if classes is None:
             # Try to get from the model step inside a sklearn Pipeline
             named = getattr(pipeline, "named_steps", {})
-            model = named.get("model")
+            model = named.get("model") if isinstance(named, dict) else None
             classes = getattr(model, "classes_", None)
         if classes is None:
             # Fallback for FLAML AutoML (no named_steps)
@@ -243,8 +247,12 @@ def _run_inference(
                 pass
         is_binary = classes is not None and len(classes) == 2
         if is_binary:
-            pos_cls = classes[positive_class_index] if positive_class_index < len(classes) else classes[1]
-            y_pred = (y_score >= threshold).astype(type(pos_cls))
+            classes_arr = np.asarray(classes)
+            pos_idx = positive_class_index if 0 <= positive_class_index < len(classes_arr) else 1
+            neg_idx = 1 - pos_idx if pos_idx in (0, 1) else 0
+            pos_cls = classes_arr[pos_idx]
+            neg_cls = classes_arr[neg_idx]
+            y_pred = np.where(y_score >= threshold, pos_cls, neg_cls)
             return np.asarray(y_pred), y_score
 
     y_pred = pipeline.predict(X)
@@ -409,15 +417,29 @@ def predict_with_trained_model(
     # the alignment step strips columns that the pipeline doesn't expect as input.
     display_df = raw_df
 
-    # Pre-inference alignment: drop columns unknown to the model and add any
-    # missing columns as NaN.  This is a safety net for pipelines that were
-    # saved before the ColumnAligner step was introduced — without it, models
-    # such as XGBoost reject extra columns with a feature_names mismatch error.
+    # Pre-inference column validation: a *missing column* (entirely absent from
+    # the input file) is a hard error — silently filling it with NaN can mask
+    # real upload mistakes and produce predictions that look plausible but are
+    # driven entirely by the imputer's training median.  *Missing values*
+    # (NaN cells inside present columns) are fine: the imputer saved in the
+    # pipeline handles them as it did at training time.  Older models that
+    # were stored without a ``training_schema`` keep the previous lenient
+    # behaviour (no schema = nothing to validate against).
     if feature_names:
-        raw_df = raw_df.copy()
-        for col in feature_names:
-            if col not in raw_df.columns:
-                raw_df[col] = np.nan
+        received = set(raw_df.columns.tolist())
+        expected = set(feature_names)
+        missing = sorted(expected - received)
+        if missing:
+            raise RuntimeError(
+                f"Input data is missing {len(missing)} required column(s): {missing}. "
+                f"Expected columns: {sorted(feature_names)}"
+            )
+        extra = sorted(received - expected)
+        if extra:
+            logger.warning(
+                "predict.extra_columns_ignored: columns=%s will be dropped before inference",
+                extra,
+            )
         raw_df = raw_df[feature_names]
 
     # Normalize dtypes for all models (StringDtype → object, numeric strings → float,

@@ -102,7 +102,10 @@ class PreprocessingConfig:
     knn_n_neighbors: int = 5
     constant_fill_numeric: float = 0.0
     constant_fill_categorical: str = "__missing__"
-    variance_threshold: float = 0.01
+    # 0.0 = remove only perfectly constant features.  Higher values (e.g. 0.01)
+    # incorrectly drop rare binary features (prevalence ~1%) whose clinical
+    # relevance may be high.
+    variance_threshold: float = 0.0
 
     @staticmethod
     def from_front(payload: dict[str, Any]) -> "PreprocessingConfig":
@@ -262,7 +265,7 @@ class PreprocessingConfig:
         raw_cat_fill = str(adv.get("constantFillCategorical") or "").strip()
         constant_fill_categorical = raw_cat_fill if raw_cat_fill else "__missing__"
         _vt_raw = adv.get("varianceThreshold")
-        variance_threshold = max(0.0, min(1.0, float(_vt_raw))) if _vt_raw is not None else 0.01
+        variance_threshold = max(0.0, min(1.0, float(_vt_raw))) if _vt_raw is not None else 0.0
 
         return PreprocessingConfig(
             defaults=resolved_defaults,

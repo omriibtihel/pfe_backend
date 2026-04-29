@@ -145,7 +145,18 @@ def run_training_session(session_id: int) -> None:
 
                 # save artifact then persist to DB atomically:
                 # if DB write fails, remove the orphaned pkl so disk stays clean.
-                pkl_path = save_pipeline(res.fitted_pipeline, out_dir, model_type)
+                _threshold_to_embed = (
+                    res.metrics_json.get("threshold_used")
+                    if res.task_type == "classification"
+                    else None
+                )
+                _balancing_arts = res.artifacts_json.get("balancing") or {}
+                pkl_path = save_pipeline(
+                    res.fitted_pipeline, out_dir, model_type,
+                    threshold=_threshold_to_embed,
+                    positive_class_index=_balancing_arts.get("positive_class_index"),
+                    positive_label=_balancing_arts.get("positive_label"),
+                )
                 res.artifacts_json["model_pkl"] = str(pkl_path)
                 res.artifacts_json["dataset_version_id"] = dv_id
 
@@ -171,12 +182,21 @@ def run_training_session(session_id: int) -> None:
                 # Track best result for meta-learning.
                 # Skip train-only results: no real evaluation, must not be recorded as best.
                 evaluation_strategy = res.metrics_json.get("evaluation_strategy", "")
-                primary_metric_name, primary_score = _extract_primary_score(res.metrics_json)
+                primary_metric_name, primary_score, _primary_source = _extract_primary_score(
+                    res.metrics_json, cfg
+                )
                 if (
                     evaluation_strategy != "train_only"
                     and primary_metric_name is not None
                     and primary_score is not None
                 ):
+                    if _primary_source == "fallback":
+                        _configured = next(iter(cfg.metrics or []), "(none)")
+                        logger.warning(
+                            "Model %s: primary score derived from fallback metric '%s', "
+                            "not from configured '%s'. Best-model comparison may be inconsistent.",
+                            model_type, primary_metric_name, _configured,
+                        )
                     is_lower = primary_metric_name in _LOWER_IS_BETTER_METRICS
                     is_first = best_result is None
                     is_new_best = is_lower and primary_score < best_score
@@ -261,29 +281,80 @@ def run_training_session(session_id: int) -> None:
         db.close()
 
 
+# Aliases map a user-facing metric name to keys that may actually appear in
+# the stored metrics dict (e.g. "roc_auc" is stored as "roc_auc_ovr_weighted"
+# for multiclass models).
+_PRIMARY_SCORE_ALIASES: Dict[str, tuple[str, ...]] = {
+    "roc_auc":           ("roc_auc", "roc_auc_ovr_weighted"),
+    "f1":                ("f1", "f1_pos", "f1_weighted"),
+    "f1_macro":          ("f1_macro", "f1"),
+    "f1_weighted":       ("f1_weighted", "f1"),
+    "f1_micro":          ("f1_micro", "f1"),
+    "precision":         ("precision", "precision_pos", "precision_weighted"),
+    "recall":            ("recall", "recall_pos", "recall_weighted"),
+    "pr_auc":            ("pr_auc",),
+    "average_precision": ("pr_auc", "average_precision"),
+    "accuracy":          ("accuracy",),
+    "balanced_accuracy": ("balanced_accuracy", "accuracy"),
+    "r2":                ("r2",),
+    "rmse":              ("rmse",),
+    "mae":               ("mae",),
+    "mse":               ("mse",),
+    "mcc":               ("mcc",),
+}
+
+
+def _score_from_metrics_json(key: str, metrics_json: Dict[str, Any]) -> Optional[float]:
+    """Look up ``key`` in the test block then in the top-level of ``metrics_json``."""
+    test = metrics_json.get("test")
+    val = test.get(key) if isinstance(test, dict) else None
+    if val is None:
+        val = metrics_json.get(key)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
 def _extract_primary_score(
     metrics_json: Dict[str, Any],
-) -> tuple[Optional[str], Optional[float]]:
-    """Return (metric_name, score) for direction-aware best-model selection.
+    cfg: TrainingConfig,
+) -> tuple[Optional[str], Optional[float], str]:
+    """Return (metric_name, score, source) for direction-aware best-model selection.
 
-    Returns (None, None) when no real evaluation metric is available — caller
-    must skip such results (do not record them as 'best' in meta-learning).
+    ``source`` is ``"user_defined"`` when the score matches ``cfg.metrics[0]``
+    (or one of its known aliases), or ``"fallback"`` when the hardcoded priority
+    list was used because the configured metric was not found.
+
+    Returns ``(None, None, "fallback")`` when no real evaluation metric is
+    available — caller must skip such results (do not record them as 'best').
     """
+    user_metric = next(iter(cfg.metrics or []), None)
+    if user_metric:
+        user_key = str(user_metric).strip().lower()
+        for alias in _PRIMARY_SCORE_ALIASES.get(user_key, (user_key,)):
+            score = _score_from_metrics_json(alias, metrics_json)
+            if score is not None:
+                return alias, score, "user_defined"
+
+    # Fallback: original hardcoded priority list (unchanged)
     for key in ("roc_auc", "f1", "pr_auc", "accuracy", "r2", "f1_weighted", "f1_macro"):
         val = metrics_json.get("test", {}).get(key) or metrics_json.get(key)
         if val is not None:
             try:
-                return key, float(val)
+                return key, float(val), "fallback"
             except Exception:
                 pass
     for key in ("rmse", "mae", "mse"):
         val = metrics_json.get("test", {}).get(key) or metrics_json.get(key)
         if val is not None:
             try:
-                return key, float(val)
+                return key, float(val), "fallback"
             except Exception:
                 pass
-    return None, None
+    return None, None, "fallback"
 
 
 def _record_meta_learning(
@@ -370,7 +441,18 @@ def run_automl_session(session_id: int) -> None:
             est_name = res.metrics_json.get("best_estimator") or ("automl" if res.is_best else "unknown")
             pkl_name = "automl" if res.is_best else f"automl_{est_name}"
             try:
-                pkl_path = save_pipeline(res.fitted_model, out_dir, pkl_name)
+                _automl_threshold = (
+                    res.metrics_json.get("threshold_used")
+                    if res.task_type == "classification"
+                    else None
+                )
+                _automl_balancing = res.artifacts_json.get("balancing") or {}
+                pkl_path = save_pipeline(
+                    res.fitted_model, out_dir, pkl_name,
+                    threshold=_automl_threshold,
+                    positive_class_index=_automl_balancing.get("positive_class_index"),
+                    positive_label=_automl_balancing.get("positive_label") or cfg.positive_label,
+                )
                 res.artifacts_json["model_pkl"] = str(pkl_path)
             except Exception as exc:
                 logger.warning("Could not save pipeline for %s: %s", est_name, exc)

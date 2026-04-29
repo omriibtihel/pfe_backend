@@ -83,12 +83,29 @@ class PrimaryMetric(BaseModel):
 
 
 class MetricsSummary(BaseModel):
-    """3–4 métriques max, suffisantes pour la vue liste."""
+    """Selected metrics for list views and comparison table."""
     model_config = ConfigDict(populate_by_name=True)
 
     accuracy: Optional[float] = None
-    rocAuc: Optional[float] = None
+    precision: Optional[float] = None
+    recall: Optional[float] = None
     f1: Optional[float] = None
+    rocAuc: Optional[float] = None
+    prAuc: Optional[float] = None
+    balancedAccuracy: Optional[float] = None
+    specificity: Optional[float] = None
+    f1Pos: Optional[float] = None
+    precisionPos: Optional[float] = None
+    recallPos: Optional[float] = None
+    precisionMacro: Optional[float] = None
+    recallMacro: Optional[float] = None
+    f1Macro: Optional[float] = None
+    precisionWeighted: Optional[float] = None
+    recallWeighted: Optional[float] = None
+    f1Weighted: Optional[float] = None
+    precisionMicro: Optional[float] = None
+    recallMicro: Optional[float] = None
+    f1Micro: Optional[float] = None
     r2: Optional[float] = None
     rmse: Optional[float] = None
     mae: Optional[float] = None
@@ -199,6 +216,9 @@ class GridSearchInfo(BaseModel):
     cvSplits: Optional[int] = None
     nCandidates: Optional[int] = None
     cvResultsSummary: Optional[List[Dict[str, Any]]] = None
+    gridSearchFailed: bool = False
+    gridSearchFailureReason: Optional[str] = None
+    warnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class BalancingInfo(BaseModel):
@@ -218,7 +238,7 @@ class AnalysisBlock(BaseModel):
     residualAnalysis: Optional[Dict[str, Any]] = None
     confusionMatrix: Optional[List[Any]] = None
     classDistribution: Optional[Dict[str, Any]] = None
-    baselineMajority: Optional[float] = None
+    baseline: Optional[Dict[str, Any]] = None
     metricsWarnings: List[str] = Field(default_factory=list)
     artifactWarnings: List[Dict[str, Any]] = Field(default_factory=list)
 

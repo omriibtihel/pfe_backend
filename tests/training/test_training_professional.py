@@ -6,6 +6,7 @@ from app.db.base import *  # noqa: F401, F403  — registers all ORM mappers (Da
 
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.model_selection import GridSearchCV as SklearnGridSearchCV
 
 import app.services.training.pipeline.trainer as trainer_module
@@ -168,13 +169,25 @@ def test_prediction_alignment_handles_missing_and_extra_columns(tmp_path):
     )
 
     base = df.drop(columns=["Outcome"]).head(15).copy()
-    misaligned = base.drop(columns=["symptom"]).copy()
-    misaligned["unexpected_feature"] = np.arange(len(misaligned))
 
-    out = predict_with_trained_model(tm, misaligned)
+    # 1) An entirely-absent column is now a hard error: silent NaN-fill could
+    #    mask upload mistakes and let the imputer's training median drive every
+    #    prediction.
+    bad = base.drop(columns=["symptom"]).copy()
+    bad["unexpected_feature"] = np.arange(len(bad))
+    with pytest.raises(RuntimeError, match="missing"):
+        predict_with_trained_model(tm, bad)
+
+    # 2) Extra columns are still accepted (logged + dropped) and NaN cells
+    #    inside present columns flow through the saved imputer untouched.
+    ok = base.copy()
+    ok["unexpected_feature"] = np.arange(len(ok))
+    ok.loc[ok.index[0], "cholesterol"] = np.nan
+    ok.loc[ok.index[1], "symptom"] = np.nan
+    out = predict_with_trained_model(tm, ok)
     assert out["model_id"] == 999
     assert out["dataset_version_id"] == 123
-    assert out["n_rows"] == len(misaligned)
+    assert out["n_rows"] == len(ok)
     assert isinstance(out["preview"], list)
     assert len(out["preview"]) > 0
 
