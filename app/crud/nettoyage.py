@@ -65,6 +65,22 @@ def create_operation(
     return obj
 
 
+# [REFACTOR] Extracted from app/api/routes/nettoyage.undo_last so the route
+# no longer issues raw db.query() calls. Returns the most recent operation
+# (or None) without deleting it — deletion is staged by the caller.
+def get_last_operation(
+    db: Session,
+    project_id: int,
+    dataset_id: int,
+) -> Optional[ProcessingOperation]:
+    return (
+        db.query(ProcessingOperation)
+        .filter_by(project_id=project_id, dataset_id=dataset_id)
+        .order_by(ProcessingOperation.created_at.desc())
+        .first()
+    )
+
+
 def pop_last_operation(
     db: Session,
     project_id: int,

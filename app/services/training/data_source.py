@@ -33,6 +33,11 @@ def resolve_training_data_path(
     Prefers the version's own CSV over the shared processed file because the
     shared file is keyed by source_dataset_id and may contain data from other
     versions sharing the same source.
+
+    Exception: when the version's CSV path *is* literally the source's raw file
+    (raw_original case — no committed snapshot for this version), an unsaved
+    cleaning workspace at processed_dataset_<src_id>.csv must take precedence.
+    Otherwise the user's cleaning operations would be silently ignored.
     """
     dataset_path, dv_id = resolve_dataset_path(db, project_id, version_id)
 
@@ -40,8 +45,12 @@ def resolve_training_data_path(
     src_ds = dv.source_dataset if dv is not None else None
     if src_ds is not None:
         processed = processed_path_for(src_ds.file_path, src_ds.id)
+        is_raw_original = _same_file(Path(dataset_path), Path(src_ds.file_path))
 
-        if Path(dataset_path).exists():
+        # raw_original + unsaved processed → prefer the cleaned workspace.
+        if is_raw_original and processed.exists():
+            path_to_load = processed
+        elif Path(dataset_path).exists():
             path_to_load = dataset_path
         elif processed.exists():
             path_to_load = processed

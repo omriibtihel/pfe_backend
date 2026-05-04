@@ -42,7 +42,8 @@
       "Bash(echo \"TS_EXIT:$?\")",
       "Bash(.venv/Scripts/python -m pytest tests/ -v --tb=short --ignore=tests/training/test_classification_metrics.py)",
       "Bash(.venv/Scripts/python -c \"from app.schemas.training import TrainingConfigIn, TrainingRecommendationOut, ActiveModelOut; print\\('package OK'\\)\")",
-      "Bash(.venv/Scripts/python -m pytest tests/ -q --tb=line)"
+      "Bash(.venv/Scripts/python -m pytest tests/ -q --tb=line)",
+      "Bash(findstr /i \"shap explain\")"
     ],
     "additionalDirectories": [
       "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\types",
