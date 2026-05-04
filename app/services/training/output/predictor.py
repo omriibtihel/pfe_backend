@@ -478,26 +478,38 @@ def predict_with_trained_model(
     }
 
 
-def predict_with_shap(
+def predict_with_explanations(
     trained_model: TrainedModel,
     raw_df: pd.DataFrame,
+    *,
+    method: str = "shap",
 ) -> Dict[str, Any]:
     """
-    Run inference and attach per-row local SHAP explanations.
+    Run inference and attach per-row local explanations.
 
-    Delegates to predict_with_trained_model for the core prediction, then
-    adds a "shap" key to each row containing the local SHAP values.
+    Parameters
+    ----------
+    trained_model:
+        The TrainedModel ORM object.
+    raw_df:
+        The input rows to predict + explain.
+    method:
+        "shap" → row["shap"] = [{feature, shap_value, data}]
+        "lime" → row["lime"] = [{feature, contribution, data}]
+        "both" → both keys are populated
 
-    Falls back gracefully: if SHAP computation fails, rows are returned
-    without the "shap" key (no exception raised to the caller).
+    Falls back gracefully: if a method fails the corresponding key is simply
+    absent. Inference itself never fails because of explainability.
     """
+    method = (method or "shap").lower()
+    if method not in ("shap", "lime", "both"):
+        method = "shap"
+
     # Core prediction — raises on failure (pkl missing, inference error, etc.)
     result = predict_with_trained_model(trained_model, raw_df)
 
-    # SHAP enrichment — best-effort, never breaks prediction
+    # Explanation enrichment — best-effort, never breaks prediction
     try:
-        from app.services.shap import compute_local_shap
-
         artifacts = trained_model.artifacts_json or {}
         task_type = str(trained_model.task_type or "classification").lower()
         training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
@@ -516,7 +528,7 @@ def predict_with_shap(
         pipeline = load_pipeline(pkl_path)
 
         # Reload the background data saved at training time (in artifacts["shap"]).
-        # This avoids the all-zeros bug where background == input row.
+        # Reused by both SHAP and LIME: same baseline distribution, no duplication.
         background: Optional[np.ndarray] = None
         shap_artifacts = artifacts.get("shap") or {}
         raw_bg = shap_artifacts.get("background_data")
@@ -526,8 +538,7 @@ def predict_with_shap(
             except Exception:
                 background = None
 
-        # Normalize input dtypes the same way predict_with_trained_model does,
-        # then align to feature_names before passing to SHAP
+        # Align inputs the same way predict_with_trained_model does
         df_aligned = _normalize_input_dtypes(raw_df.copy(), pipeline)
         if feature_names:
             for col in feature_names:
@@ -535,23 +546,74 @@ def predict_with_shap(
                     df_aligned[col] = np.nan
             df_aligned = df_aligned[feature_names]
 
-        # Compute local SHAP for each row individually
+        want_shap = method in ("shap", "both")
+        want_lime = method in ("lime", "both")
+
+        compute_local_shap = None
+        compute_local_lime = None
+        if want_shap:
+            from app.services.shap import compute_local_shap as _csh  # type: ignore
+            compute_local_shap = _csh
+        if want_lime:
+            from app.services.lime import compute_local_lime as _cli  # type: ignore
+            compute_local_lime = _cli
+
         for i, row_result in enumerate(result["rows"]):
             row_df = df_aligned.iloc[[i]]
-            shap_items = compute_local_shap(
-                pipeline,
-                row_df,
-                task_type=task_type,
-                background=background,
-                feature_names=feature_names if feature_names else None,
-            )
-            if shap_items is not None:
-                row_result["shap"] = shap_items
+
+            if want_shap and compute_local_shap is not None:
+                try:
+                    shap_items = compute_local_shap(
+                        pipeline,
+                        row_df,
+                        task_type=task_type,
+                        background=background,
+                        feature_names=feature_names if feature_names else None,
+                    )
+                    if shap_items is not None:
+                        row_result["shap"] = shap_items
+                except Exception as exc:
+                    logger.warning(
+                        "predict_with_explanations: SHAP failed row=%d (model_id=%s): %s",
+                        i, trained_model.id, exc,
+                    )
+
+            if want_lime and compute_local_lime is not None:
+                try:
+                    lime_items = compute_local_lime(
+                        pipeline,
+                        row_df,
+                        task_type=task_type,
+                        background=background,
+                        feature_names=feature_names if feature_names else None,
+                    )
+                    if lime_items is not None:
+                        row_result["lime"] = lime_items
+                except Exception as exc:
+                    logger.warning(
+                        "predict_with_explanations: LIME failed row=%d (model_id=%s): %s",
+                        i, trained_model.id, exc,
+                    )
 
     except Exception as exc:
-        logger.warning("predict_with_shap: SHAP enrichment failed (model_id=%s): %s", trained_model.id, exc)
+        logger.warning(
+            "predict_with_explanations: enrichment failed (method=%s, model_id=%s): %s",
+            method, trained_model.id, exc,
+        )
 
     return result
+
+
+def predict_with_shap(
+    trained_model: TrainedModel,
+    raw_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """
+    Backward-compatible wrapper around predict_with_explanations(method="shap").
+
+    Kept so existing callers that import predict_with_shap keep working.
+    """
+    return predict_with_explanations(trained_model, raw_df, method="shap")
 
 
 def predict_rows_json(

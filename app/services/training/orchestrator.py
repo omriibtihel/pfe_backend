@@ -964,17 +964,17 @@ def _run_holdout(
         except Exception as e:
             artifact_warnings.append({"artifact": "residual_analysis", "error": type(e).__name__, "detail": str(e)})
 
-        # Global SHAP — computed after permutation importance.
-        # KernelExplainer can be slow; skipped for search_type != "none"
-        # (already slow from hyperparameter tuning).
-        _shap_allowed = cfg.search_type == "none"
+        # Global SHAP — computed on the final refit pipeline.
+        # When a search is active, fitted_pipe is best_estimator_ (already refit),
+        # so SHAP cost is independent of search runtime. KernelExplainer is
+        # capped internally by _KERNEL_MAX_ROWS to bound runtime.
         try:
             _shap_result = compute_global_shap(
                 fitted_pipe,
                 split.X_test,
                 task_type=cfg.task_type,
                 feature_names=list(split.X_test.columns),
-            ) if _shap_allowed else None
+            )
             if _shap_result is not None:
                 artifacts["shap"] = _shap_result
         except Exception as e:

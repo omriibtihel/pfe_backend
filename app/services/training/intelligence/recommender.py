@@ -264,7 +264,7 @@ class RecommendationEngine:
         rec = engine.recommend(profile)
     """
 
-    def recommend(self, profile: DatasetProfile) -> TrainingRecommendation:
+    def recommend(self, profile: DatasetProfile, target_column: str = "") -> TrainingRecommendation:
         models       = _recommend_models(profile)
         search_type, time_budget = _recommend_search_type(profile)
         split        = _recommend_split(profile)
@@ -329,6 +329,7 @@ class RecommendationEngine:
         }
 
         payload: dict[str, Any] = {
+            "targetColumn":  target_column,
             "taskType":      _map_task_type(profile.task_type),
             "models":        models,
             "metrics":       [metrics.primary] + metrics.secondary,

@@ -65,7 +65,7 @@ def recommend_training_config(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    rec = _engine.recommend(prof)
+    rec = _engine.recommend(prof, target_column=str(payload.target_column))
 
     profile_out = DatasetProfileOut(
         n_samples=prof.n_samples,

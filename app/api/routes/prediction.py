@@ -5,7 +5,7 @@ import io
 from datetime import datetime, timezone as _tz
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -18,9 +18,11 @@ from app.services.training.output.predictor import (
     predict_rows_json,
     predict_to_csv,
     predict_with_trained_model,
-    predict_with_shap,
+    predict_with_explanations,
     read_uploaded_dataframe,
 )
+
+ExplainMethod = str  # "shap" | "lime" | "both" — validated below
 from app.api.deps import ensure_project_owner
 from app.services.training.presenter import (
     extract_feature_names_for_prediction,
@@ -168,16 +170,20 @@ def predict_active_model_json(
 def predict_active_model_json_with_shap(
     project_id: int,
     payload: ManualPredictIn,
+    method: ExplainMethod = Query("shap", regex="^(shap|lime|both)$"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     """
-    Run inference with local SHAP explanations per row.
+    Run inference with local explanations per row.
 
-    Same as /predict/json but each row in the response includes a "shap" key
-    with per-feature SHAP values sorted by |shap_value| descending.
-    SHAP computation is best-effort: if unavailable the response still contains
-    predictions without the "shap" key.
+    Each row in the response includes one or both of:
+      - "shap": [{feature, shap_value, data}]
+      - "lime": [{feature, contribution, data}]
+
+    Controlled by the `method` query parameter (default: "shap" for backward
+    compatibility). Explanation computation is best-effort: if a method fails
+    the corresponding key is simply absent.
     """
     ensure_project_owner(db, project_id, current_user.id)
     m = _get_active_model_or_404(db, project_id)
@@ -185,7 +191,7 @@ def predict_active_model_json_with_shap(
     try:
         import pandas as pd
         raw_df = pd.DataFrame(payload.rows)
-        result = predict_with_shap(m, raw_df)
+        result = predict_with_explanations(m, raw_df, method=method)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
 
@@ -269,16 +275,20 @@ def predict_with_saved_model_json_explain(
     project_id: int,
     model_id: int,
     payload: ManualPredictIn,
+    method: ExplainMethod = Query("shap", regex="^(shap|lime|both)$"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     """
-    Run inference with local SHAP explanations per row (saved model variant).
+    Run inference with local explanations per row (saved model variant).
 
-    Same as /models/{model_id}/predict/json but each row in the response includes
-    a "shap" key with per-feature SHAP values sorted by |shap_value| descending.
-    SHAP computation is best-effort: if unavailable the response still contains
-    predictions without the "shap" key.
+    Each row in the response includes one or both of:
+      - "shap": [{feature, shap_value, data}]
+      - "lime": [{feature, contribution, data}]
+
+    Controlled by the `method` query parameter (default: "shap" for backward
+    compatibility). Explanation computation is best-effort: if a method fails
+    the corresponding key is simply absent.
     """
     project = ensure_project_owner(db, project_id, current_user.id)
     m = _get_saved_or_active_model_or_404(db, project=project, model_id=model_id)
@@ -286,7 +296,7 @@ def predict_with_saved_model_json_explain(
     try:
         import pandas as pd
         raw_df = pd.DataFrame(payload.rows)
-        result = predict_with_shap(m, raw_df)
+        result = predict_with_explanations(m, raw_df, method=method)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
 

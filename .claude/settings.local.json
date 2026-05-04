@@ -43,7 +43,22 @@
       "Bash(.venv/Scripts/python -m pytest tests/ -v --tb=short --ignore=tests/training/test_classification_metrics.py)",
       "Bash(.venv/Scripts/python -c \"from app.schemas.training import TrainingConfigIn, TrainingRecommendationOut, ActiveModelOut; print\\('package OK'\\)\")",
       "Bash(.venv/Scripts/python -m pytest tests/ -q --tb=line)",
-      "Bash(findstr /i \"shap explain\")"
+      "Bash(findstr /i \"shap explain\")",
+      "Bash(git -C \"c:/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend\" diff app/services/training/orchestrator.py)",
+      "Bash(\"c:/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend/.venv/Scripts/pip.exe\" show *)",
+      "Bash(\"c:/Users/ibtih/OneDrive/Bureau/pfe/medicalvision-backend/.venv/Scripts/pip.exe\" install *)",
+      "Bash(./.venv/Scripts/python.exe -c \"from app.services.lime import compute_local_lime; from app.services.training.output.predictor import predict_with_explanations, predict_with_shap; from app.api.routes.prediction import router; print\\('OK - all imports succeed'\\); print\\('predict_with_shap is callable:', callable\\(predict_with_shap\\)\\); print\\('predict_with_explanations is callable:', callable\\(predict_with_explanations\\)\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(.venv\\\\Scripts\\\\python.exe -m pytest tests/test_explainability.py -v)",
+      "Bash(cmd /c \"cd /d c:\\\\Users\\\\ibtih\\\\OneDrive\\\\Bureau\\\\pfe\\\\medicalvision-backend && .venv\\\\Scripts\\\\python.exe -m pytest tests/test_explainability.py -v 2>&1\")",
+      "Bash(powershell -Command \"Set-Location 'c:\\\\Users\\\\ibtih\\\\OneDrive\\\\Bureau\\\\pfe\\\\medicalvision-backend'; & '.venv\\\\Scripts\\\\python.exe' -m pytest tests/test_explainability.py -v 2>&1\")",
+      "Bash(powershell -Command \"Set-Location 'c:\\\\Users\\\\ibtih\\\\OneDrive\\\\Bureau\\\\pfe\\\\medicalvision-backend'; & '.venv\\\\Scripts\\\\python.exe' _shap_lime_agreement.py 2>&1\")",
+      "Bash(powershell -Command \"Remove-Item 'c:\\\\Users\\\\ibtih\\\\OneDrive\\\\Bureau\\\\pfe\\\\medicalvision-backend\\\\_shap_lime_agreement.py' -Force\")",
+      "Bash(powershell -Command \"Set-Location 'c:\\\\Users\\\\ibtih\\\\OneDrive\\\\Bureau\\\\pfe\\\\medicalvision-backend'; & '.venv\\\\Scripts\\\\python.exe' -m pytest tests/test_automl_integrity.py -v 2>&1\")",
+      "Bash(powershell -Command \"Set-Location 'c:\\\\Users\\\\ibtih\\\\OneDrive\\\\Bureau\\\\pfe\\\\medicalvision-backend'; & '.venv\\\\Scripts\\\\python.exe' -m pytest tests/test_automl_integrity.py::TestRecommendationToTraining -v 2>&1\")",
+      "Bash(powershell -Command \"Set-Location 'c:\\\\Users\\\\ibtih\\\\OneDrive\\\\Bureau\\\\pfe\\\\medicalvision-backend'; & '.venv\\\\Scripts\\\\python.exe' -m pytest tests/training/test_recommendation_engine.py tests/test_automl_integrity.py -v --tb=short 2>&1\")",
+      "Bash(Select-String -Pattern \"automl|persist|save|is_best|per_estimator|AutoMLRunResult\" -Context 2,2)"
     ],
     "additionalDirectories": [
       "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\types",
