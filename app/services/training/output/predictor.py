@@ -470,6 +470,7 @@ def predict_with_trained_model(
         "feature_count_received": int(raw_df.shape[1]),
         "feature_count_expected": int(len(feature_names)) if feature_names else None,
         "feature_names_expected": feature_names,
+        "top_features": _get_top_features_for_display(artifacts, feature_names, k=3),
         "threshold_used": threshold,
         "rows": rows,
         "preview": rows,
@@ -628,6 +629,191 @@ def predict_rows_json(
         raise RuntimeError("No rows provided for prediction.")
     raw_df = pd.DataFrame(rows)
     return predict_with_trained_model(trained_model, raw_df)
+
+
+def compute_counterfactual_for_row(
+    trained_model: TrainedModel,
+    row: Dict[str, Any],
+    features_to_vary: List[str],
+    *,
+    n_counterfactuals: int = 3,
+) -> Dict[str, Any]:
+    """
+    Compute DiCE counterfactuals for a single patient row from a saved model.
+
+    Orchestrates pipeline loading, background retrieval, dtype normalisation,
+    and delegates to app.services.counterfactual.compute_counterfactual.
+    No business logic here — all explainability logic lives in the service.
+
+    Returns
+    -------
+    Dict with keys: model_id, task_type, original_prediction, original_score,
+    counterfactual (list or None), message (str or None).
+    """
+    artifacts = trained_model.artifacts_json or {}
+    model_pkl = artifacts.get("model_pkl")
+    if not model_pkl:
+        raise RuntimeError("Model artifact path is missing (model_pkl).")
+
+    pkl_path = Path(str(model_pkl))
+    if not pkl_path.exists():
+        raise RuntimeError(f"Model file not found: {pkl_path}")
+
+    pipeline = load_pipeline(pkl_path)
+
+    task_type = str(trained_model.task_type or "classification").lower()
+    training_schema = (
+        artifacts.get("training_schema")
+        if isinstance(artifacts.get("training_schema"), dict)
+        else {}
+    )
+    feature_names: List[str] = training_schema.get("feature_names") or []
+
+    # Build input DataFrame — same normalisation as predict_with_trained_model.
+    raw_df = pd.DataFrame([row])
+    raw_df = _normalize_input_dtypes(raw_df, pipeline)
+    if feature_names:
+        for col in feature_names:
+            if col not in raw_df.columns:
+                raw_df[col] = np.nan
+        raw_df = raw_df[feature_names]
+
+    # Capture the current prediction so the response includes it alongside CF.
+    threshold = _get_optimal_threshold(artifacts, task_type)
+    _balancing = artifacts.get("balancing") or {}
+    _pos_idx = _balancing.get("positive_class_index")
+    positive_class_index: int = int(_pos_idx) if _pos_idx is not None else 1
+
+    y_pred, y_score = _run_inference(pipeline, raw_df, task_type, threshold, positive_class_index)
+    original_prediction = _to_builtin(y_pred[0])
+    original_score = _to_builtin(float(y_score[0])) if y_score is not None else None
+
+    # Load the preprocessed background (same artifact used by SHAP and LIME).
+    background: Optional[np.ndarray] = None
+    raw_bg = (artifacts.get("shap") or {}).get("background_data")
+    if raw_bg:
+        try:
+            background = np.array(raw_bg, dtype=float)
+        except Exception:
+            pass
+
+    from app.services.counterfactual import compute_counterfactual
+    cf_items = compute_counterfactual(
+        pipeline,
+        raw_df,
+        features_to_vary=features_to_vary,
+        task_type=task_type,
+        background=background,
+        feature_names=feature_names if feature_names else None,
+        n_counterfactuals=n_counterfactuals,
+    )
+
+    return {
+        "model_id":            int(trained_model.id),
+        "task_type":           task_type,
+        "original_prediction": original_prediction,
+        "original_score":      original_score,
+        "counterfactual":      cf_items,
+        "message":             None if cf_items else "No valid counterfactual found for this row.",
+    }
+
+
+def _get_top_features_for_display(
+    artifacts: Dict[str, Any],
+    feature_names: List[str],
+    k: int = 3,
+) -> List[str]:
+    """
+    Pick the K most informative ORIGINAL feature names to surface inline in
+    the predictions table.
+
+    Priority:
+      1. artifacts["shap"]["summary"] — global SHAP, sorted by mean_abs_shap.
+         The names there are post-preprocessing ("num__Glucose", "cat__sex_male");
+         we strip the ColumnTransformer prefix and dedupe OHE expansions
+         ("sex_male" + "sex_female" → "sex").
+      2. Alphabetical fallback when no SHAP summary is available.
+
+    The returned names are guaranteed to be present in `feature_names` so the
+    frontend can read row.inputData[name] without surprises.
+    """
+    if not feature_names:
+        return []
+
+    feat_set = set(feature_names)
+    top: List[str] = []
+
+    shap_summary = (artifacts.get("shap") or {}).get("summary") or []
+    for item in shap_summary:
+        if len(top) >= k:
+            break
+        prep_name = str(item.get("feature", ""))
+        # Strip ColumnTransformer prefix (e.g. "num__", "cat__")
+        base = prep_name.split("__", 1)[-1] if "__" in prep_name else prep_name
+        # Direct match
+        if base in feat_set and base not in top:
+            top.append(base)
+            continue
+        # OHE expansion: "sex_male" → original feature "sex"
+        if "_" in base:
+            stem = base.rsplit("_", 1)[0]
+            if stem in feat_set and stem not in top:
+                top.append(stem)
+
+    # Fill remaining slots with alphabetically-first features when SHAP is
+    # missing or didn't surface enough unique names.
+    if len(top) < k:
+        for f in feature_names:
+            if len(top) >= k:
+                break
+            if f not in top:
+                top.append(f)
+
+    return top[:k]
+
+
+def get_feature_ranges_for_model(trained_model: TrainedModel) -> Dict[str, Dict[str, Any]]:
+    """
+    Return per-feature statistics used to bound interactive counterfactual sliders.
+
+    Numeric features:     {"type": "numeric", "min", "max", "mean", "std"}
+    Categorical features: {"type": "categorical", "categories": [str, ...]}
+
+    Source: artifacts["training_schema"]["column_stats"] saved at training time.
+    Returns {} for older models that lack column_stats.
+    """
+    artifacts = trained_model.artifacts_json or {}
+    training_schema = (
+        artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
+    )
+    feature_names: List[str] = training_schema.get("feature_names") or []
+    column_stats: Dict[str, Any] = training_schema.get("column_stats") or {}
+
+    ranges: Dict[str, Dict[str, Any]] = {}
+    for feat in feature_names:
+        stats = column_stats.get(feat) or {}
+        col_type = stats.get("type")
+
+        if col_type == "numeric":
+            ranges[feat] = {
+                "type": "numeric",
+                "min":  float(stats.get("min", 0.0)),
+                "max":  float(stats.get("max", 1.0)),
+                "mean": float(stats.get("mean", 0.0)),
+                "std":  float(stats.get("std", 1.0)) or 1.0,
+            }
+        elif col_type in ("categorical", "text"):
+            cats = stats.get("categories") or []
+            ranges[feat] = {
+                "type": "categorical",
+                "categories": [str(c) for c in cats],
+            }
+        else:
+            # No stats available — frontend will use a sensible default range
+            # derived from the patient's own value.
+            ranges[feat] = {"type": "unknown"}
+
+    return ranges
 
 
 def predict_to_csv(

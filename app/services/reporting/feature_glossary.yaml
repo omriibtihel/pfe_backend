@@ -1,0 +1,150 @@
+# Feature glossary — labels, units, and normal ranges used by the reporter.
+#
+# Keys MUST match the raw column name produced by the dataset. Lookup is
+# case-insensitive and falls through to a snake_case canonicalization, but
+# explicit keys win. When a feature is missing here the report still works
+# (it falls back to the raw column name) — the only loss is the human label
+# and the position-vs-normal annotation.
+#
+# Adding a feature:
+#   <column_name>:
+#     label_fr: "Nom lisible"
+#     label_en: "Readable name"
+#     unit: "mg/dL"          # optional
+#     normal_range: [low, high]   # optional, numeric features only
+#
+# This file ships a starter set for the common diabetes / cardiology
+# datasets. Extend it project-by-project as new columns appear.
+
+# ── Diabetes / metabolic ──────────────────────────────────────────────────────
+
+glucose:
+  label_fr: "Glycémie"
+  label_en: "Glucose"
+  unit: "mg/dL"
+  normal_range: [70, 100]
+
+glucose_fasting:
+  label_fr: "Glycémie à jeun"
+  label_en: "Fasting glucose"
+  unit: "mg/dL"
+  normal_range: [70, 100]
+
+hba1c:
+  label_fr: "Hémoglobine glyquée (HbA1c)"
+  label_en: "Glycated hemoglobin (HbA1c)"
+  unit: "%"
+  normal_range: [4.0, 5.6]
+
+insulin:
+  label_fr: "Insuline"
+  label_en: "Insulin"
+  unit: "µU/mL"
+  normal_range: [2, 25]
+
+bmi:
+  label_fr: "Indice de masse corporelle (IMC)"
+  label_en: "Body Mass Index (BMI)"
+  unit: "kg/m²"
+  normal_range: [18.5, 24.9]
+
+# ── Cardiovascular ────────────────────────────────────────────────────────────
+
+age:
+  label_fr: "Âge"
+  label_en: "Age"
+  unit: "ans"
+
+bloodpressure:
+  label_fr: "Pression artérielle"
+  label_en: "Blood pressure"
+  unit: "mmHg"
+  normal_range: [80, 120]
+
+systolic_bp:
+  label_fr: "Pression artérielle systolique"
+  label_en: "Systolic blood pressure"
+  unit: "mmHg"
+  normal_range: [90, 120]
+
+diastolic_bp:
+  label_fr: "Pression artérielle diastolique"
+  label_en: "Diastolic blood pressure"
+  unit: "mmHg"
+  normal_range: [60, 80]
+
+heart_rate:
+  label_fr: "Fréquence cardiaque"
+  label_en: "Heart rate"
+  unit: "bpm"
+  normal_range: [60, 100]
+
+cholesterol:
+  label_fr: "Cholestérol total"
+  label_en: "Total cholesterol"
+  unit: "mg/dL"
+  normal_range: [125, 200]
+
+ldl:
+  label_fr: "Cholestérol LDL"
+  label_en: "LDL cholesterol"
+  unit: "mg/dL"
+  normal_range: [0, 100]
+
+hdl:
+  label_fr: "Cholestérol HDL"
+  label_en: "HDL cholesterol"
+  unit: "mg/dL"
+  normal_range: [40, 60]
+
+triglycerides:
+  label_fr: "Triglycérides"
+  label_en: "Triglycerides"
+  unit: "mg/dL"
+  normal_range: [0, 150]
+
+# ── Pregnancy / Pima diabetes dataset shorthand ───────────────────────────────
+
+pregnancies:
+  label_fr: "Nombre de grossesses"
+  label_en: "Pregnancies"
+
+skinthickness:
+  label_fr: "Épaisseur du pli cutané"
+  label_en: "Skin thickness"
+  unit: "mm"
+
+diabetespedigreefunction:
+  label_fr: "Antécédents familiaux (score)"
+  label_en: "Diabetes pedigree function"
+
+# ── Generic anthropometric ────────────────────────────────────────────────────
+
+weight:
+  label_fr: "Poids"
+  label_en: "Weight"
+  unit: "kg"
+
+height:
+  label_fr: "Taille"
+  label_en: "Height"
+  unit: "cm"
+
+waist:
+  label_fr: "Tour de taille"
+  label_en: "Waist circumference"
+  unit: "cm"
+
+# ── Sex / categorical ─────────────────────────────────────────────────────────
+
+sex:
+  label_fr: "Sexe"
+  label_en: "Sex"
+
+gender:
+  label_fr: "Genre"
+  label_en: "Gender"
+
+smoking:
+  label_fr: "Tabagisme"
+  label_en: "Smoking"

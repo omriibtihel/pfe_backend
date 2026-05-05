@@ -13,13 +13,20 @@ from app.api.deps import get_db, get_current_user
 from app.models.project import Project
 from app.models.training import TrainedModel
 from app.schemas.training import ActiveModelOut, ManualPredictIn
-from app.schemas.prediction import PredictionResultsExportIn
+from app.schemas.prediction import (
+    PredictionResultsExportIn,
+    CounterfactualIn,
+    CounterfactualOut,
+    FeatureRangesOut,
+)
 from app.services.training.output.predictor import (
     predict_rows_json,
     predict_to_csv,
     predict_with_trained_model,
     predict_with_explanations,
     read_uploaded_dataframe,
+    compute_counterfactual_for_row,
+    get_feature_ranges_for_model,
 )
 
 ExplainMethod = str  # "shap" | "lime" | "both" — validated below
@@ -406,5 +413,81 @@ async def predict_with_model(
         result = predict_with_trained_model(m, raw_df)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Counterfactual explanations (saved-model variant)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/models/{model_id}/feature-ranges",
+    response_model=FeatureRangesOut,
+)
+def get_model_feature_ranges(
+    project_id: int,
+    model_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Return per-feature min/max/mean/std (numeric) or categories (categorical)
+    used to bound interactive counterfactual sliders on the frontend.
+
+    Source: training-time column_stats stored in artifacts.
+    """
+    project = ensure_project_owner(db, project_id, current_user.id)
+    m = _get_saved_or_active_model_or_404(db, project=project, model_id=model_id)
+
+    try:
+        ranges = get_feature_ranges_for_model(m)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to load feature ranges: {str(e)}",
+        )
+
+    return {"model_id": int(m.id), "ranges": ranges}
+
+
+@router.post(
+    "/models/{model_id}/predict/json/counterfactual",
+    response_model=CounterfactualOut,
+)
+def predict_counterfactual_json(
+    project_id: int,
+    model_id: int,
+    payload: CounterfactualIn,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Generate counterfactual explanations for a single patient row.
+
+    Answers "what would need to change to flip this prediction?".
+    Only features listed in features_to_vary are eligible for modification.
+
+    Response:
+      - original_prediction / original_score: current model output for the row
+      - counterfactual: [{feature, original_value, suggested_value, delta}]
+        sorted by |delta| descending, or null if no flip was found
+      - message: human-readable fallback when counterfactual is null
+    """
+    project = ensure_project_owner(db, project_id, current_user.id)
+    m = _get_saved_or_active_model_or_404(db, project=project, model_id=model_id)
+
+    try:
+        result = compute_counterfactual_for_row(
+            m,
+            payload.row,
+            payload.features_to_vary,
+            n_counterfactuals=payload.n_counterfactuals,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Counterfactual computation failed: {str(e)}",
+        )
 
     return result

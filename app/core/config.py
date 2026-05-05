@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "MedicalVision"
     FRONTEND_URL: str = "http://localhost:5173"
 
+    # LLM reporting backends. Empty values disable a backend.
+    # Default deployment uses Groq (managed). Ollama is kept available for
+    # on-prem / RGPD-strict deployments — set the two URL/MODEL vars in .env
+    # to enable it. By default both are empty so Ollama is skipped silently.
+    REPORTING_OLLAMA_URL: str = ""
+    REPORTING_OLLAMA_MODEL: str = ""
+    REPORTING_OLLAMA_TIMEOUT_S: int = 30
+    REPORTING_GROQ_API_KEY: str = ""
+    REPORTING_GROQ_MODEL: str = "llama-3.3-70b-versatile"
+
     class Config:
         env_file = Path(__file__).resolve().parent.parent.parent / ".env"
         extra = "ignore"

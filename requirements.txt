@@ -31,3 +31,4 @@ flaml[automl]>=2.1.0
 
 shap>=0.45
 lime>=0.2.0.1
+dice-ml>=0.11
