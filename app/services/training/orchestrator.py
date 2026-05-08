@@ -555,6 +555,7 @@ def _run_holdout(
 
     estimator_hyperparams = dict(hp_normalized.get("estimator_params") or {})
     param_grid = dict(hp_normalized.get("param_grid") or {})
+    param_distributions = dict(hp_normalized.get("param_distributions") or {})
     training_schema = build_training_schema(
         X=split.X_train,
         target=cfg.target_column,
@@ -724,6 +725,7 @@ def _run_holdout(
         model_type=model_type_norm,
         task_type=cfg.task_type,
         model_param_grid=param_grid,
+        model_param_distributions=param_distributions,
         refit_metric_override=(decision.refit_metric if cfg.task_type == "classification" else None),
         resampler=resampler_for_gs,
         n_samples=int(len(y_f)),
@@ -891,7 +893,7 @@ def _run_holdout(
         confusion_matrix=confusion_matrix,
         class_distribution=class_distribution,
         resolved_positive_label=resolved_positive_label,
-        curves=test_eval.metrics.get("curves") if isinstance(test_eval.metrics, dict) else None,
+        curves=test_eval.metrics.get("curves") if (test_eval is not None and isinstance(test_eval.metrics, dict)) else None,
     )
     hyperparams_artifacts: Dict[str, Any] = {
         "requested": dict(requested_hyperparams_raw),

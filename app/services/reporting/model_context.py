@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from app.services.reporting.context_builder import (
     ModelQualitySignal,
@@ -32,6 +32,7 @@ class ReportingModelContext:
     model_quality: list[ModelQualitySignal] = field(default_factory=list)
     dataset_summary: list[str] = field(default_factory=list)
     feature_metadata: dict[str, dict[str, str]] = field(default_factory=dict)
+    threshold_value: Optional[float] = None
 
 
 _PREFIX_RE = re.compile(r"^(?:num|cat|remainder)__", re.IGNORECASE)
@@ -60,12 +61,24 @@ def build_reporting_model_context(
         glossary=glossary,
     )
 
+    threshold_value: Optional[float] = None
+    raw_threshold = (
+        _dig(metrics, "test", "meta", "threshold_used")
+        or _dig(metrics, "holdout_test_metrics", "meta", "threshold_used")
+    )
+    if raw_threshold is not None:
+        try:
+            threshold_value = float(raw_threshold)
+        except (TypeError, ValueError):
+            pass
+
     return ReportingModelContext(
         display_prediction=display_prediction,
         class_context=class_ctx,
         model_quality=_build_model_quality(metrics, lang=lang),
         dataset_summary=_build_dataset_summary(artifacts, metrics, lang=lang),
         feature_metadata=feature_metadata,
+        threshold_value=threshold_value,
     )
 
 
@@ -153,12 +166,12 @@ def _build_model_quality(metrics: dict[str, Any], *, lang: str) -> list[ModelQua
     if threshold is not None:
         out.append(
             ModelQualitySignal(
-                label="Seuil de decision" if lang == "fr" else "Decision threshold",
+                label="Niveau d'alerte" if lang == "fr" else "Alert threshold",
                 value=_format_metric(threshold),
                 interpretation=(
-                    "score a partir duquel la classe positive est suggeree"
+                    "au-dela de ce score, l'outil signale un resultat preoccupant"
                     if lang == "fr"
-                    else "score from which the positive class is suggested"
+                    else "above this score, the tool signals a concerning result"
                 ),
             )
         )
@@ -178,39 +191,56 @@ def _build_dataset_summary(
     n_samples = split.get("n_samples")
     if n_samples is not None:
         summary.append(
-            f"Jeu de donnees d'entrainement: {int(n_samples)} lignes"
+            f"Base sur l'analyse de {int(n_samples)} profils medicaux"
             if lang == "fr"
-            else f"Training dataset: {int(n_samples)} rows"
+            else f"Based on the analysis of {int(n_samples)} medical profiles"
         )
 
     if split.get("method"):
-        method = sanitize_for_prompt(str(split.get("method")), max_len=60)
         if split.get("k_folds"):
+            n = int(split["k_folds"])
             summary.append(
-                f"Validation: {method}, {int(split['k_folds'])} folds"
+                f"Fiabilite verifiee sur {n} groupes de test distincts"
                 if lang == "fr"
-                else f"Validation: {method}, {int(split['k_folds'])} folds"
+                else f"Reliability verified across {n} separate test groups"
             )
         else:
-            summary.append(f"Validation: {method}")
+            summary.append(
+                "Fiabilite verifiee sur des donnees distinctes"
+                if lang == "fr"
+                else "Reliability verified on a separate held-out dataset"
+            )
 
     test_rows = split.get("test_rows")
     if test_rows is not None:
         summary.append(
-            f"Test final: {int(test_rows)} lignes conservees"
+            f"Dont {int(test_rows)} profils reserves pour la verification finale"
             if lang == "fr"
-            else f"Final test set: {int(test_rows)} held-out rows"
+            else f"Including {int(test_rows)} profiles reserved for final verification"
         )
 
-    confusion = _dig(metrics, "holdout_test_metrics", "confusion_matrix") or _dig(metrics, "test", "confusion_matrix")
-    if isinstance(confusion, dict) and confusion.get("matrix"):
-        summary.append(
-            "Matrice de confusion disponible pour interpreter les erreurs du modele"
-            if lang == "fr"
-            else "Confusion matrix available to interpret model errors"
-        )
+    cv_summary = metrics.get("cv_summary") if isinstance(metrics.get("cv_summary"), dict) else {}
+    if cv_summary:
+        n_folds_ok = cv_summary.get("n_folds_ok")
+        std_dict = cv_summary.get("std") or {}
+        main_std = None
+        for key in ("roc_auc", "f1_pos", "accuracy"):
+            v = std_dict.get(key) if isinstance(std_dict, dict) else None
+            if v is not None:
+                try:
+                    main_std = float(v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if main_std is not None and n_folds_ok is not None:
+            stability = round(main_std * 100, 1)
+            summary.append(
+                f"Resultats stables sur les {int(n_folds_ok)} groupes de test (variation de {stability} %)"
+                if lang == "fr"
+                else f"Stable results across {int(n_folds_ok)} test groups (variation: {stability} %)"
+            )
 
-    return [sanitize_for_prompt(s, max_len=180) for s in summary[:4]]
+    return [sanitize_for_prompt(s, max_len=180) for s in summary[:5]]
 
 
 def _build_feature_metadata(
@@ -232,13 +262,20 @@ def _build_feature_metadata(
         if not name:
             continue
         value = item.get("importance")
+        ordinal_fr = _ordinal_fr(idx)
+        ordinal_en = _ordinal_en(idx)
         if value is None:
-            text = f"rang global {idx}/{total}" if lang == "fr" else f"global rank {idx}/{total}"
-        else:
             text = (
-                f"rang global {idx}/{total}, importance relative {_format_metric(value)}"
+                f"{ordinal_fr} facteur le plus influent parmi {total}"
                 if lang == "fr"
-                else f"global rank {idx}/{total}, relative importance {_format_metric(value)}"
+                else f"{ordinal_en} most influential factor out of {total}"
+            )
+        else:
+            pct = _format_metric(value)
+            text = (
+                f"{ordinal_fr} facteur le plus influent parmi {total} (poids : {pct})"
+                if lang == "fr"
+                else f"{ordinal_en} most influential factor out of {total} (weight: {pct})"
             )
         importance_by_feature[_canonical(name)] = sanitize_for_prompt(text, max_len=160)
 
@@ -282,15 +319,15 @@ def _format_training_reference(
     parts: list[str] = []
     if mean is not None:
         parts.append(
-            f"moyenne entrainement: {_format_number(mean)}{unit}"
+            f"valeur habituelle parmi les profils de reference : {_format_number(mean)}{unit}"
             if lang == "fr"
-            else f"training mean: {_format_number(mean)}{unit}"
+            else f"typical value among reference profiles: {_format_number(mean)}{unit}"
         )
     if min_v is not None and max_v is not None:
         parts.append(
-            f"intervalle observe: {_format_number(min_v)}-{_format_number(max_v)}{unit}"
+            f"ecart observe : de {_format_number(min_v)}{unit} a {_format_number(max_v)}{unit}"
             if lang == "fr"
-            else f"observed range: {_format_number(min_v)}-{_format_number(max_v)}{unit}"
+            else f"observed spread: from {_format_number(min_v)}{unit} to {_format_number(max_v)}{unit}"
         )
     return sanitize_for_prompt("; ".join(parts), max_len=180)
 
@@ -309,41 +346,57 @@ def _metric_source(metrics: dict[str, Any]) -> dict[str, Any]:
 
 _METRIC_LABELS: dict[str, dict[str, str]] = {
     "fr": {
-        "accuracy": "Exactitude globale",
-        "balanced_accuracy": "Exactitude equilibree",
-        "roc_auc": "ROC AUC",
-        "precision_pos": "Precision classe positive",
-        "recall_pos": "Rappel classe positive",
-        "f1_pos": "F1 classe positive",
+        "accuracy": "Taux de predictions correctes",
+        "balanced_accuracy": "Precision equilibree",
+        "roc_auc": "Fiabilite globale de l'outil",
+        "precision_pos": "Fiabilite des alertes",
+        "recall_pos": "Taux de detection des cas preoccupants",
+        "f1_pos": "Score global de detection",
     },
     "en": {
-        "accuracy": "Overall accuracy",
+        "accuracy": "Correct prediction rate",
         "balanced_accuracy": "Balanced accuracy",
-        "roc_auc": "ROC AUC",
-        "precision_pos": "Positive-class precision",
-        "recall_pos": "Positive-class recall",
-        "f1_pos": "Positive-class F1",
+        "roc_auc": "Overall tool reliability",
+        "precision_pos": "Alert reliability",
+        "recall_pos": "At-risk case detection rate",
+        "f1_pos": "Overall detection score",
     },
 }
 
 _METRIC_INTERPRETATIONS: dict[str, dict[str, str]] = {
     "fr": {
-        "accuracy": "part des predictions correctes",
-        "balanced_accuracy": "tient compte du desequilibre entre classes",
-        "roc_auc": "capacite a separer les classes",
-        "precision_pos": "fiabilite des alertes positives",
-        "recall_pos": "capacite a retrouver les cas positifs",
-        "f1_pos": "compromis precision/rappel sur la classe positive",
+        "accuracy": "sur 100 profils, l'outil predit correctement dans ce pourcentage de cas",
+        "balanced_accuracy": "taux de precision tenant compte des groupes inegaux",
+        "roc_auc": "sur 100 comparaisons, l'outil distingue correctement les profils preoccupants dans ce pourcentage de cas",
+        "precision_pos": "sur 100 alertes emises, ce pourcentage sont justifiees",
+        "recall_pos": "sur 100 profils vraiment preoccupants, l'outil en detecte ce pourcentage — les autres peuvent passer inapercus",
+        "f1_pos": "equilibre entre les alertes justifiees et les cas detectes",
     },
     "en": {
-        "accuracy": "share of correct predictions",
-        "balanced_accuracy": "accounts for class imbalance",
-        "roc_auc": "ability to separate classes",
-        "precision_pos": "reliability of positive alerts",
-        "recall_pos": "ability to find positive cases",
-        "f1_pos": "precision/recall tradeoff for the positive class",
+        "accuracy": "out of 100 profiles, the tool predicts correctly in this percentage of cases",
+        "balanced_accuracy": "accuracy accounting for unequal groups",
+        "roc_auc": "out of 100 comparisons, the tool correctly identifies concerning profiles in this percentage of cases",
+        "precision_pos": "out of 100 alerts issued, this percentage are justified",
+        "recall_pos": "out of 100 truly concerning profiles, the tool detects this percentage — the rest may go unnoticed",
+        "f1_pos": "balance between justified alerts and detected cases",
     },
 }
+
+
+def _ordinal_fr(n: int) -> str:
+    """Return a French ordinal string for a rank: 1 → "1er", 2 → "2e", etc."""
+    return "1er" if n == 1 else f"{n}e"
+
+
+def _ordinal_en(n: int) -> str:
+    """Return an English ordinal string: 1 → "1st", 2 → "2nd", 3 → "3rd", else "Nth"."""
+    if n == 1:
+        return "1st"
+    if n == 2:
+        return "2nd"
+    if n == 3:
+        return "3rd"
+    return f"{n}th"
 
 
 def _format_metric(value: Any) -> str:

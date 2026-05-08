@@ -78,11 +78,18 @@ def generate_report_stream(
         cached = report_cache.get(
             db, model_id=m.id, lang=lang, request_hash=request_hash,
         )
-        if cached is not None:
+        # Reject cached entries that predate chart_data support — they lack the
+        # chart_data section and would render broken gauges in the frontend.
+        cached_content = cached.content_json if cached is not None else None
+        if (
+            cached is not None
+            and isinstance(cached_content, dict)
+            and "chart_data" in cached_content
+        ):
             cached_meta = dict(cached.generation_event or {})
             cached_meta["cached"] = True
             return StreamingResponse(
-                stream_existing_report(cached.content_json, cached_meta),
+                stream_existing_report(cached_content, cached_meta),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -110,6 +117,7 @@ def generate_report_stream(
         feature_metadata=model_context.feature_metadata,
         task_type=str(m.task_type or "classification"),
         glossary=feature_glossary,
+        threshold_value=model_context.threshold_value,
     )
 
     service = ReportService(router=build_default_router())

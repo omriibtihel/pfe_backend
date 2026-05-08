@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping
 
+from scipy import stats as _scipy_stats
+
 from app.services.training.pipeline.models import MODEL_REGISTRY
 from app.services.training.config.schema.types import MODEL_HP_SCHEMA
 
@@ -262,6 +264,72 @@ def _coerce_scalar_with_schema(
 
 
 # ---------------------------------------------------------------------------
+# Search-value coercion (RandomSearch / HalvingRandom)
+# ---------------------------------------------------------------------------
+
+
+def _coerce_search_value(
+    field_name: str,
+    value: Any,
+    schema_field: dict[str, Any],
+) -> Any:
+    """
+    Coerce a hyperparameter value for a distribution-based search.
+
+    - ``__range__`` dict  → scipy distribution (uniform / loguniform / randint).
+    - list               → returned as-is (already valid for param_distributions).
+    - scalar             → delegates to ``_coerce_scalar_with_schema``.
+
+    Returns ``None`` when a ``__range__`` dict is malformed.
+    """
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, dict) and value.get("__range__") is True:
+        try:
+            min_val = float(value["min"])
+            max_val = float(value["max"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if not (math.isfinite(min_val) and math.isfinite(max_val)):
+            return None
+        if min_val >= max_val:
+            return None
+
+        field_type = str(schema_field.get("type", "")).strip().lower()
+        distribution = str(value.get("distribution", "uniform")).strip().lower()
+
+        # Integer fields → discrete uniform over [low, high] inclusive.
+        if field_type in ("int", "int_or_none"):
+            low = int(math.ceil(min_val))
+            high = int(math.floor(max_val))
+            if low > high:
+                return None
+            # int_or_none with includeNull: sklearn can sample from a plain list,
+            # so mix None with a capped set of integer candidates.
+            if field_type == "int_or_none" and bool(value.get("includeNull")):
+                n_ints = min(high - low + 1, 20)
+                step = max(1, (high - low + 1) // n_ints)
+                int_values: list[Any] = list(range(low, high + 1, step))
+                return [None] + int_values
+            return _scipy_stats.randint(low, high + 1)
+
+        # Log-uniform: scipy.stats.loguniform(a, b) samples in [a, b] log-uniformly.
+        if distribution == "log_uniform":
+            if min_val <= 0:
+                return None  # loguniform requires strictly positive bounds
+            return _scipy_stats.loguniform(min_val, max_val)
+
+        # Default: uniform over [min_val, max_val].
+        return _scipy_stats.uniform(min_val, max_val - min_val)
+
+    # Scalar fallback.
+    coerced, _ = _coerce_scalar_with_schema(field_name, value, schema_field)
+    return coerced
+
+
+# ---------------------------------------------------------------------------
 # Public: normalize_model_hyperparams
 # ---------------------------------------------------------------------------
 
@@ -290,6 +358,7 @@ def normalize_model_hyperparams(
     effective: dict[str, Any] = {name: spec.get("default") for name, spec in schema.items()}
     estimator_params: dict[str, Any] = {name: spec.get("default") for name, spec in schema.items()}
     param_grid: dict[str, list[Any]] = {}
+    param_distributions: dict[str, Any] = {}
     issues: list[dict[str, Any]] = []
     warnings: list[str] = []
     errors: list[str] = []
@@ -325,6 +394,30 @@ def normalize_model_hyperparams(
             continue
 
         raw_value = source.get(field)
+
+        # ── __range__ dict → scipy distribution for RandomSearch / HalvingRandom ──
+        if isinstance(raw_value, dict) and raw_value.get("__range__") is True:
+            if use_grid_search:
+                dist = _coerce_search_value(field, raw_value, field_schema)
+                if dist is not None:
+                    param_distributions[field] = dist
+                    effective[field] = raw_value  # keep raw dict for display / logging
+                else:
+                    _push_issue(
+                        "error",
+                        "HP_INVALID",
+                        f"{model_name}.{field} has an invalid range specification: "
+                        f"min={raw_value.get('min')}, max={raw_value.get('max')}.",
+                    )
+            else:
+                _push_issue(
+                    "warning",
+                    "HP_RANGE_IGNORED",
+                    f"{model_name}.{field} received a range specification while "
+                    f"useGridSearch=false; ignored.",
+                )
+            continue
+
         if isinstance(raw_value, list):
             if len(raw_value) == 0:
                 _push_issue(
@@ -372,7 +465,7 @@ def normalize_model_hyperparams(
 
     if model_name == "svm" and _is_linear_kernel(effective.get("kernel")) and "gamma" in schema:
         gamma_was_requested = "gamma" in source
-        if gamma_was_requested or "gamma" in param_grid:
+        if gamma_was_requested or "gamma" in param_grid or "gamma" in param_distributions:
             _push_issue(
                 "warning",
                 "HP_SVM_GAMMA_IGNORED",
@@ -381,10 +474,11 @@ def normalize_model_hyperparams(
         effective.pop("gamma", None)
         estimator_params.pop("gamma", None)
         param_grid.pop("gamma", None)
+        param_distributions.pop("gamma", None)
 
     if model_name == "decisiontree" and str(task_type or "").strip().lower() == "regression":
         criterion_was_requested = "criterion" in source
-        if criterion_was_requested or "criterion" in param_grid:
+        if criterion_was_requested or "criterion" in param_grid or "criterion" in param_distributions:
             _push_issue(
                 "warning",
                 "HP_TASK_INCOMPATIBLE",
@@ -393,6 +487,7 @@ def normalize_model_hyperparams(
         effective.pop("criterion", None)
         estimator_params.pop("criterion", None)
         param_grid.pop("criterion", None)
+        param_distributions.pop("criterion", None)
 
     # class_weight is classification-only — strip it unconditionally in regression.
     if "class_weight" in schema and str(task_type or "").strip().lower() == "regression":
@@ -405,6 +500,7 @@ def normalize_model_hyperparams(
         effective.pop("class_weight", None)
         estimator_params.pop("class_weight", None)
         param_grid.pop("class_weight", None)
+        param_distributions.pop("class_weight", None)
 
     for key in list(estimator_params.keys()):
         if key in param_grid and isinstance(param_grid.get(key), list):
@@ -416,6 +512,7 @@ def normalize_model_hyperparams(
         "effective": effective,
         "estimator_params": estimator_params,
         "param_grid": param_grid,
+        "param_distributions": param_distributions,
         "issues": issues,
         "warnings": warnings,
         "errors": errors,

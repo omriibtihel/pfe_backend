@@ -50,6 +50,8 @@ _DISCLAIMER_TEXT = {
 # ── Section ordering — controls SSE chunk order ───────────────────────────────
 _SECTION_ORDER: tuple[str, ...] = (
     "prediction",
+    "risk_level",
+    "chart_data",
     "summary",
     "key_factors",
     "context",
@@ -169,6 +171,8 @@ class ReportService:
         """
         out = dict(report) if isinstance(report, dict) else {}
         out["disclaimer"] = _DISCLAIMER_TEXT.get(context.lang, _DISCLAIMER_TEXT["fr"])
+        out["risk_level"] = _compute_risk_level(context)
+        out["chart_data"] = _build_chart_data(context)
 
         out.setdefault(
             "prediction",
@@ -213,6 +217,8 @@ class ReportService:
                     item["normal_range"] = feat.normal_range
                 item.setdefault("direction", feat.direction)
                 item.setdefault("explanation", "")
+                # Status is always overridden server-side (derived from glossary normal_range).
+                item["status"] = _status_from_position(feat.position_vs_normal)
 
             if item:
                 repaired.append(item)
@@ -222,6 +228,75 @@ class ReportService:
 
 def _blank(value: object) -> bool:
     return value is None or str(value).strip() in {"", "—", "-"}
+
+
+def _build_chart_data(context: ReportContext) -> dict:
+    """Chart-ready payload sent as a dedicated SSE chunk.
+
+    The frontend renders this as inline SVG (no library). No LLM involvement —
+    all values come directly from the already-validated ReportContext.
+    """
+    score_pct = (
+        round(float(context.score) * 100)
+        if context.score is not None
+        else None
+    )
+    threshold_pct = (
+        round(float(context.threshold_value) * 100)
+        if context.threshold_value is not None
+        else 50
+    )
+    return {
+        "score_pct": score_pct,
+        "threshold_pct": threshold_pct,
+        "is_classification": context.task_type == "classification",
+        "factors": [
+            {
+                "label": feat.label,
+                "value": feat.value,
+                "direction": feat.direction,
+                "weight": round(abs(feat.weight), 3),
+                "status": _status_from_position(feat.position_vs_normal),
+                "normal_range": feat.normal_range,
+            }
+            for feat in context.top_features
+        ],
+    }
+
+
+def _compute_risk_level(context: ReportContext) -> str:
+    """Deterministic risk level from confidence + prediction direction.
+
+    For classification only. Maps (is_positive_prediction, confidence) to a
+    3-level scale: "low", "medium", "high". The frontend uses this to drive
+    a color-coded badge — never the LLM, which could hallucinate it.
+    """
+    if context.task_type != "classification":
+        return "unknown"
+
+    raw = context.class_context.raw_label
+    pos = context.class_context.positive_class
+    is_positive = bool(
+        pos
+        and raw.lower().rstrip("0").rstrip(".") == pos.lower().rstrip("0").rstrip(".")
+    )
+
+    high_conf = context.confidence_text in ("élevée", "high")
+    low_conf = context.confidence_text in ("faible", "low")
+
+    if is_positive:
+        return "high" if high_conf else "medium"
+    else:
+        return "medium" if low_conf else "low"
+
+
+def _status_from_position(position: str) -> str:
+    """Map FeatureContribution.position_vs_normal to a display status."""
+    return {
+        "above": "abnormal_high",
+        "below": "abnormal_low",
+        "within": "normal",
+    }.get(position, "unknown")
 
 
 def build_default_router() -> LLMRouter:

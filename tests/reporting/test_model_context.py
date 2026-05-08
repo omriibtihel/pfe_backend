@@ -82,8 +82,8 @@ def test_model_context_translates_negative_class_label():
 def test_model_context_extracts_quality_and_dataset_summary():
     ctx = build_reporting_model_context(_model(), raw_prediction=1, lang="fr", glossary=FeatureGlossary())
     values = {m.label: m.value for m in ctx.model_quality}
-    assert "Exactitude globale" in values
-    assert values["Exactitude globale"] == "77.5 %"
+    assert "Taux de predictions correctes" in values
+    assert values["Taux de predictions correctes"] == "77.5 %"
     assert any("768" in item for item in ctx.dataset_summary)
     assert any("231" in item for item in ctx.dataset_summary)
 
@@ -91,8 +91,8 @@ def test_model_context_extracts_quality_and_dataset_summary():
 def test_model_context_extracts_feature_metadata_aliases():
     ctx = build_reporting_model_context(_model(), raw_prediction=1, lang="fr", glossary=FeatureGlossary())
     glucose = ctx.feature_metadata["Glucose"]
-    assert "moyenne entrainement" in glucose["training_reference"]
+    assert "valeur habituelle parmi les profils de reference" in glucose["training_reference"]
     assert "121.59" in glucose["training_reference"]
-    assert "rang global 1/2" in glucose["global_importance"]
+    assert "1er facteur le plus influent parmi 2" in glucose["global_importance"]
     assert ctx.feature_metadata["num__Glucose"]["global_importance"] == glucose["global_importance"]
     assert ctx.feature_metadata["glucose"]["training_reference"] == glucose["training_reference"]

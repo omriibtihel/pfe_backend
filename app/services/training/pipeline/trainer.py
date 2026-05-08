@@ -39,6 +39,42 @@ from app.services.training.pipeline.cv_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _build_random_distributions(
+    model_type: str,
+    task_type: str,
+    user_param_distributions: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Build the merged param_distributions dict for RandomSearch / HalvingRandom.
+
+    User-provided distributions (scipy frozen distributions or lists) take
+    priority over the model defaults returned by ``get_model_distributions()``.
+
+    Parameters
+    ----------
+    model_type:
+        Normalised model key (e.g. ``"randomforest"``).
+    task_type:
+        ``"classification"`` or ``"regression"``.
+    user_param_distributions:
+        Raw dict coming from ``normalize_model_hyperparams()["param_distributions"]``.
+        Keys are bare parameter names (no ``model__`` prefix).
+        Values may be scipy frozen distributions or plain lists.
+        ``None`` is treated as an empty dict.
+
+    Returns
+    -------
+    Dict keyed with ``model__<param>`` prefixes, ready to pass to sklearn.
+    """
+    default_dist = get_model_distributions(model_type, task_type)
+    user_dist = {
+        k: v
+        for k, v in (user_param_distributions or {}).items()
+        if hasattr(v, "rvs") or isinstance(v, list)  # scipy frozen dist or list
+    }
+    merged = {**default_dist, **user_dist}  # user entries overwrite defaults
+    return {f"model__{k}": v for k, v in merged.items()}
+
+
 @dataclass
 class TrainerFitResult:
     fitted_pipeline: Any
@@ -116,6 +152,7 @@ class Trainer:
         model_type: str,
         task_type: str,
         model_param_grid: Dict[str, list[Any]] | None = None,
+        model_param_distributions: Dict[str, Any] | None = None,
         refit_metric_override: str | None = None,
         resampler: Any | None = None,
         n_samples: int | None = None,
@@ -222,8 +259,10 @@ class Trainer:
                 )
                 search_type = "random"
             else:
-                model_distributions = get_model_distributions(model_type, task_type)
-                if not model_distributions:
+                param_distributions = _build_random_distributions(
+                    model_type, task_type, model_param_distributions
+                )
+                if not param_distributions:
                     log_event("training.fit", model_type=model_type, tuning=False, reason="empty_distributions")
                     pipeline.fit(X_train, y_train, **fit_params)
                     return TrainerFitResult(
@@ -235,8 +274,6 @@ class Trainer:
                             "sample_weight_used": bool(fit_sample_weight is not None),
                         },
                     )
-
-                param_distributions = {f"model__{k}": v for k, v in model_distributions.items()}
 
                 _n_samples_actual = n_samples if n_samples is not None else int(len(y_train))
                 _cfg_n_iter = getattr(cfg, "n_iter_random_search", None)
@@ -301,8 +338,10 @@ class Trainer:
 
         # ── RandomizedSearchCV ────────────────────────────────────────────────
         if search_type == "random":
-            model_distributions = get_model_distributions(model_type, task_type)
-            if not model_distributions:
+            param_distributions = _build_random_distributions(
+                model_type, task_type, model_param_distributions
+            )
+            if not param_distributions:
                 log_event("training.fit", model_type=model_type, tuning=False, reason="empty_distributions")
                 pipeline.fit(X_train, y_train, **fit_params)
                 return TrainerFitResult(
@@ -314,8 +353,6 @@ class Trainer:
                         "sample_weight_used": bool(fit_sample_weight is not None),
                     },
                 )
-
-            param_distributions = {f"model__{k}": v for k, v in model_distributions.items()}
 
             # Adaptive n_iter: scales with dataset size.
             # User-supplied n_iter_random_search overrides when explicitly set.

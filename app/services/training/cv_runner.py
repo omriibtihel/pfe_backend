@@ -52,8 +52,10 @@ from app.services.training.pipeline.trainer import Trainer
 from app.services.training.orchestrator import (
     ModelRunResult,
     _DENSE_REQUIRED_MODELS,
+    _RESAMPLE_STRATEGIES,
     _aggregate_cv_metrics,
     _build_inference_pipeline,
+    _build_resampler_for_gs,
     _compute_oof_regression_metrics,
     _default_decision_for_non_classification,
     _ensure_dense_matrix,
@@ -780,14 +782,29 @@ def _run_kfold_cv(
     X_final_f = X_refit_prep
     y_final_f = np.asarray(y_refit)
     final_fit_params: Dict[str, Any] = {}
+    # Anti-leakage: when GridSearch is active AND the balancing strategy resamples,
+    # embed the resampler inside the GS pipeline (same fix as the holdout path).
+    # Pre-resampling before GS would let synthetic samples appear in GS val folds.
+    _final_resampler_for_gs: Any = None
+    _final_use_gs_with_resampling = (
+        cfg.search_type != "none"
+        and cfg.task_type == "classification"
+        and final_decision.strategy in _RESAMPLE_STRATEGIES
+    )
     if cfg.task_type == "classification":
-        if final_decision.strategy in {"smote", "smote_tomek", "random_undersampling"}:
-            if hasattr(X_refit_prep, "toarray"):
+        if _final_use_gs_with_resampling:
+            _final_resampler_for_gs = _build_resampler_for_gs(final_decision)
+            if _final_resampler_for_gs is not None and hasattr(X_refit_prep, "toarray"):
                 X_refit_prep = X_refit_prep.toarray()
                 X_final_f = X_refit_prep
-        X_final_f, y_final_f, final_fit_params = final_executor.apply_prefit(
-            X_refit_prep, y_refit, final_decision
-        )
+        else:
+            if final_decision.strategy in _RESAMPLE_STRATEGIES:
+                if hasattr(X_refit_prep, "toarray"):
+                    X_refit_prep = X_refit_prep.toarray()
+                    X_final_f = X_refit_prep
+            X_final_f, y_final_f, final_fit_params = final_executor.apply_prefit(
+                X_refit_prep, y_refit, final_decision
+            )
 
     final_hp = dict(base_estimator_hp)
     if "class_weight" in final_fit_params:
@@ -826,6 +843,7 @@ def _run_kfold_cv(
         task_type=cfg.task_type,
         model_param_grid=final_param_grid if final_param_grid else None,
         refit_metric_override=(final_decision.refit_metric if cfg.task_type == "classification" else None),
+        resampler=_final_resampler_for_gs,
         n_samples=int(len(y_final_f)),
         imbalanced=_final_is_imbalanced,
     )
@@ -895,7 +913,7 @@ def _run_kfold_cv(
                 db=db,
                 smote_samples_added=(
                     int(len(y_final_f) - len(y_refit))
-                    if final_decision.strategy in {"smote", "smote_tomek"}
+                    if not _final_use_gs_with_resampling and final_decision.strategy in {"smote", "smote_tomek"}
                     else None
                 ),
                 optimal_threshold=optimal_threshold,
@@ -1482,14 +1500,26 @@ def _run_loo(
     X_final_f = X_refit_prep
     y_final_f = np.asarray(y_all)
     final_fit_params: Dict[str, Any] = {}
+    _loo_resampler_for_gs: Any = None
+    _loo_use_gs_with_resampling = (
+        cfg.search_type != "none"
+        and cfg.task_type == "classification"
+        and final_decision.strategy in _RESAMPLE_STRATEGIES
+    )
     if cfg.task_type == "classification":
-        if final_decision.strategy in {"smote", "smote_tomek", "random_undersampling"}:
-            if hasattr(X_refit_prep, "toarray"):
+        if _loo_use_gs_with_resampling:
+            _loo_resampler_for_gs = _build_resampler_for_gs(final_decision)
+            if _loo_resampler_for_gs is not None and hasattr(X_refit_prep, "toarray"):
                 X_refit_prep = X_refit_prep.toarray()
                 X_final_f = X_refit_prep
-        X_final_f, y_final_f, final_fit_params = final_executor.apply_prefit(
-            X_refit_prep, y_all, final_decision
-        )
+        else:
+            if final_decision.strategy in _RESAMPLE_STRATEGIES:
+                if hasattr(X_refit_prep, "toarray"):
+                    X_refit_prep = X_refit_prep.toarray()
+                    X_final_f = X_refit_prep
+            X_final_f, y_final_f, final_fit_params = final_executor.apply_prefit(
+                X_refit_prep, y_all, final_decision
+            )
 
     final_hp = dict(base_estimator_hp)
     if "class_weight" in final_fit_params:
@@ -1517,6 +1547,7 @@ def _run_loo(
         task_type=cfg.task_type,
         model_param_grid=final_param_grid if final_param_grid else None,
         refit_metric_override=(final_decision.refit_metric if cfg.task_type == "classification" else None),
+        resampler=_loo_resampler_for_gs,
         n_samples=int(len(y_final_f)),
         imbalanced=False,
     )
@@ -1581,7 +1612,7 @@ def _run_loo(
                 db=db,
                 smote_samples_added=(
                     int(len(y_final_f) - len(y_all))
-                    if final_decision.strategy in {"smote", "smote_tomek"} else None
+                    if not _loo_use_gs_with_resampling and final_decision.strategy in {"smote", "smote_tomek"} else None
                 ),
                 optimal_threshold=optimal_threshold,
                 threshold_f1_gain=threshold_f1_gain,

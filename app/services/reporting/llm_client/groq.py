@@ -37,7 +37,7 @@ class GroqConfig:
     base_url: str = "https://api.groq.com/openai/v1"
     timeout_s: int = 30
     temperature: float = 0.2
-    max_tokens: int = 1024
+    max_tokens: int = 1800
 
 
 class GroqClient:

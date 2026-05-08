@@ -68,7 +68,7 @@ def run_training_session(session_id: int) -> None:
     """
     Worker appelé par la route (background task).
     split->preprocess->smote(train only)->fit->eval->persist.
-    Pour l’instant: orchestrator = HOLDOUT (kfold arrive juste après).
+    Supports holdout, kfold, stratified_kfold, repeated, group, and LOO strategies.
     """
     t_start = time.monotonic()
     db = SessionLocal()

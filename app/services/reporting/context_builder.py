@@ -93,6 +93,9 @@ class ReportContext:
     model_name: str = ""
     model_version: str = ""
     task_type: str = "classification"
+    # Internal fields — never forwarded to the LLM prompt; used for server-side postprocessing.
+    score: Optional[float] = None
+    threshold_value: Optional[float] = None
 
 
 # ── Confidence bucketing ──────────────────────────────────────────────────────
@@ -242,6 +245,7 @@ class ReportContextBuilder:
         task_type: str = "classification",
         glossary: Any = None,
         top_n: int = 5,
+        threshold_value: Optional[float] = None,
     ) -> ReportContext:
         label = sanitize_for_prompt(str(prediction_value), max_len=_MAX_LABEL_LEN) or "—"
         confidence_text = bucket_confidence(score, lang)
@@ -279,6 +283,8 @@ class ReportContextBuilder:
             model_name=sanitize_for_prompt(model_name, max_len=80),
             model_version=sanitize_for_prompt(model_version, max_len=40),
             task_type=task_type,
+            score=score,
+            threshold_value=threshold_value,
         )
 
     @staticmethod
