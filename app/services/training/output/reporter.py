@@ -17,6 +17,47 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _resolve_positive_class_index(fitted_pipeline: Any, resolved_positive_label: Any) -> Optional[int]:
+    """Return the column index of the positive class in model.classes_.
+
+    Explicitly saves the index even for standard {0,1} datasets (where
+    resolved_positive_label is None) so the predictor never relies on a
+    fallback that may be wrong for non-standard class orderings.
+
+    Returns None only when classes_ is unavailable or has != 2 classes.
+    """
+    try:
+        model_step = getattr(fitted_pipeline, "named_steps", {}).get("model")
+        classes_ = getattr(model_step, "classes_", None)
+        if classes_ is None or len(classes_) != 2:
+            return None
+
+        if resolved_positive_label is not None:
+            # Primary: explicit positive label set at training time.
+            pos_str = str(resolved_positive_label)
+            for i, cls in enumerate(classes_):
+                if str(cls) == pos_str:
+                    return i
+            # String comparison failed — try via to_python_scalar (handles numpy types)
+            pos_native = to_python_scalar(resolved_positive_label)
+            for i, cls in enumerate(classes_):
+                if to_python_scalar(cls) == pos_native:
+                    return i
+            return None  # not found; caller will fall back to 1
+        else:
+            # Fallback for standard {0,1} encoding: sklearn always sorts classes_
+            # so 1 (or True) is at index 1. Derive the index instead of hardcoding.
+            for i, cls in enumerate(classes_):
+                try:
+                    if float(to_python_scalar(cls)) == 1.0:
+                        return i
+                except (TypeError, ValueError):
+                    pass
+            return 1  # absolute fallback
+    except Exception:
+        return None
+
+
 def _extract_feature_names(fitted_pipeline: Any, n_fallback: int) -> list[str]:
     named_steps = getattr(fitted_pipeline, "named_steps", {}) or {}
     prep = named_steps.get("prep")
@@ -198,18 +239,27 @@ def summarize_model(model: Any) -> Dict[str, Any]:
 def _build_column_stats(X: pd.DataFrame) -> Dict[str, Any]:
     """Compute per-column statistics for drift detection at prediction time."""
     stats: Dict[str, Any] = {}
+    n_rows = len(X)
     for col in X.columns:
         s = X[col].dropna()
         if len(s) == 0:
             continue
         if pd.api.types.is_numeric_dtype(s):
-            stats[str(col)] = {
+            n_unique = int(s.nunique())
+            # High-cardinality numeric columns (> 90 % unique values) are likely
+            # identifiers (patient IDs, timestamps). Drift detection on them
+            # produces only false positives and is not clinically useful.
+            high_cardinality = n_rows > 0 and (n_unique / n_rows) > 0.90
+            col_stats: Dict[str, Any] = {
                 "type": "numeric",
                 "mean": float(s.mean()),
                 "std": float(s.std()) if len(s) > 1 else 0.0,
                 "min": float(s.min()),
                 "max": float(s.max()),
             }
+            if high_cardinality:
+                col_stats["high_cardinality"] = True
+            stats[str(col)] = col_stats
         else:
             unique_vals = s.astype(str).unique().tolist()
             # Only store categories if cardinality is manageable
@@ -295,20 +345,9 @@ class Reporter:
             enriched_balancing["positive_label"] = (
                 str(resolved_positive_label) if resolved_positive_label is not None else None
             )
-            # Compute the index of the positive class within model.classes_
-            pos_idx: Optional[int] = None
-            if resolved_positive_label is not None:
-                try:
-                    model_step = fitted_pipeline.named_steps.get("model")
-                    classes_ = getattr(model_step, "classes_", None)
-                    if classes_ is not None:
-                        classes_list = [str(c) for c in classes_]
-                        lbl = str(resolved_positive_label)
-                        if lbl in classes_list:
-                            pos_idx = int(classes_list.index(lbl))
-                except Exception:
-                    pass
-            enriched_balancing["positive_class_index"] = pos_idx
+            enriched_balancing["positive_class_index"] = _resolve_positive_class_index(
+                fitted_pipeline, resolved_positive_label
+            )
 
         artifacts: Dict[str, Any] = {
             "split_info": {
@@ -460,19 +499,9 @@ class Reporter:
             enriched_balancing["positive_label"] = (
                 str(resolved_positive_label) if resolved_positive_label is not None else None
             )
-            pos_idx: Optional[int] = None
-            if resolved_positive_label is not None:
-                try:
-                    model_step = fitted_pipeline.named_steps.get("model")
-                    classes_ = getattr(model_step, "classes_", None)
-                    if classes_ is not None:
-                        classes_list = [str(c) for c in classes_]
-                        lbl = str(resolved_positive_label)
-                        if lbl in classes_list:
-                            pos_idx = int(classes_list.index(lbl))
-                except Exception:
-                    pass
-            enriched_balancing["positive_class_index"] = pos_idx
+            enriched_balancing["positive_class_index"] = _resolve_positive_class_index(
+                fitted_pipeline, resolved_positive_label
+            )
 
         artifacts: Dict[str, Any] = {
             "split_info": {

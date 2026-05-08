@@ -403,20 +403,37 @@ def _random_search_cf(
 def _format_items(
     raw: List[Dict[str, Any]],
     inv_scale_map: Dict[str, Tuple[float, float]],
+    ohe_features: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
-    """Convert raw binary-search results to the public output format."""
+    """Convert raw counterfactual results to the public output format.
+
+    For OHE binary features (e.g. sex_male ∈ {0, 1}), the continuous search
+    may produce values like 0.73.  These are snapped to the nearest valid
+    integer so the suggestion is clinically meaningful.  Features that map to
+    the same integer after snapping are skipped (no actionable change).
+    """
     items: List[Dict[str, Any]] = []
     for r in raw:
         pname = r["col"]
         orig_prep = r["orig_prep"]
         sugg_prep = r["sugg_prep"]
-        if pname in inv_scale_map:
+
+        # Snap OHE features to {0, 1} before inverse-scaling or display.
+        if ohe_features and pname in ohe_features:
+            snapped = float(round(max(0.0, min(1.0, sugg_prep))))
+            if abs(snapped - round(max(0.0, min(1.0, orig_prep)))) < 1e-8:
+                continue  # After snapping both are equal — no actionable change
+            orig_prep = float(round(max(0.0, min(1.0, orig_prep))))
+            sugg_prep = snapped
+            orig_val, sugg_val = orig_prep, sugg_prep
+        elif pname in inv_scale_map:
             params = inv_scale_map[pname]
             orig_val = _apply_inverse_scale(orig_prep, params)
             sugg_val = _apply_inverse_scale(sugg_prep, params)
         else:
             orig_val = orig_prep
             sugg_val = sugg_prep
+
         delta = sugg_val - orig_val
         items.append({
             "feature":         _strip_ct_prefix(str(pname)),
@@ -497,6 +514,11 @@ def compute_counterfactual(
         # Otherwise fall back to 1.0 (StandardScaler output has unit variance).
         bg_array: Optional[np.ndarray] = None
         sigma_map: Dict[str, float] = {}
+        # Features whose background values are exclusively 0 or 1 are OHE binary
+        # dummies. Counterfactual search may land on values like 0.73 in the
+        # continuous preprocessed space; we snap them back to {0, 1} before
+        # display so suggestions are clinically valid.
+        ohe_prep_features: set = set()
 
         if (
             background is not None
@@ -509,7 +531,12 @@ def compute_counterfactual(
             for col in prep_vary:
                 idx = feat_to_idx.get(col)
                 if idx is not None:
-                    sigma_map[col] = float(np.std(bg_array[:, idx])) or 1.0
+                    col_vals = bg_array[:, idx]
+                    sigma_map[col] = float(np.std(col_vals)) or 1.0
+                    # Detect OHE feature: all non-NaN values are exactly 0 or 1
+                    valid_vals = col_vals[~np.isnan(col_vals)]
+                    if valid_vals.size > 0 and set(np.unique(valid_vals).tolist()).issubset({0.0, 1.0}):
+                        ohe_prep_features.add(col)
         else:
             logger.info(
                 "counterfactual: SHAP background unavailable (shape=%s, expected (n,%d)); "
@@ -676,7 +703,7 @@ def compute_counterfactual(
             )
             return None
 
-        return _format_items(raw, inv_scale_map)
+        return _format_items(raw, inv_scale_map, ohe_features=ohe_prep_features)
 
     except Exception as exc:
         logger.warning("counterfactual: compute_counterfactual failed: %s", exc, exc_info=True)

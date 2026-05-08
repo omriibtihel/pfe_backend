@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from sklearn.metrics import f1_score, precision_recall_curve, roc_curve
@@ -49,6 +50,17 @@ def _as_binary_minority(y_true: np.ndarray) -> np.ndarray:
     return (y_true == minority_label).astype(int)
 
 
+def _as_binary_for_positive(y_true: np.ndarray, positive_label: Any) -> np.ndarray:
+    """Map positive_label → 1, everything else → 0.
+
+    When positive_label is None, falls back to the minority class so existing
+    behaviour is preserved for callers that don't supply a positive label.
+    """
+    if positive_label is None:
+        return _as_binary_minority(y_true)
+    return (y_true == positive_label).astype(int)
+
+
 class ThresholdOptimizer:
     def optimize(
         self,
@@ -60,23 +72,42 @@ class ThresholdOptimizer:
         cost_fn: float = 1.0,
         cost_fp: float = 1.0,
         classes: np.ndarray | None = None,
+        positive_label: Any = None,
     ) -> ThresholdResult:
         y_arr = np.asarray(y_true).reshape(-1)
         proba_arr = np.asarray(y_proba)
+
+        # Determine which probability column corresponds to the positive class.
+        # Priority: use positive_label (from resolved_positive_label at training time).
+        # Fallback: use the minority class column (original behavior).
+        # Both the proba column and y_bin must reference the same class so that
+        # F1 optimisation is coherent — misaligning them would invert the threshold.
+        selected_col = 1  # default
+        effective_positive_label: Any = positive_label
+
         if proba_arr.ndim == 2 and proba_arr.shape[1] >= 2:
-            # _as_binary_minority maps the minority class → 1; pick the proba
-            # column that corresponds to that minority class so the optimization
-            # direction is correct even when the minority class is at column 0.
-            minority_col = 1  # default (minority is usually the positive class at index 1)
-            if classes is not None and len(classes) == 2 and y_arr.size > 0:
-                values, counts = np.unique(y_arr, return_counts=True)
-                if len(values) == 2:
-                    minority_label = values[int(np.argmin(counts))]
-                    try:
-                        minority_col = list(classes).index(minority_label)
-                    except ValueError:
-                        minority_col = 1
-            proba_arr = proba_arr[:, minority_col]
+            if classes is not None and len(classes) == 2:
+                if positive_label is not None:
+                    # Align with the explicitly provided positive class.
+                    pos_str = str(positive_label)
+                    for i, cls in enumerate(classes):
+                        if str(cls) == pos_str:
+                            selected_col = i
+                            break
+                elif y_arr.size > 0:
+                    # Fall back: minority class (original behavior for callers that
+                    # don't supply a positive_label, e.g. {0,1} standard encoding).
+                    values, counts = np.unique(y_arr, return_counts=True)
+                    if len(values) == 2:
+                        minority_label = values[int(np.argmin(counts))]
+                        try:
+                            selected_col = list(classes).index(minority_label)
+                        except ValueError:
+                            selected_col = 1
+                        effective_positive_label = classes[selected_col]
+                else:
+                    effective_positive_label = classes[selected_col]
+            proba_arr = proba_arr[:, selected_col]
         proba_arr = proba_arr.reshape(-1)
 
         if y_arr.size == 0 or proba_arr.size == 0 or y_arr.size != proba_arr.size:
@@ -90,7 +121,8 @@ class ThresholdOptimizer:
                 improvement_delta=0.0,
             )
 
-        y_bin = _as_binary_minority(y_arr)
+        # y_bin must be 1 wherever y_true == positive class — same class as proba_arr.
+        y_bin = _as_binary_for_positive(y_arr, effective_positive_label)
         if y_bin.size == 0:
             return ThresholdResult(
                 optimal_threshold=0.5,

@@ -332,6 +332,10 @@ def _detect_drift(raw_df: pd.DataFrame, training_schema: dict) -> List[Dict[str,
         col_type = stats.get("type", "numeric")
 
         if col_type == "numeric":
+            # Skip high-cardinality columns (IDs, timestamps) flagged at training
+            # time — they produce only false-positive drift alerts.
+            if stats.get("high_cardinality"):
+                continue
             train_mean = stats.get("mean")
             train_std = stats.get("std")
             if train_mean is None or train_std is None or train_std == 0:
@@ -372,6 +376,8 @@ def _detect_drift(raw_df: pd.DataFrame, training_schema: dict) -> List[Dict[str,
 def predict_with_trained_model(
     trained_model: TrainedModel,
     raw_df: pd.DataFrame,
+    *,
+    _preloaded_pipeline: Any = None,
 ) -> Dict[str, Any]:
     """
     Run inference on raw_df using the fitted pipeline stored in trained_model.
@@ -392,7 +398,9 @@ def predict_with_trained_model(
     if not pkl_path.exists():
         raise RuntimeError(f"Model file not found: {pkl_path}")
 
-    pipeline = load_pipeline(pkl_path)
+    # Accept a pre-loaded pipeline so callers like predict_with_explanations can
+    # avoid deserializing the pickle twice (Bug 12 fix).
+    pipeline = _preloaded_pipeline if _preloaded_pipeline is not None else load_pipeline(pkl_path)
 
     task_type = str(trained_model.task_type or "classification").lower()
     training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
@@ -506,27 +514,32 @@ def predict_with_explanations(
     if method not in ("shap", "lime", "both"):
         method = "shap"
 
+    # Load the pipeline once and reuse for both prediction and explanation
+    # (Bug 12 fix: avoids deserialising the pkl twice).
+    artifacts = trained_model.artifacts_json or {}
+    _shared_pipeline: Any = None
+    _pkl_path_str = artifacts.get("model_pkl")
+    if _pkl_path_str:
+        _pkl_path = Path(str(_pkl_path_str))
+        if _pkl_path.exists():
+            try:
+                _shared_pipeline = load_pipeline(_pkl_path)
+            except Exception:
+                pass
+
     # Core prediction — raises on failure (pkl missing, inference error, etc.)
-    result = predict_with_trained_model(trained_model, raw_df)
+    result = predict_with_trained_model(trained_model, raw_df, _preloaded_pipeline=_shared_pipeline)
+
+    if _shared_pipeline is None:
+        return result
 
     # Explanation enrichment — best-effort, never breaks prediction
     try:
-        artifacts = trained_model.artifacts_json or {}
         task_type = str(trained_model.task_type or "classification").lower()
         training_schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
         feature_names: List[str] = training_schema.get("feature_names") or []
 
-        pkl_path_str = artifacts.get("model_pkl")
-        if not pkl_path_str:
-            return result
-
-        from pathlib import Path
-        pkl_path = Path(str(pkl_path_str))
-        if not pkl_path.exists():
-            return result
-
-        from app.services.training.output.persistence import load_pipeline
-        pipeline = load_pipeline(pkl_path)
+        pipeline = _shared_pipeline  # already loaded above — no second deserialisation
 
         # Reload the background data saved at training time (in artifacts["shap"]).
         # Reused by both SHAP and LIME: same baseline distribution, no duplication.
@@ -538,6 +551,11 @@ def predict_with_explanations(
                 background = np.array(raw_bg, dtype=float)
             except Exception:
                 background = None
+
+        # Recover the positive_label agreed at training time so SHAP values are
+        # oriented toward the correct class (not blindly toward index 1).
+        _balancing_info = artifacts.get("balancing") or {}
+        _artifact_positive_label: Optional[str] = _balancing_info.get("positive_label")
 
         # Align inputs the same way predict_with_trained_model does
         df_aligned = _normalize_input_dtypes(raw_df.copy(), pipeline)
@@ -570,6 +588,7 @@ def predict_with_explanations(
                         task_type=task_type,
                         background=background,
                         feature_names=feature_names if feature_names else None,
+                        positive_label=_artifact_positive_label,
                     )
                     if shap_items is not None:
                         row_result["shap"] = shap_items
@@ -750,15 +769,22 @@ def _get_top_features_for_display(
         prep_name = str(item.get("feature", ""))
         # Strip ColumnTransformer prefix (e.g. "num__", "cat__")
         base = prep_name.split("__", 1)[-1] if "__" in prep_name else prep_name
-        # Direct match
+        # Direct match (also covers non-OHE preprocessed features)
         if base in feat_set and base not in top:
             top.append(base)
             continue
-        # OHE expansion: "sex_male" → original feature "sex"
+        # OHE expansion: try all prefix lengths longest-first.
+        # "cat__diagnosis_high_blood_pressure" → base="diagnosis_high_blood_pressure"
+        # tries "diagnosis_high_blood_pressure", "diagnosis_high_blood", "diagnosis_high",
+        # "diagnosis" — first match wins.  Single rsplit("_", 1) would get
+        # "diagnosis_high_blood" which is wrong for multi-word category suffixes.
         if "_" in base:
-            stem = base.rsplit("_", 1)[0]
-            if stem in feat_set and stem not in top:
-                top.append(stem)
+            parts_base = base.split("_")
+            for n in range(len(parts_base) - 1, 0, -1):
+                stem = "_".join(parts_base[:n])
+                if stem in feat_set and stem not in top:
+                    top.append(stem)
+                    break
 
     # Fill remaining slots with alphabetically-first features when SHAP is
     # missing or didn't surface enough unique names.

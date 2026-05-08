@@ -47,6 +47,38 @@ from app.services.shap.global_shap import (
 _MAX_FEATURES = 30
 
 
+def _map_prep_to_raw_value(prep_name: str, raw_values: "Dict[str, Any]") -> "Any":
+    """Map a preprocessed feature name back to the closest original input value.
+
+    Handles three naming patterns produced by sklearn's ColumnTransformer:
+    1. Direct match:  'age'            → raw_values['age']
+    2. CT prefix:     'num__age'       → raw_values['age']  (strip prefix)
+    3. OHE expansion: 'cat__sex_male'  → raw_values['sex']  (original column)
+       For OHE the *original column value* is returned ('male'), not the 0/1
+       indicator, so the user sees the clinically meaningful category.
+
+    Uses progressively shorter prefixes so multi-word category suffixes like
+    'cat__diagnosis_high_blood_pressure' correctly resolve to 'diagnosis'.
+    """
+    # 1. Direct match
+    if prep_name in raw_values:
+        return raw_values[prep_name]
+
+    # 2. Strip ColumnTransformer prefix (num__, cat__, remainder__, …)
+    base = prep_name.split("__", 1)[-1] if "__" in prep_name else prep_name
+    if base in raw_values:
+        return raw_values[base]
+
+    # 3. OHE: try progressively shorter prefixes (longest match wins)
+    parts = base.split("_")
+    for n in range(len(parts) - 1, 0, -1):
+        candidate = "_".join(parts[:n])
+        if candidate in raw_values:
+            return raw_values[candidate]
+
+    return None
+
+
 def compute_local_lime(
     fitted_pipe: Any,
     row: pd.DataFrame,
@@ -187,7 +219,9 @@ def compute_local_lime(
         items: List[Dict[str, Any]] = []
         for i, fname in enumerate(shap_feature_names):
             weight = weights_map.get(i, 0.0)
-            raw_val = raw_values.get(fname, None)
+            # Use the robust mapper so OHE features (cat__sex_male) resolve to
+            # the original column value ('male') rather than returning None.
+            raw_val = _map_prep_to_raw_value(fname, raw_values)
             items.append({
                 "feature":      str(fname),
                 "contribution": float(to_json_safe(weight)) if to_json_safe(weight) is not None else 0.0,

@@ -37,6 +37,7 @@ class Evaluator:
     def evaluate(self, pipeline: Any, X: pd.DataFrame, y: np.ndarray, *, threshold: float = 0.5) -> DatasetEval:
         labels = get_class_labels(pipeline)
         is_binary = labels is not None and len(labels) == 2
+        _threshold_ignored_warning: Optional[str] = None
         if threshold != 0.5 and is_binary and hasattr(pipeline, "predict_proba"):
             # Find the column index of the positive class to avoid always using index 1.
             pos_col = 1
@@ -52,6 +53,15 @@ class Evaluator:
             neg_class = labels[1 - pos_col]
             y_pred = np.where(proba >= threshold, pos_class, neg_class)
         else:
+            if threshold != 0.5 and is_binary:
+                # Model lacks predict_proba — threshold cannot be applied. Metrics
+                # will be computed at the model's native decision boundary, which may
+                # differ from the calibrated optimal_threshold. Surface this to the user.
+                _threshold_ignored_warning = (
+                    f"threshold={threshold:.3f} could not be applied: model does not expose "
+                    "predict_proba. Metrics are computed at the native decision boundary (threshold≈0.5). "
+                    "Enable probability=True (SVM) or use a model that supports predict_proba."
+                )
             y_pred = pipeline.predict(X)
         y_proba, y_score = get_proba_or_score(pipeline, X)
 
@@ -67,6 +77,9 @@ class Evaluator:
                 requested_metrics=self.requested_metrics,
                 task_type=self.task_type,
             )
+            if _threshold_ignored_warning is not None and isinstance(metrics, dict):
+                existing = list(metrics.get("warnings") or [])
+                metrics = {**metrics, "warnings": existing + [_threshold_ignored_warning]}
             cm_payload = metrics.get("confusion_matrix") if isinstance(metrics, dict) else {}
             cm = cm_payload.get("matrix") if isinstance(cm_payload, dict) else safe_confusion_matrix(y, y_pred)
             return DatasetEval(metrics=metrics, predictions=y_pred, confusion_matrix=cm)

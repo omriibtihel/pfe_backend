@@ -32,6 +32,7 @@ import pandas as pd
 
 from app.services.shap._utils import (
     extract_model_from_pipeline,
+    get_positive_class_index,
     shap_values_to_float_array,
     to_json_safe,
 )
@@ -53,6 +54,7 @@ def compute_global_shap(
     task_type: str = "classification",
     feature_names: Optional[List[str]] = None,
     random_state: int = 42,
+    positive_label: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Compute global SHAP feature importances on the test set.
@@ -87,6 +89,15 @@ def compute_global_shap(
     try:
         estimator = extract_model_from_pipeline(fitted_pipe)
 
+        # Determine which class column SHAP values should be oriented toward.
+        # For binary classification, TreeExplainer returns [shap_class0, shap_class1];
+        # we must pick the index matching the agreed positive class, not always index 1.
+        binary_class_index = (
+            get_positive_class_index(fitted_pipe, positive_label)
+            if task_type == "classification"
+            else 0
+        )
+
         # ── Preprocessed features for the explainer ──────────────────────────
         # We need a numpy background matrix that has already been transformed
         # by the pipeline's preprocessing steps (align + prep), so the
@@ -111,7 +122,11 @@ def compute_global_shap(
 
         # ── Compute SHAP values ───────────────────────────────────────────────
         raw_shap = explainer.shap_values(X_explain)
-        shap_arr = shap_values_to_float_array(raw_shap)  # (n, n_preprocessed_features)
+        # For multiclass global SHAP: compute mean(abs) across classes for the
+        # overall importance ranking, then also build per-class summaries so
+        # users can see which features push toward each specific class.
+        _is_multiclass_list = isinstance(raw_shap, list) and len(raw_shap) > 2
+        shap_arr = shap_values_to_float_array(raw_shap, binary_class_index=binary_class_index)
 
         # ── Map preprocessed features back to original feature names ─────────
         # After OHE / scaling the number of columns may differ from len(names).
@@ -136,10 +151,50 @@ def compute_global_shap(
         items.sort(key=lambda d: float(d["mean_abs_shap"]), reverse=True)
         items = items[:_MAX_FEATURES]
 
+        # ── Per-class summaries for multiclass (Bug 13 fix) ───────────────────
+        # mean(abs(SHAP)) hides direction — a feature that strongly predicts
+        # class A may appear "unimportant" if it has low absolute values for
+        # other classes. Per-class signed summaries let the user ask
+        # "which features push toward diabetes vs. healthy?".
+        per_class_summary: Optional[List[Dict[str, Any]]] = None
+        if _is_multiclass_list:
+            try:
+                model_classes = getattr(estimator, "classes_", None)
+                per_class_summary = []
+                for cls_idx, cls_shap in enumerate(raw_shap):
+                    cls_arr = np.asarray(cls_shap, dtype=float)
+                    if cls_arr.ndim != 2 or cls_arr.shape[1] != len(shap_feature_names):
+                        continue
+                    cls_mean_abs = np.abs(cls_arr).mean(axis=0)
+                    cls_mean_signed = cls_arr.mean(axis=0)
+                    cls_items = [
+                        {
+                            "feature": str(shap_feature_names[i]),
+                            "mean_abs_shap": float(to_json_safe(cls_mean_abs[i])),
+                            "mean_shap": float(to_json_safe(cls_mean_signed[i])),
+                        }
+                        for i in range(len(shap_feature_names))
+                    ]
+                    cls_items.sort(key=lambda d: float(d["mean_abs_shap"]), reverse=True)
+                    class_label = (
+                        str(model_classes[cls_idx])
+                        if model_classes is not None and cls_idx < len(model_classes)
+                        else f"class_{cls_idx}"
+                    )
+                    per_class_summary.append({
+                        "class_index": cls_idx,
+                        "class_label": class_label,
+                        "features": cls_items[:_MAX_FEATURES],
+                    })
+            except Exception:
+                per_class_summary = None
+
         # ── Expected value ────────────────────────────────────────────────────
         ev = getattr(explainer, "expected_value", None)
         if isinstance(ev, (list, np.ndarray)):
-            ev = ev[1] if len(ev) == 2 else float(np.mean(ev))
+            # Use the same class index as the SHAP values so the baseline
+            # probability matches the direction of the explanations.
+            ev = ev[binary_class_index] if len(ev) == 2 else float(np.mean(ev))
         expected_value = to_json_safe(float(ev)) if ev is not None else None
 
         # Save a small background subsample for local SHAP at prediction time.
@@ -149,13 +204,16 @@ def compute_global_shap(
         bg_idx = rng_bg.choice(len(X_prep), size=n_bg, replace=False)
         bg_data = X_prep[bg_idx].tolist()
 
-        return {
+        result: Dict[str, Any] = {
             "summary":         items,
             "expected_value":  expected_value,
             "explainer_type":  explainer_type,
             "n_samples":       int(len(X_explain)),
             "background_data": bg_data,
         }
+        if per_class_summary is not None:
+            result["per_class_summary"] = per_class_summary
+        return result
 
     except Exception:
         return None

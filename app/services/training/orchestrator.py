@@ -765,6 +765,7 @@ def _run_holdout(
             threshold_input_X,
             np.asarray(threshold_input_y) if threshold_input_y is not None else None,
             decision,
+            positive_label=resolved_positive_label,
         )
         if executor.last_threshold_result is not None:
             threshold_f1_gain = float(executor.last_threshold_result.improvement_delta)
@@ -796,7 +797,10 @@ def _run_holdout(
         requested_metrics=cfg.metrics,
         positive_label=resolved_positive_label,
     )
-    train_eval = evaluator.evaluate(fitted_pipe, split.X_train, np.asarray(split.y_train))
+    # Use the same threshold as the test set so train vs test metrics are
+    # directly comparable. Computing train metrics at threshold=0.5 while
+    # test metrics use optimal_threshold makes precision/recall look inconsistent.
+    train_eval = evaluator.evaluate(fitted_pipe, split.X_train, np.asarray(split.y_train), threshold=optimal_threshold)
 
     val_metrics = None
     if split.X_val is not None and split.y_val is not None and len(split.X_val) > 0:
@@ -974,6 +978,7 @@ def _run_holdout(
                 split.X_test,
                 task_type=cfg.task_type,
                 feature_names=list(split.X_test.columns),
+                positive_label=resolved_positive_label,
             )
             if _shap_result is not None:
                 artifacts["shap"] = _shap_result

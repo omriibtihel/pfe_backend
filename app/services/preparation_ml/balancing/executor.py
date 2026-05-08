@@ -73,6 +73,8 @@ class BalancingExecutor:
         X_val: Any,
         y_val: np.ndarray | None,
         decision: BalancingDecision,
+        *,
+        positive_label: Any = None,
     ) -> float:
         self.postfit_warnings = []
         self.last_threshold_result = None
@@ -121,14 +123,13 @@ class BalancingExecutor:
 
         try:
             y_proba = predict_proba(X_val)
-            # Retrieve the class-label order used by the model so the optimizer
-            # can pick the correct proba column for the minority class.
             model_classes = getattr(model, "classes_", None)
             return self._optimize_threshold(
                 y_true=y_arr,
                 y_proba=np.asarray(y_proba),
                 decision=decision,
                 model_classes=model_classes,
+                positive_label=positive_label,
             )
         except Exception as exc:
             warning = f"threshold_optimization_failed_{exc.__class__.__name__.lower()}"
@@ -151,6 +152,8 @@ class BalancingExecutor:
         y_proba: np.ndarray,
         decision: BalancingDecision,
         model_classes: Any | None = None,
+        *,
+        positive_label: Any = None,
     ) -> float:
         """Calibrate the decision threshold from already-collected out-of-fold predictions.
 
@@ -196,6 +199,7 @@ class BalancingExecutor:
                 y_proba=proba_arr,
                 decision=decision,
                 model_classes=model_classes,
+                positive_label=positive_label,
             )
         except Exception as exc:
             warning = f"threshold_optimization_failed_{exc.__class__.__name__.lower()}"
@@ -218,6 +222,8 @@ class BalancingExecutor:
         y_proba: np.ndarray,
         decision: BalancingDecision,
         model_classes: Any | None,
+        *,
+        positive_label: Any = None,
     ) -> float:
         optimizer = ThresholdOptimizer()
         result = optimizer.optimize(
@@ -233,6 +239,7 @@ class BalancingExecutor:
             cost_fn=float(getattr(decision, "cost_fn", 1.0)),
             cost_fp=float(getattr(decision, "cost_fp", 1.0)),
             classes=model_classes,
+            positive_label=positive_label,
         )
         # Revert to 0.5 if the optimized threshold brings no improvement or degrades F1.
         if result.improvement_delta <= 0.0:

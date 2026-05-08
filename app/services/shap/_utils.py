@@ -110,22 +110,37 @@ def safe_background(
     return X[idx]
 
 
-def shap_values_to_float_array(shap_vals: Any, *, binary_class_index: int = 1) -> np.ndarray:
+def shap_values_to_float_array(
+    shap_vals: Any,
+    *,
+    binary_class_index: int = 1,
+    predicted_class_indices: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """
     Normalise SHAP output to a 2-D float array: (n_samples, n_features).
 
     Different explainers return values in different formats:
-    - TreeExplainer binary classification: list of 2 arrays → take index 1
-    - TreeExplainer multiclass: list of C arrays → stack and average abs
+    - TreeExplainer binary classification: list of 2 arrays → take binary_class_index
+    - TreeExplainer multiclass: list of C arrays
+      * When predicted_class_indices is provided: take per-sample predicted class
+        (clinically correct — shows why THIS sample was classified as class X)
+      * Fallback: mean absolute across classes (overall importance view)
     - LinearExplainer: already (n, p) 2-D
     - KernelExplainer: already (n, p) 2-D (for binary) or list
     """
     if isinstance(shap_vals, list):
         if len(shap_vals) == 2:
-            # Binary: return positive class
+            # Binary: return the agreed positive class
             return np.asarray(shap_vals[binary_class_index], dtype=float)
         if len(shap_vals) > 2:
-            # Multiclass: mean absolute across classes
+            if predicted_class_indices is not None:
+                # Per-sample: extract SHAP values for the predicted class.
+                # stacked: (n_classes, n_samples, n_features)
+                stacked = np.stack([np.asarray(v, dtype=float) for v in shap_vals], axis=0)
+                n_samples = stacked.shape[1]
+                indices = np.asarray(predicted_class_indices, dtype=int)
+                return np.array([stacked[indices[i], i, :] for i in range(n_samples)])
+            # Default: mean absolute across classes (global feature importance view)
             stacked = np.stack([np.abs(np.asarray(v, dtype=float)) for v in shap_vals], axis=0)
             return stacked.mean(axis=0)
         if len(shap_vals) == 1:
@@ -138,9 +153,43 @@ def shap_values_to_float_array(shap_vals: Any, *, binary_class_index: int = 1) -
     if arr.ndim == 3:
         if arr.shape[2] == 2:
             return arr[:, :, binary_class_index]
+        if predicted_class_indices is not None:
+            indices = np.asarray(predicted_class_indices, dtype=int)
+            return np.array([arr[i, :, indices[i]] for i in range(arr.shape[0])])
         return np.abs(arr).mean(axis=2)
 
     return arr  # (n, p) already
+
+
+def get_positive_class_index(pipeline_or_estimator: Any, positive_label: Any) -> int:
+    """Return the column index of positive_label in the fitted model's classes_ array.
+
+    Used so that SHAP values always correspond to the class that was designated
+    as "positive" at training time, regardless of sklearn's internal sort order.
+
+    Falls back to 1 (sklearn default for {0,1}) when:
+    - positive_label is None  (standard {0,1} encoding — class 1 is always positive)
+    - positive_label is not found in classes_
+    - classes_ is absent or not exactly 2 classes
+    """
+    if positive_label is None:
+        return 1
+
+    named = getattr(pipeline_or_estimator, "named_steps", None)
+    if named is not None:
+        estimator = named.get("model") or list(named.values())[-1]
+    else:
+        estimator = pipeline_or_estimator
+
+    classes_ = getattr(estimator, "classes_", None)
+    if classes_ is None or len(classes_) != 2:
+        return 1
+
+    pos_str = str(positive_label)
+    for i, label in enumerate(classes_):
+        if str(label) == pos_str:
+            return i
+    return 1
 
 
 def to_json_safe(v: Any) -> Any:

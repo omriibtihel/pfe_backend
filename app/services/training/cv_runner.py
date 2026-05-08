@@ -841,6 +841,7 @@ def _run_kfold_cv(
     optimal_threshold = 0.5
     threshold_f1_gain: Optional[float] = None
     threshold_calibration_source = "not_applicable"
+    _oof_metrics_at_threshold: Optional[Dict[str, Any]] = None  # populated below for classification
     if cfg.task_type == "classification":
         # Threshold optimization is binary-only: disable it for multiclass with explicit warning.
         _cv_multiclass_threshold_disabled = False
@@ -870,11 +871,13 @@ def _run_kfold_cv(
                 y_proba=oof_proba_arr,
                 decision=final_decision,
                 model_classes=getattr(final_fitted_model, "classes_", None),
+                positive_label=resolved_positive_label,
             )
             threshold_calibration_source = "oof"
         else:
             optimal_threshold = final_executor.apply_postfit(
-                fitted_pipe, X_refit, y_refit, final_decision
+                fitted_pipe, X_refit, y_refit, final_decision,
+                positive_label=resolved_positive_label,
             )
             threshold_calibration_source = "train_refit"
             final_executor.postfit_warnings.append(
@@ -899,6 +902,50 @@ def _run_kfold_cv(
                 threshold_f1_gain=threshold_f1_gain,
                 postfit_warnings=list(final_executor.postfit_warnings or []),
             )
+
+        # ── OOF metrics at the deployed threshold (Bug 4 fix) ─────────────────
+        # cv_summary fold metrics are computed at threshold=0.5 (the threshold
+        # is unknown during the fold loop). When optimal_threshold ≠ 0.5, we
+        # re-evaluate on the pooled OOF probabilities at the deployed threshold
+        # so users can compare CV summary against the model they will actually
+        # use. Stored as cv_mean_at_threshold in metrics_json.
+        _oof_metrics_at_threshold: Optional[Dict[str, Any]] = None
+        if optimal_threshold != 0.5 and oof_proba_arr is not None and oof_true_arr is not None:
+            try:
+                _model_cls_thr = getattr(final_fitted_model, "classes_", None)
+                _pos_col_thr = 1
+                if resolved_positive_label is not None and _model_cls_thr is not None and len(_model_cls_thr) == 2:
+                    _pos_str_thr = str(resolved_positive_label)
+                    for _ii, _cc in enumerate(_model_cls_thr):
+                        if str(_cc) == _pos_str_thr:
+                            _pos_col_thr = _ii
+                            break
+
+                _oof_proba_col = (
+                    oof_proba_arr[:, _pos_col_thr]
+                    if oof_proba_arr.ndim == 2 and oof_proba_arr.shape[1] >= 2
+                    else oof_proba_arr.ravel()
+                )
+                if _model_cls_thr is not None and len(_model_cls_thr) == 2:
+                    _pos_cls_thr = _model_cls_thr[_pos_col_thr]
+                    _neg_cls_thr = _model_cls_thr[1 - _pos_col_thr]
+                    _oof_y_pred_thr = np.where(_oof_proba_col >= optimal_threshold, _pos_cls_thr, _neg_cls_thr)
+                else:
+                    _oof_y_pred_thr = (_oof_proba_col >= optimal_threshold).astype(int)
+
+                from app.services.training.pipeline.metrics import classification_metrics as _cm
+                _oof_metrics_at_threshold = _extract_scalar_metrics(
+                    _cm(
+                        oof_true_arr, _oof_y_pred_thr,
+                        y_proba=oof_proba_arr,
+                        labels=_model_cls_thr,
+                        positive_label=resolved_positive_label,
+                        requested_metrics=list(cfg.metrics),
+                        task_type=cfg.task_type,
+                    )
+                )
+            except Exception as _thr_exc:
+                _log_event("training.cv.oof_threshold_metrics_failed", model_type=model_type_norm, reason=str(_thr_exc))
 
     _log_event("training.cv.refit_end", model_type=model_type_norm)
 
@@ -977,6 +1024,10 @@ def _run_kfold_cv(
     # otherwise CV mean metrics (backward compat for route/frontend).
     # "cv_mean" always holds the aggregated CV validation metrics.
     cv_mean_metrics = cv_summary.get("mean", {})
+    # Bug 9: "test" key has dual semantics (holdout OR cv_mean). Preserve it for
+    # backward compat but add an explicit "test_meta" dict so callers cannot
+    # silently misinterpret CV metrics as an independent holdout evaluation.
+    _test_source = "holdout" if (has_holdout_test and holdout_test_metrics is not None) else "cv_mean"
     metrics_json: Dict[str, Any] = {
         "split_method": cfg.split_method,
         "cv": True,
@@ -989,6 +1040,17 @@ def _run_kfold_cv(
         "test": holdout_test_metrics if (has_holdout_test and holdout_test_metrics is not None) else cv_mean_metrics,
         "test_is_cv_mean": not has_holdout_test,
         "test_label": "CV validation (moyenne des folds)" if not has_holdout_test else "Holdout test set",
+        "test_meta": {
+            "source": _test_source,
+            "is_independent_holdout": has_holdout_test and holdout_test_metrics is not None,
+            "interpretation": (
+                "Independent holdout set — honest generalisation estimate."
+                if _test_source == "holdout"
+                else "CV mean across folds (threshold=0.5). "
+                     "Use cv_mean_at_threshold (when present) for performance at deployed threshold. "
+                     "NOT equivalent to an independent test set."
+            ),
+        },
         "training_time_sec": float(time.perf_counter() - t0),
     }
     if has_holdout_test and holdout_test_metrics is not None:
@@ -996,6 +1058,23 @@ def _run_kfold_cv(
     metrics_json["threshold_used"] = optimal_threshold
     metrics_json["threshold_source"] = threshold_calibration_source
     metrics_json["confidence_intervals"] = bootstrap_cis_cv
+    # Bug 4: expose OOF metrics recomputed at the deployed threshold so users
+    # can compare apples-to-apples (cv_mean uses 0.5; this uses optimal_threshold).
+    if _oof_metrics_at_threshold is not None:
+        metrics_json["cv_mean_at_threshold"] = _oof_metrics_at_threshold
+        metrics_json["threshold_adjusted_note"] = (
+            f"cv_mean was computed at threshold=0.5 during fold evaluation. "
+            f"cv_mean_at_threshold applies the deployed threshold={optimal_threshold:.3f} "
+            "to pooled OOF predictions for a like-for-like comparison."
+        )
+    # Bug 5: surface the OOF calibration limitation so users understand the
+    # threshold may not be perfectly tuned for the refit-on-full-data model.
+    if threshold_calibration_source == "oof":
+        metrics_json["threshold_oof_note"] = (
+            "Threshold was calibrated on out-of-fold predictions (fold-specific models). "
+            "The deployed model (refit on all CV data) may have slightly different probability "
+            "calibration — the optimal threshold could differ marginally."
+        )
     cv_instability = cv_summary.get("instability_warnings", [])
     postfit_w = list(getattr(final_executor, "postfit_warnings", None) or [])
     _clip_strs = [
@@ -1115,6 +1194,11 @@ def _run_loo(
     y_proba_loo: list[Any] = []
     fold_results: List[Dict[str, Any]] = []
     n_ok = 0
+    # Track the proba column index for the positive class. Captured once from
+    # the first successful fold's model.classes_ so y_score_loo is oriented
+    # toward resolved_positive_label instead of always defaulting to index 1.
+    _loo_pos_col: int = 1
+    _loo_pos_col_set: bool = False
 
     try:
         loo_splits = list(iter_loo_splits(X_all, y_all))
@@ -1235,6 +1319,17 @@ def _run_loo(
             if hasattr(fold_pipeline, "predict_proba"):
                 proba = fold_pipeline.predict_proba(X_val_prep)
                 y_proba_loo.append(proba[0])
+                # Capture the positive-class column index from classes_ once.
+                # All LOO folds use the same label encoding, so one capture suffices.
+                if not _loo_pos_col_set and resolved_positive_label is not None:
+                    _fold_classes = getattr(fold_pipeline, "classes_", None)
+                    if _fold_classes is not None and len(_fold_classes) == 2:
+                        pos_str = str(resolved_positive_label)
+                        for _i, _cls in enumerate(_fold_classes):
+                            if str(_cls) == pos_str:
+                                _loo_pos_col = _i
+                                _loo_pos_col_set = True
+                                break
 
             fold_results.append({
                 "fold": fold_num,
@@ -1268,7 +1363,8 @@ def _run_loo(
 
         if y_proba_arr is not None:
             if y_proba_arr.ndim == 2 and y_proba_arr.shape[1] == 2:
-                y_score_loo = y_proba_arr[:, 1]
+                # Use the tracked positive-class column, not hardcoded index 1.
+                y_score_loo = y_proba_arr[:, _loo_pos_col]
             else:
                 y_score_loo = y_proba_arr
 
@@ -1461,11 +1557,13 @@ def _run_loo(
                 y_proba=oof_proba_arr,
                 decision=final_decision,
                 model_classes=getattr(final_fitted_model, "classes_", None),
+                positive_label=resolved_positive_label,
             )
             threshold_calibration_source = "loo_oof"
         else:
             optimal_threshold = final_executor.apply_postfit(
-                fitted_pipe, X_all, y_all, final_decision
+                fitted_pipe, X_all, y_all, final_decision,
+                positive_label=resolved_positive_label,
             )
             if final_decision.apply_threshold:
                 threshold_calibration_source = "train_fallback"
