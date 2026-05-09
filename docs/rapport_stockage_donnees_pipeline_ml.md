@@ -1,5 +1,5 @@
 # Rapport : Stockage des donnees dans le pipeline ML
-## MedicalVision Backend
+## MedIQ Backend
 **Date** : 2026-04-20
 
 ---

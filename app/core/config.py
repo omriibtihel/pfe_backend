@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "MedicalVision API"
+    APP_NAME: str = "MedIQ API"
     ENV: str = "dev"
     SECRET_KEY: str = "super-secret-key"
 
@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
-    SMTP_FROM_EMAIL: str = "noreply@medicalvision.ai"
-    SMTP_FROM_NAME: str = "MedicalVision"
+    SMTP_FROM_EMAIL: str = "noreply@mediq.ai"
+    SMTP_FROM_NAME: str = "MedIQ"
     FRONTEND_URL: str = "http://localhost:5173"
 
     # LLM reporting backends. Empty values disable a backend.

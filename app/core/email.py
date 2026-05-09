@@ -19,7 +19,7 @@ def _base_template(content: str) -> str:
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MedicalVision</title>
+  <title>MedIQ</title>
 </head>
 <body style="margin:0;padding:0;background-color:#0f1117;font-family:'Segoe UI',Arial,sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#0f1117;padding:40px 0;">
@@ -34,7 +34,7 @@ def _base_template(content: str) -> str:
                 <tr>
                   <td style="background:rgba(255,255,255,0.15);border-radius:12px;padding:10px 14px;display:inline-block;">
                     <span style="font-size:22px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">
-                      &#9889; MedicalVision
+                      &#9889; MedIQ
                     </span>
                   </td>
                 </tr>
@@ -59,7 +59,7 @@ def _base_template(content: str) -> str:
                 Cet e-mail a été envoyé automatiquement — merci de ne pas y répondre.
               </p>
               <p style="margin:0;color:rgba(255,255,255,0.25);font-size:11px;">
-                © 2025 MedicalVision · Tous droits réservés
+                © 2025 MedIQ · Tous droits réservés
               </p>
             </td>
           </tr>
@@ -103,7 +103,7 @@ def _approval_html(full_name: str) -> str:
       </p>
       <p style="margin:0 0 16px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
         Nous avons le plaisir de vous informer que votre demande d'inscription sur
-        <strong style="color:#8b5cf6;">MedicalVision</strong> a été <strong style="color:#10b981;">approuvée</strong>
+        <strong style="color:#8b5cf6;">MedIQ</strong> a été <strong style="color:#10b981;">approuvée</strong>
         par notre équipe d'administration.
       </p>
       <p style="margin:0 0 32px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
@@ -148,7 +148,7 @@ def _approval_html(full_name: str) -> str:
       </div>
 
       <p style="margin:28px 0 0;color:rgba(255,255,255,0.4);font-size:12px;text-align:center;">
-        Bienvenue dans la communauté MedicalVision 🎉
+        Bienvenue dans la communauté MedIQ 🎉
       </p>
     """
     return _base_template(content)
@@ -198,7 +198,7 @@ def _rejection_html(full_name: str, reason: str | None) -> str:
       </p>
       <p style="margin:0 0 16px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
         Après examen de votre demande d'accès à la plateforme
-        <strong style="color:#8b5cf6;">MedicalVision</strong>, nous sommes dans
+        <strong style="color:#8b5cf6;">MedIQ</strong>, nous sommes dans
         l'obligation de vous informer que celle-ci n'a pas pu être validée à ce stade.
       </p>
       <p style="margin:0 0 28px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
@@ -218,7 +218,7 @@ def _rejection_html(full_name: str, reason: str | None) -> str:
       </div>
 
       <p style="margin:0;color:rgba(255,255,255,0.45);font-size:13px;text-align:center;line-height:1.7;">
-        Nous vous remercions de l'intérêt que vous portez à MedicalVision<br/>
+        Nous vous remercions de l'intérêt que vous portez à MedIQ<br/>
         et vous souhaitons bonne continuation.
       </p>
     """
@@ -257,12 +257,12 @@ def _send_email(to_email: str, subject: str, html_body: str) -> None:
 # ──────────────────────────────────────────────
 
 def send_approval_email(to_email: str, full_name: str) -> None:
-    subject = "✅ Votre compte MedicalVision a été approuvé"
+    subject = "✅ Votre compte MedIQ a été approuvé"
     html = _approval_html(full_name)
     _send_email(to_email, subject, html)
 
 
 def send_rejection_email(to_email: str, full_name: str, reason: str | None = None) -> None:
-    subject = "ℹ️ Décision concernant votre demande MedicalVision"
+    subject = "ℹ️ Décision concernant votre demande MedIQ"
     html = _rejection_html(full_name, reason)
     _send_email(to_email, subject, html)

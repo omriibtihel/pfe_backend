@@ -1,4 +1,4 @@
-# Architecture — MedicalVision Backend
+# Architecture — MedIQ Backend
 
 ## Vue d'ensemble
 

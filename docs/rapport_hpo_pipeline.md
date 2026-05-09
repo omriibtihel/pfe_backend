@@ -1,5 +1,5 @@
 # Rapport : Pipeline d'Optimisation des Hyperparamètres (HPO)
-## MedicalVision Backend — Analyse Technique Détaillée
+## MedIQ Backend — Analyse Technique Détaillée
 **Date** : 2026-04-01
 
 ---
@@ -22,7 +22,7 @@
 
 ## 1. Vue d'ensemble
 
-Le pipeline HPO de MedicalVision est un système **adaptatif multi-couche** qui :
+Le pipeline HPO de MedIQ est un système **adaptatif multi-couche** qui :
 
 - Supporte 4 modes de recherche : `none`, `grid`, `random`, `halving_random`
 - Adapte automatiquement les grilles et budgets à la taille du dataset (6 catégories : micro/tiny/small/medium/large)

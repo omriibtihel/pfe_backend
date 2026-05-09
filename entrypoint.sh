@@ -54,15 +54,15 @@ conn = psycopg2.connect(
     dbname=p.path.lstrip("/"),
 )
 cur = conn.cursor()
-cur.execute("SELECT 1 FROM users WHERE email = 'admin@medicalvision.com'")
+cur.execute("SELECT 1 FROM users WHERE email = 'admin@mediq.com'")
 if cur.fetchone() is None:
     pwd = CryptContext(schemes=["bcrypt"]).hash("Admin@1234")
     cur.execute(
         "INSERT INTO users (full_name, email, password_hash, role, status) VALUES (%s,%s,%s,%s,%s)",
-        ("Admin", "admin@medicalvision.com", pwd, "ADMIN", "APPROVED"),
+        ("Admin", "admin@mediq.com", pwd, "ADMIN", "APPROVED"),
     )
     conn.commit()
-    print("Admin created: admin@medicalvision.com / Admin@1234")
+    print("Admin created: admin@mediq.com / Admin@1234")
 else:
     print("Admin already exists, skipping.")
 conn.close()
