@@ -463,6 +463,32 @@ def normalize_model_hyperparams(
         effective[field] = normalized_scalar
         estimator_params[field] = normalized_scalar
 
+    # Fill param_grid from schema.grid_values for any HP the user didn't override.
+    if use_grid_search:
+        normalized_task = str(task_type or "").strip().lower()
+        for field, field_schema in schema.items():
+            if field in source or field in param_grid:
+                continue
+            grid_values = field_schema.get("grid_values")
+            if not isinstance(grid_values, list) or not grid_values:
+                continue
+            supported_in = field_schema.get("supported_in")
+            if (
+                isinstance(supported_in, list)
+                and supported_in
+                and normalized_task
+                and normalized_task not in supported_in
+            ):
+                continue
+            normalized_values: list[Any] = []
+            for item in grid_values:
+                normalized_value, _value_error = _coerce_scalar_with_schema(field, item, field_schema)
+                if _value_error is None:
+                    normalized_values.append(normalized_value)
+            if normalized_values:
+                param_grid[field] = normalized_values
+                effective[field] = normalized_values
+
     if model_name == "svm" and _is_linear_kernel(effective.get("kernel")) and "gamma" in schema:
         gamma_was_requested = "gamma" in source
         if gamma_was_requested or "gamma" in param_grid or "gamma" in param_distributions:
@@ -517,3 +543,21 @@ def normalize_model_hyperparams(
         "warnings": warnings,
         "errors": errors,
     }
+
+
+def inject_class_weight_for_imbalance(
+    param_grid: dict[str, list[Any]],
+    model_key: str,
+    task_type: str,
+    imbalanced: bool,
+) -> dict[str, list[Any]]:
+    """Let GridSearchCV try class_weight='balanced' on imbalanced classification."""
+    if not imbalanced or str(task_type or "").strip().lower() != "classification":
+        return param_grid
+    model_name = MODEL_REGISTRY.normalize_name(str(model_key or "").strip().lower())
+    if "class_weight" not in MODEL_HP_SCHEMA.get(model_name, {}):
+        return param_grid
+    if "class_weight" in param_grid:
+        return param_grid
+    param_grid["class_weight"] = [None, "balanced"]
+    return param_grid

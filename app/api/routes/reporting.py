@@ -1,7 +1,8 @@
 """Reporting API — generates a patient-readable report from one prediction."""
 from __future__ import annotations
 
-from typing import Literal
+import logging
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -15,9 +16,52 @@ from app.services.reporting import ReportContextBuilder, ReportService
 from app.services.reporting.cache import compute_request_hash, report_cache
 from app.services.reporting.feature_glossary import feature_glossary
 from app.services.reporting.model_context import build_reporting_model_context
-from app.services.reporting.service import build_default_router, stream_existing_report
+from app.services.reporting.service import (
+    REPORT_SCHEMA_VERSION,
+    build_default_router,
+    stream_existing_report,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _compute_cf_for_report(
+    trained_model: TrainedModel,
+    input_data: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Best-effort DiCE call for report enrichment.
+
+    Returns ``[]`` on any failure (DiCE not converging, missing background,
+    regression task, etc.) so the caller can pass an empty list to the prompt
+    and the LLM yields an empty ``what_to_change`` section. Never raises.
+    """
+    task_type = str(trained_model.task_type or "classification").lower()
+    if task_type != "classification":
+        return []
+    artifacts = trained_model.artifacts_json if isinstance(trained_model.artifacts_json, dict) else {}
+    schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
+    feature_names = schema.get("feature_names") or []
+    # Only vary numeric features by default — categorical CF reads poorly in
+    # patient narratives ("change sex from male to female") and DiCE handles
+    # them less reliably. A future iteration can lift this restriction.
+    numeric_features = (schema.get("numeric_features") or [])
+    features_to_vary = [f for f in numeric_features if f in feature_names] or feature_names
+    if not features_to_vary:
+        return []
+    try:
+        from app.services.training.output.predictor import compute_counterfactual_for_row
+        result = compute_counterfactual_for_row(
+            trained_model,
+            input_data,
+            features_to_vary,
+            n_counterfactuals=1,
+        )
+    except Exception as exc:
+        logger.info("reporting.cf_skipped: %s", exc)
+        return []
+    items = result.get("counterfactual") if isinstance(result, dict) else None
+    return items if isinstance(items, list) else []
 
 
 def _resolve_model(db: Session, project: Project, model_id: int) -> TrainedModel:
@@ -78,13 +122,20 @@ def generate_report_stream(
         cached = report_cache.get(
             db, model_id=m.id, lang=lang, request_hash=request_hash,
         )
-        # Reject cached entries that predate chart_data support — they lack the
-        # chart_data section and would render broken gauges in the frontend.
+        # Only honour caches whose schema_version matches the current code.
+        # Bumps in REPORT_SCHEMA_VERSION (regression handling, new sections,
+        # post-process changes) silently invalidate stale rows without an
+        # operator action — regeneration replaces them in place.
         cached_content = cached.content_json if cached is not None else None
+        cached_schema = (
+            cached_content.get("schema_version")
+            if isinstance(cached_content, dict)
+            else None
+        )
         if (
             cached is not None
             and isinstance(cached_content, dict)
-            and "chart_data" in cached_content
+            and cached_schema == REPORT_SCHEMA_VERSION
         ):
             cached_meta = dict(cached.generation_event or {})
             cached_meta["cached"] = True
@@ -101,6 +152,10 @@ def generate_report_stream(
         lang=lang,
         glossary=feature_glossary,
     )
+    # Best-effort DiCE — feeds the "what_to_change" section. Empty list when
+    # CF can't be computed (regression, no flip found, missing background).
+    cf_items = _compute_cf_for_report(m, payload.input_data)
+
     builder = ReportContextBuilder()
     context = builder.build(
         prediction_id=f"p{project.id}-m{m.id}-r{payload.row_index}",
@@ -118,6 +173,7 @@ def generate_report_stream(
         task_type=str(m.task_type or "classification"),
         glossary=feature_glossary,
         threshold_value=model_context.threshold_value,
+        counterfactual_items=cf_items,
     )
 
     service = ReportService(router=build_default_router())

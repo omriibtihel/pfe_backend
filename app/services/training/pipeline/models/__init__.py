@@ -19,8 +19,7 @@ from app.services.training.pipeline.models.registry import (
     MODEL_REGISTRY,
     ModelRegistry,
     ModelSpec,
-    # Adaptive grids
-    get_adaptive_model_grid,
+    # Search budgets (RandomSearch / HalvingRandomSearch)
     get_adaptive_n_iter,
     get_halving_n_candidates,
     # Public helpers
@@ -101,7 +100,6 @@ __all__ = [
     "MODEL_REGISTRY",
     "ModelRegistry",
     "ModelSpec",
-    "get_adaptive_model_grid",
     "get_adaptive_n_iter",
     "get_halving_n_candidates",
     "build_model",

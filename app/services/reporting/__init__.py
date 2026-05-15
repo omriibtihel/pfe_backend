@@ -11,6 +11,7 @@ Public entry points:
 from __future__ import annotations
 
 from app.services.reporting.context_builder import (
+    CounterfactualChange,
     FeatureContribution,
     ModelQualitySignal,
     PredictionClassContext,
@@ -20,6 +21,7 @@ from app.services.reporting.context_builder import (
 from app.services.reporting.service import ReportService
 
 __all__ = [
+    "CounterfactualChange",
     "FeatureContribution",
     "ModelQualitySignal",
     "PredictionClassContext",

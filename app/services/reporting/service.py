@@ -22,13 +22,21 @@ import time
 import uuid
 from typing import AsyncGenerator
 
-from app.services.reporting.context_builder import ReportContext
+from app.services.reporting.context_builder import ReportContext, localize_direction
 from app.services.reporting.llm_client import LLMClient, LLMReport, TemplateClient
 from app.services.reporting.llm_client.router import LLMRouter
 from app.services.reporting.observability import event_from_meta, log_event
 from app.services.reporting.validator import ReportValidator
 
 logger = logging.getLogger(__name__)
+
+
+# Bump whenever the post-processed report shape changes (new fields, new
+# section semantics, new task-type handling). The cache layer only accepts
+# entries whose stored ``schema_version`` matches this constant — older
+# reports fall through to regeneration. Bumping is safer than purging the
+# whole table because in-flight regeneration replaces stale rows in place.
+REPORT_SCHEMA_VERSION = 2
 
 
 _DISCLAIMER_TEXT = {
@@ -57,6 +65,7 @@ _SECTION_ORDER: tuple[str, ...] = (
     "context",
     "limitations",
     "next_steps",
+    "what_to_change",
     "disclaimer",
 )
 
@@ -170,6 +179,7 @@ class ReportService:
           always render the panel.
         """
         out = dict(report) if isinstance(report, dict) else {}
+        out["schema_version"] = REPORT_SCHEMA_VERSION
         out["disclaimer"] = _DISCLAIMER_TEXT.get(context.lang, _DISCLAIMER_TEXT["fr"])
         out["risk_level"] = _compute_risk_level(context)
         out["chart_data"] = _build_chart_data(context)
@@ -187,7 +197,9 @@ class ReportService:
         out.setdefault("context", "")
         out.setdefault("limitations", "")
         out.setdefault("next_steps", "")
+        out.setdefault("what_to_change", [])
         out["key_factors"] = self._repair_key_factors(out.get("key_factors"), context)
+        out["what_to_change"] = _sanitize_what_to_change(out.get("what_to_change"), context)
 
         return out
 
@@ -215,7 +227,12 @@ class ReportService:
                     item["value"] = feat.value
                 if item.get("normal_range") in (None, "", "—", "-"):
                     item["normal_range"] = feat.normal_range
-                item.setdefault("direction", feat.direction)
+                # Always override the LLM's direction wording with the
+                # canonical semantic label. The LLM is allowed to write
+                # "augmente" / "diminue" in prose, but the structured
+                # ``direction`` field that drives the frontend badge must be
+                # the deterministic Préoccupant / Rassurant token.
+                item["direction"] = localize_direction(feat.direction, context.lang)
                 item.setdefault("explanation", "")
                 # Status is always overridden server-side (derived from glossary normal_range).
                 item["status"] = _status_from_position(feat.position_vs_normal)
@@ -235,21 +252,35 @@ def _build_chart_data(context: ReportContext) -> dict:
 
     The frontend renders this as inline SVG (no library). No LLM involvement —
     all values come directly from the already-validated ReportContext.
+
+    For regression, ``score_pct`` and ``threshold_pct`` are nullified so the
+    frontend gauge logic can branch on ``is_classification`` and render a
+    dedicated regression layout (predicted-value badge instead of a 0–100
+    bar). The factors list is shared between both task types — bar lengths
+    still encode |weight| in either case.
     """
-    score_pct = (
-        round(float(context.score) * 100)
-        if context.score is not None
-        else None
-    )
-    threshold_pct = (
-        round(float(context.threshold_value) * 100)
-        if context.threshold_value is not None
-        else 50
-    )
+    is_classification = context.task_type == "classification"
+    if is_classification:
+        score_pct = (
+            round(float(context.score) * 100)
+            if context.score is not None
+            else None
+        )
+        threshold_pct = (
+            round(float(context.threshold_value) * 100)
+            if context.threshold_value is not None
+            else 50
+        )
+    else:
+        # Regression: a percentage gauge would be misleading. The frontend
+        # falls back to showing the textual prediction badge alone.
+        score_pct = None
+        threshold_pct = None
+
     return {
         "score_pct": score_pct,
         "threshold_pct": threshold_pct,
-        "is_classification": context.task_type == "classification",
+        "is_classification": is_classification,
         "factors": [
             {
                 "label": feat.label,
@@ -265,12 +296,26 @@ def _build_chart_data(context: ReportContext) -> dict:
 
 
 def _compute_risk_level(context: ReportContext) -> str:
-    """Deterministic risk level from confidence + prediction direction.
+    """Deterministic risk-level token consumed by the frontend badge.
 
-    For classification only. Maps (is_positive_prediction, confidence) to a
-    3-level scale: "low", "medium", "high". The frontend uses this to drive
-    a color-coded badge — never the LLM, which could hallucinate it.
+    Classification: 3-level scale derived from (is_positive_prediction,
+    confidence) — "high" for confident positives, "low" for confident
+    negatives, "medium" otherwise.
+
+    Regression: there is no positive/negative axis, so "risk" maps to the
+    *reliability* of the estimate rather than a clinical risk level. The
+    frontend re-uses the same badge component but with neutral colours.
+    Returns "estimate_reliable" / "estimate_moderate" / "estimate_uncertain"
+    so the frontend can pick a tailored colour and label without having
+    to re-derive the bucket.
     """
+    if context.task_type == "regression":
+        if context.confidence_text in ("élevée", "high"):
+            return "estimate_reliable"
+        if context.confidence_text in ("modérée", "moderate"):
+            return "estimate_moderate"
+        return "estimate_uncertain"
+
     if context.task_type != "classification":
         return "unknown"
 
@@ -350,6 +395,119 @@ def build_default_router() -> LLMRouter:
             pass
 
     return LLMRouter(chain)  # TemplateClient appended internally
+
+
+_AWAY_PHRASES_FR = (
+    "éloignerait",
+    "éloigner",
+    "aggraverait",
+    "aggraver",
+    "augmenterait le risque",
+    "rendrait le profil plus préoccupant",
+    "plus préoccupant",
+)
+_AWAY_PHRASES_EN = (
+    "move further",
+    "further from",
+    "would worsen",
+    "increase the risk",
+    "make the profile more concerning",
+    "more concerning",
+)
+
+
+def _is_anti_recommendation(why_it_matters: str, lang: str) -> bool:
+    """True when the LLM prose admits the change moves AWAY from reassurance.
+
+    A counterfactual that worsens the prediction has no place in a
+    "what to change" section; surfacing it confuses the patient and
+    contradicts the very purpose of the section. The CF generator can
+    produce such rows on noisy model surfaces (constant-σ pushes when
+    no SHAP background is available), so we filter them server-side
+    rather than rely on the LLM to suppress them.
+    """
+    if not why_it_matters:
+        return False
+    text = why_it_matters.lower()
+    phrases = _AWAY_PHRASES_FR if lang == "fr" else _AWAY_PHRASES_EN
+    return any(p in text for p in phrases)
+
+
+def _is_negligible_change(cf: object) -> bool:
+    """Drop changes whose magnitude is too small to be clinically meaningful.
+
+    A delta below 2 % of the original value AND below 1 unit in absolute
+    terms is treated as noise from the CF search rather than a real
+    suggestion. This guards against the constant ±0.9 artefact seen when
+    the background distribution is unavailable.
+    """
+    try:
+        import re as _re
+        match_orig = _re.search(r"-?\d+(?:\.\d+)?", str(getattr(cf, "current_value", "")))
+        match_delta = _re.search(r"-?\d+(?:\.\d+)?", str(getattr(cf, "magnitude_text", "")))
+        if not match_orig or not match_delta:
+            return False
+        orig = abs(float(match_orig.group()))
+        delta = abs(float(match_delta.group()))
+    except (TypeError, ValueError):
+        return False
+    if delta < 1.0 and (orig == 0 or delta / orig < 0.02):
+        return True
+    return False
+
+
+def _sanitize_what_to_change(raw: object, context: ReportContext) -> list[dict]:
+    """Keep only entries that are coherent and clinically meaningful.
+
+    The LLM may invent extra rows (hallucinated targets) or drop entries it
+    found awkward to phrase. We anchor on the server-built list: every CF
+    suggestion gets at least the structured fields; LLM prose fills the
+    free-text ones. Two filters then run:
+
+    - **Anti-recommendation filter**: rows whose prose admits the change
+      worsens the result are removed. These contradict the section's
+      purpose and arise when the CF search ran without a usable background
+      distribution.
+    - **Negligible-delta filter**: rows whose magnitude is clinically
+      trivial (< 2 % relative AND < 1 unit absolute) are removed. They
+      are usually a side-effect of constant-σ pushing.
+
+    Empty list when no CF was computed (regression, or DiCE failed to
+    converge) or after filtering wipes everything.
+    """
+    if not context.counterfactual_changes:
+        return []
+    by_label = {c.label: c for c in context.counterfactual_changes}
+    raw_items = raw if isinstance(raw, list) else []
+    by_factor: dict[str, dict] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        factor = str(item.get("factor", "")).strip()
+        if factor in by_label:
+            by_factor[factor] = item
+
+    out: list[dict] = []
+    for cf in context.counterfactual_changes:
+        if _is_negligible_change(cf):
+            continue
+        llm = by_factor.get(cf.label, {})
+        why = str(llm.get("why_it_matters", "")).strip()
+        if _is_anti_recommendation(why, context.lang):
+            continue
+        out.append(
+            {
+                "factor": cf.label,
+                "current": cf.current_value,
+                "target": cf.suggested_value,
+                "direction": localize_direction(cf.direction, context.lang),
+                "magnitude_text": cf.magnitude_text,
+                "normal_range": cf.normal_range,
+                "change_text": str(llm.get("change_text", "")).strip(),
+                "why_it_matters": why,
+            }
+        )
+    return out
 
 
 __all__ = ["ReportService", "build_default_router", "stream_existing_report"]

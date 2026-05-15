@@ -18,6 +18,7 @@ from .classification import (
 )
 from .curves import (
     compute_calibration_curve,
+    compute_multiclass_ovr_curves,
     compute_roc_pr_curves,
 )
 from .regression import (
@@ -37,6 +38,7 @@ __all__ = [
     "compute_classification_metrics",
     # curves
     "compute_calibration_curve",
+    "compute_multiclass_ovr_curves",
     "compute_roc_pr_curves",
     # regression
     "regression_metrics",

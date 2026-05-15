@@ -278,6 +278,8 @@ class CurvesResponse(BaseModel):
     roc: Optional[List[Any]] = None
     pr: Optional[List[Any]] = None
     calibration: Optional[Dict[str, Any]] = None
+    multiclassRoc: Optional[Dict[str, Any]] = None
+    multiclassPr: Optional[Dict[str, Any]] = None
     learningCurves: Optional[Dict[str, Any]] = None
     artifactWarnings: List[Dict[str, Any]] = Field(default_factory=list)
 

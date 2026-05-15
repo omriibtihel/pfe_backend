@@ -23,7 +23,8 @@ from app.services.preparation_ml.balancing import (
     resolve,
 )
 from app.services.training.config.schema import (
-    TrainingConfig, PreprocessingConfig, PreprocessingDefaults, normalize_model_hyperparams,
+    TrainingConfig, PreprocessingConfig, PreprocessingDefaults,
+    inject_class_weight_for_imbalance, normalize_model_hyperparams,
 )
 from app.services.training.pipeline.confidence import compute_bootstrap_cis
 from app.services.training.pipeline.evaluator import Evaluator
@@ -715,6 +716,13 @@ def _run_holdout(
         and profile.imbalance_ratio > 3.0
         and not _active_balancing
     )
+    if bool(cfg.use_grid_search):
+        param_grid = inject_class_weight_for_imbalance(
+            param_grid,
+            model_key=model_type_norm,
+            task_type=cfg.task_type,
+            imbalanced=_is_imbalanced,
+        )
     trainer = Trainer()
     fit_result = trainer.fit(
         pipeline=Pipeline(steps=[("model", model)]),

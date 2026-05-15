@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import FitFailedWarning
 from sklearn.model_selection import GridSearchCV as _GridSearchCV
 from sklearn.pipeline import Pipeline
 from sqlalchemy.orm import Session
@@ -37,7 +39,11 @@ from app.services.preparation_ml.splitters import (
     iter_loo_splits,
     iter_repeated_kfold_splits,
 )
-from app.services.training.config.schema import TrainingConfig, normalize_model_hyperparams
+from app.services.training.config.schema import (
+    TrainingConfig,
+    inject_class_weight_for_imbalance,
+    normalize_model_hyperparams,
+)
 from app.services.training.output.audit import build_and_persist_audit
 from app.services.training.output.reporter import Reporter, build_training_schema
 from app.services.training.pipeline.confidence import compute_bootstrap_cis
@@ -510,15 +516,18 @@ def _run_kfold_cv(
                 )
                 _inner_model = build_model(model_type_norm, cfg.task_type, fold_hp)
                 _inner_pipe = Pipeline(steps=[("model", _inner_model)])
+                _inner_param_grid = {f"model__{k}": v for k, v in nested_param_grid.items()}
                 _inner_gs = _GridSearchCV(
-                    _inner_pipe, nested_param_grid,
+                    _inner_pipe, _inner_param_grid,
                     cv=_inner_cv_splitter, scoring=inner_scoring,
-                    refit=True, n_jobs=-1, error_score="raise",
+                    refit=True, n_jobs=-1, error_score=np.nan,
                 )
-                if sw is not None:
-                    _inner_gs.fit(X_f, y_f, model__sample_weight=np.asarray(sw))
-                else:
-                    _inner_gs.fit(X_f, y_f)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FitFailedWarning)
+                    if sw is not None:
+                        _inner_gs.fit(X_f, y_f, model__sample_weight=np.asarray(sw))
+                    else:
+                        _inner_gs.fit(X_f, y_f)
                 fold_pipeline = _inner_gs.best_estimator_
                 fold_best_inner_params = {
                     k.replace("model__", "", 1): v
@@ -830,6 +839,13 @@ def _run_kfold_cv(
         and final_profile.imbalance_ratio > 3.0
         and not _final_active_balancing
     )
+    if bool(cfg.use_grid_search):
+        final_param_grid = inject_class_weight_for_imbalance(
+            final_param_grid,
+            model_key=model_type_norm,
+            task_type=cfg.task_type,
+            imbalanced=_final_is_imbalanced,
+        )
     final_model_raw = build_model(model_type_norm, cfg.task_type, final_estimator_hp)
     final_trainer = Trainer()
     sw_final = final_fit_params.get("sample_weight")

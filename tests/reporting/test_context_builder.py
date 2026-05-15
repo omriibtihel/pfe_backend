@@ -11,9 +11,14 @@ from __future__ import annotations
 import pytest
 
 from app.services.reporting.context_builder import (
+    PredictionClassContext,
     ReportContextBuilder,
     bucket_confidence,
+    get_display_label,
+    is_raw_column_name,
+    localize_direction,
     sanitize_for_prompt,
+    sanitize_label,
 )
 
 
@@ -112,7 +117,9 @@ def test_builder_handles_missing_lime():
         model_version="1",
     )
     assert ctx.top_features == []
-    assert ctx.label == "Diabète"
+    # Post-correction: ``sanitize_label`` lowercases unknown labels to defuse
+    # SCREAMING raw class names. The original case is no longer preserved.
+    assert ctx.label == "diabète"
     assert ctx.confidence_text == "élevée"
     assert ctx.score_pct == "90 %"
 
@@ -162,7 +169,7 @@ def test_builder_uses_glossary_label_and_unit():
     assert feat.normal_range == "70–100 mg/dL"
 
 
-def test_builder_falls_back_to_raw_name_when_glossary_missing():
+def test_builder_humanizes_label_when_glossary_missing():
     b = ReportContextBuilder()
     lime = [{"feature": "weird_col", "contribution": 0.3, "data": 5}]
     ctx = b.build(
@@ -173,10 +180,57 @@ def test_builder_falls_back_to_raw_name_when_glossary_missing():
         lime_items=lime,
         model_name="rf",
         model_version="1",
-        glossary={},  # empty
+        glossary={},  # empty — exercise the humanization fallback
     )
-    assert ctx.top_features[0].label == "weird_col"
+    # Underscores converted to spaces and first letter capitalised so the
+    # patient-facing report no longer shows raw column names.
+    assert ctx.top_features[0].label == "Weird col"
     assert ctx.top_features[0].normal_range is None
+
+
+def test_builder_replaces_opaque_names_with_positional_fallback():
+    """Post-correction contract: raw column names like ``f_0`` never reach the
+    patient. They are replaced by a positional placeholder (``Indicator N`` /
+    ``Indicateur N``) at build time so both the LLM payload and the
+    frontend renderer see a readable label.
+    """
+    b = ReportContextBuilder()
+    lime = [{"feature": "f_0", "contribution": 0.4, "data": 1.2}]
+    ctx = b.build(
+        prediction_id="p1",
+        lang="en",
+        prediction_value="X",
+        score=0.8,
+        lime_items=lime,
+        model_name="rf",
+        model_version="1",
+        glossary={},
+    )
+    assert ctx.top_features[0].label == "Indicator 1"
+    # The raw column name is preserved on ``raw_name`` so downstream lookups
+    # still work — only the patient-facing label is rewritten.
+    assert ctx.top_features[0].raw_name == "f_0"
+
+
+def test_builder_uses_synthetic_observed_range_when_glossary_missing():
+    b = ReportContextBuilder()
+    lime = [{"feature": "custom_marker", "contribution": 0.5, "data": 4.2}]
+    ctx = b.build(
+        prediction_id="p1",
+        lang="fr",
+        prediction_value="X",
+        score=0.8,
+        lime_items=lime,
+        model_name="rf",
+        model_version="1",
+        glossary={},
+        feature_metadata={"custom_marker": {"min_raw": "1.0", "max_raw": "9.5"}},
+    )
+    feat = ctx.top_features[0]
+    assert feat.label == "Custom marker"
+    # Observed range, NOT clinical normal — the prefix makes the distinction
+    # explicit so the LLM cannot misread it as a medical norm.
+    assert feat.normal_range == "plage observée : 1.0–9.5"
 
 
 def test_builder_sanitizes_feature_names():
@@ -396,3 +450,148 @@ def test_builder_lime_transformed_feature_uses_original_input_value_and_label():
     assert feat.normal_range == "70–100 mg/dL"
     assert feat.position_vs_normal == "above"
     assert feat.training_reference == "moyenne entrainement: 121.59 mg/dL"
+
+
+# ── Correction 1 — CF target stays absolute even when only delta is given ─────
+
+
+def test_counterfactual_target_is_absolute_when_only_delta_given():
+    """Regression: ensure ``suggested_value`` is the ABSOLUTE target, not a delta.
+
+    Upstream is supposed to provide both ``suggested_value`` and ``delta``.
+    When only the delta is forwarded (legacy / partial integration), the
+    builder must derive the target as ``orig - |delta|``, NEVER store the
+    delta as the suggested value.
+    """
+    b = ReportContextBuilder()
+    glossary = {
+        "Glucose": {
+            "label_fr": "Glycémie",
+            "unit": "mg/dL",
+            "normal_range": [70, 100],
+        }
+    }
+    ctx = b.build(
+        prediction_id="p1",
+        lang="fr",
+        prediction_value="X",
+        score=0.9,
+        lime_items=[],
+        input_data={"Glucose": 148},
+        model_name="rf",
+        model_version="1",
+        glossary=glossary,
+        counterfactual_items=[
+            # No suggested_value: only the delta is available.
+            {"feature": "Glucose", "original_value": 148.0, "delta": 14.30},
+        ],
+    )
+    assert len(ctx.counterfactual_changes) == 1
+    cf = ctx.counterfactual_changes[0]
+    # 148 - |14.30| = 133.70 — the absolute target, not 14.30.
+    assert cf.suggested_value == "133.70 mg/dL"
+    assert cf.current_value == "148 mg/dL"
+    assert "14" in cf.magnitude_text  # magnitude carries the delta, not the target
+
+
+# ── Correction 2 — direction is localised at the serialization boundary ───────
+
+
+def test_localize_direction_translates_fr():
+    assert localize_direction("increase", "fr") == "Préoccupant"
+    assert localize_direction("decrease", "fr") == "Rassurant"
+
+
+def test_localize_direction_translates_en():
+    assert localize_direction("increase", "en") == "Concerning"
+    assert localize_direction("decrease", "en") == "Reassuring"
+
+
+def test_localize_direction_passthrough_on_unknown_pair():
+    assert localize_direction("increase", "de") == "increase"
+    assert localize_direction("sideways", "fr") == "sideways"
+
+
+# ── Correction urgente — sensitive raw labels never reach the patient ─────────
+
+
+def test_sanitize_label_deces_fr():
+    assert sanitize_label("DECES", "fr") == "résultat préoccupant"
+
+
+def test_sanitize_label_death_en():
+    assert sanitize_label("DEATH", "en") == "concerning result"
+
+
+def test_sanitize_label_cancer_en():
+    """Lang-aware lookup: same raw token, different language → translated."""
+    assert sanitize_label("CANCER", "en") == "concerning result"
+    assert sanitize_label("CANCER", "fr") == "résultat préoccupant"
+
+
+def test_sanitize_label_negatif_fr():
+    assert sanitize_label("NEGATIF", "fr") == "résultat rassurant"
+    assert sanitize_label("NEGATIF", "en") == "reassuring result"
+
+
+def test_sanitize_label_numeric_fallback_lang_aware():
+    # "1" and "0" are in the static map → semantic substitution
+    assert sanitize_label("1", "fr") == "résultat préoccupant"
+    assert sanitize_label("0", "fr") == "résultat rassurant"
+    # An unseen short digit-only token → generic doctor-discussion fallback.
+    assert sanitize_label("42", "fr") == "résultat à analyser avec votre médecin"
+    assert sanitize_label("42", "en") == "result to discuss with your doctor"
+
+
+def test_sanitize_label_passthrough_lowercases_unknown():
+    # An arbitrary string is at least lowercased — no SHOUTING leaks.
+    assert sanitize_label("SOME_CONDITION", "fr") == "some_condition"
+
+
+def test_builder_sanitises_class_context_and_prediction():
+    b = ReportContextBuilder()
+    ctx = b.build(
+        prediction_id="p1",
+        lang="fr",
+        prediction_value="DECES",
+        score=0.92,
+        lime_items=[],
+        input_data={"Glucose": 148},
+        model_name="rf",
+        model_version="1",
+        class_context=PredictionClassContext(
+            raw_label="1",
+            target_name="Outcome",
+            positive_class="DECES",
+            label_meaning="DECES",
+        ),
+    )
+    assert "DECES" not in ctx.label
+    assert "DECES" not in ctx.class_context.raw_label
+    assert "DECES" not in ctx.class_context.positive_class
+    assert "DECES" not in ctx.class_context.label_meaning
+    # target_name is intentionally preserved (it is a column header, not
+    # a patient-visible verdict).
+    assert ctx.class_context.target_name == "Outcome"
+
+
+# ── Correction urgente — raw column names get a positional fallback ───────────
+
+
+def test_get_display_label_raw():
+    assert get_display_label("f_62", 0, "fr") == "Indicateur 1"
+
+
+def test_get_display_label_raw_en():
+    assert get_display_label("col_3", 2, "en") == "Indicator 3"
+
+
+def test_get_display_label_preserves_real_label():
+    assert get_display_label("Glycémie à jeun", 0, "fr") == "Glycémie à jeun"
+
+
+def test_is_raw_column_name_detects_common_patterns():
+    for raw in ("f_62", "F_0", "col_3", "feature_14", "column_99", "var_5", "x1", "X12", "v3"):
+        assert is_raw_column_name(raw), f"should detect {raw!r}"
+    for ok in ("Glucose", "BMI", "Cholestérol total", "ALT"):
+        assert not is_raw_column_name(ok), f"should NOT detect {ok!r}"

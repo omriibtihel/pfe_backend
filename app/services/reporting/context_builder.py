@@ -40,6 +40,28 @@ def _feature_lookup_name(raw_name: str) -> str:
     return _TRANSFORMER_PREFIX_RE.sub("", raw_name).strip()
 
 
+# Names like "f_0", "x12", "var3" carry no semantic signal — leave them as-is.
+_OPAQUE_NAME_RE = re.compile(r"^[a-z]_?\d+$", re.IGNORECASE)
+
+
+def _humanize_feature_name(raw_name: str) -> str:
+    """Best-effort label when the glossary has no entry.
+
+    Replaces underscores/dashes with spaces and capitalises the first letter
+    so ``blood_pressure`` becomes ``Blood pressure``. Opaque names such as
+    ``f_0`` are returned unchanged because there is nothing to recover.
+    """
+    cleaned = _feature_lookup_name(raw_name)
+    if not cleaned:
+        return raw_name
+    if _OPAQUE_NAME_RE.fullmatch(cleaned):
+        return cleaned
+    spaced = re.sub(r"[_\-]+", " ", cleaned).strip()
+    if not spaced:
+        return raw_name
+    return spaced[:1].upper() + spaced[1:]
+
+
 # ── Dataclasses (the data contract) ───────────────────────────────────────────
 
 Direction = Literal["increase", "decrease", "neutral"]
@@ -80,6 +102,23 @@ class ModelQualitySignal:
 
 
 @dataclass(frozen=True)
+class CounterfactualChange:
+    """One actionable change suggested by DiCE.
+
+    Pre-formatted for the LLM: ``current_value`` and ``suggested_value`` are
+    already strings with units. ``magnitude_text`` is a short human phrase
+    (e.g., "−24 mg/dL", "+5 kg/m²") so the LLM never sees raw floats.
+    """
+    label: str
+    current_value: str
+    suggested_value: str
+    direction: Direction
+    magnitude_text: str
+    normal_range: Optional[str] = None
+    training_reference: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ReportContext:
     prediction_id: str
     lang: Literal["fr", "en"]
@@ -93,6 +132,9 @@ class ReportContext:
     model_name: str = ""
     model_version: str = ""
     task_type: str = "classification"
+    # Suggestions DiCE déjà formatées pour le LLM. Vide = pas de CF disponible
+    # (régression, échec DiCE, ou modèle déjà du bon côté).
+    counterfactual_changes: list[CounterfactualChange] = field(default_factory=list)
     # Internal fields — never forwarded to the LLM prompt; used for server-side postprocessing.
     score: Optional[float] = None
     threshold_value: Optional[float] = None
@@ -125,6 +167,43 @@ def bucket_confidence(score: Optional[float], lang: str) -> ConfidenceText:
     return buckets[-1][1]
 
 
+def _extract_r2(model_quality: list[ModelQualitySignal]) -> Optional[float]:
+    """Pull the R² value from the model_quality list.
+
+    R² appears under a patient-friendly label (no raw key), so we match by
+    pre-formatted string ("XX.X %") and convert it back. When the label or
+    value cannot be parsed, returns None and the caller falls back to
+    "unquantified". We never fail loudly because the report must still
+    render.
+    """
+    for sig in model_quality:
+        label_lower = (sig.label or "").lower()
+        if "variation" in label_lower or "variation explained" in label_lower:
+            text = (sig.value or "").strip().rstrip("%").strip()
+            try:
+                return float(text) / 100.0
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _bucket_regression_reliability(r2: Optional[float], lang: str) -> ConfidenceText:
+    """Three-bucket reliability for regression — sourced from R², not score.
+
+    Mirrors the classification confidence buckets so the rest of the prompt
+    (and the frontend's badge / phrasing) can stay task-agnostic. The
+    thresholds are deliberately conservative: a regression model below 40 %
+    R² is rarely trustworthy enough to justify a "moderate" badge.
+    """
+    if r2 is None:
+        return "non quantifiée" if lang == "fr" else "unquantified"
+    if r2 >= 0.7:
+        return "élevée" if lang == "fr" else "high"
+    if r2 >= 0.4:
+        return "modérée" if lang == "fr" else "moderate"
+    return "faible" if lang == "fr" else "low"
+
+
 # ── Value formatting ──────────────────────────────────────────────────────────
 
 def _format_value(value: Any, unit: Optional[str] = None) -> str:
@@ -152,6 +231,121 @@ def _direction_from_weight(weight: float) -> Direction:
     if weight < -1e-6:
         return "decrease"
     return "neutral"
+
+
+# Semantic localisation for the user-visible ``direction`` field. The dataclass
+# itself keeps the Literal["increase"|"decrease"|"neutral"] contract; this map
+# is applied only at serialization boundaries (LLM prompt + post-processed
+# report sent to the frontend). The mapping is intentionally semantic
+# (Préoccupant / Rassurant) rather than verbal (augmente / diminue), so a
+# non-clinical reader can decode the badge at a glance.
+_DIRECTION_DISPLAY: dict[tuple[str, str], str] = {
+    ("fr", "increase"): "Préoccupant",
+    ("fr", "decrease"): "Rassurant",
+    ("fr", "neutral"): "Neutre",
+    ("en", "increase"): "Concerning",
+    ("en", "decrease"): "Reassuring",
+    ("en", "neutral"): "Neutral",
+}
+
+
+def localize_direction(direction: str, lang: str) -> str:
+    """Translate an internal Direction token to its patient-facing label.
+
+    Returns the input unchanged when the (lang, direction) pair is not in
+    the table — keeps the function safe even when an unexpected value
+    slips through from an upstream module.
+    """
+    return _DIRECTION_DISPLAY.get((lang, direction or ""), direction or "")
+
+
+# ── Sensitive-label sanitisation ──────────────────────────────────────────────
+# Training pipelines often pass raw class names (DECES, MALIGNE, 1) straight
+# through to the report layer. Showing these verbatim to a non-clinical reader
+# is harmful (cognitive shock) and legally fragile — we rewrite them into
+# neutral patient-facing phrasings BEFORE they reach the LLM payload or the
+# frontend renderer.
+# Each entry maps an upper-cased clinical token to the patient-safe phrasing
+# for both supported languages, so a French-locale lookup with raw label
+# "CANCER" returns French text and an English-locale lookup with the same
+# raw label returns English text.
+_SENSITIVE_LABEL_MAP: dict[str, dict[str, str]] = {
+    "DECES":     {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "DECES_1":   {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "MORT":      {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "DEATH":     {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "DECEASED":  {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "MALIGNE":   {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "MALIGNANT": {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "CANCER":    {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "POSITIF":   {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "POSITIVE":  {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "NEGATIF":   {"fr": "résultat rassurant",    "en": "reassuring result"},
+    "NEGATIVE":  {"fr": "résultat rassurant",    "en": "reassuring result"},
+    "1":         {"fr": "résultat préoccupant",  "en": "concerning result"},
+    "0":         {"fr": "résultat rassurant",    "en": "reassuring result"},
+}
+
+_FALLBACK_LABEL: dict[str, str] = {
+    "fr": "résultat à analyser avec votre médecin",
+    "en": "result to discuss with your doctor",
+}
+
+
+def sanitize_label(raw_label: str, lang: str = "fr") -> str:
+    """Replace clinical raw labels with patient-safe phrasings.
+
+    See ``_SENSITIVE_LABEL_MAP`` for the static substitutions. The lookup
+    now respects ``lang`` so a French dataset containing "CANCER" returns
+    French text and an English-locale call with the same raw label returns
+    English text. Three fallbacks apply when the upper-cased input is not
+    in the map:
+    - purely digit strings or 1–2 char tokens → generic "to discuss with
+      your doctor" phrasing (lang-aware),
+    - empty input → empty string,
+    - anything else → lower-cased pass-through (at minimum no SHOUTING).
+    """
+    if raw_label is None:
+        return ""
+    key = str(raw_label).strip().upper()
+    if not key:
+        return ""
+    lang = lang if lang in ("fr", "en") else "fr"
+    mapping = _SENSITIVE_LABEL_MAP.get(key)
+    if mapping:
+        return mapping[lang]
+    if key.isdigit() or len(key) <= 2:
+        return _FALLBACK_LABEL[lang]
+    return str(raw_label).lower()
+
+
+# ── Raw column-name fallback ──────────────────────────────────────────────────
+# When the project's glossary has no entry for a feature, the column name
+# reaches the report unchanged (e.g. "f_62", "col_3"). The LLM is instructed
+# to keep these as-is, but the result is unreadable. We detect the pattern
+# and substitute a positional placeholder before the label propagates.
+_RAW_COLUMN_RE = re.compile(
+    r"^(?:f_|col_|feature_|column_|var_|x|v)\d+$",
+    re.IGNORECASE,
+)
+
+
+def is_raw_column_name(label: str) -> bool:
+    """True when the label looks like an unconfigured technical column name."""
+    if not label:
+        return True
+    return bool(_RAW_COLUMN_RE.match(str(label).strip()))
+
+
+def get_display_label(label: str, position: int, lang: str = "fr") -> str:
+    """Return ``label`` when it carries semantic signal, else a positional fallback.
+
+    ``position`` is the 0-based index in the top-features list; the visible
+    placeholder is 1-based (``Indicateur 1`` / ``Indicator 1``).
+    """
+    if not label or is_raw_column_name(label):
+        return f"Indicateur {position + 1}" if lang == "fr" else f"Indicator {position + 1}"
+    return label
 
 
 def _position_vs_normal(value: Any, normal_range_raw: Any) -> NormalPosition:
@@ -191,6 +385,35 @@ def _resolve_glossary_entry(glossary: Any, raw_name: str) -> dict[str, Any]:
         if isinstance(entry, dict):
             return entry
     return {}
+
+
+def _synthetic_entry(
+    raw_name: str,
+    feature_metadata: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """Glossary-shaped fallback built from training column_stats.
+
+    Used only when the canonical glossary has nothing for the feature. Carries
+    a humanised label and an *observed* range derived from training min/max.
+    Critically: it does NOT populate ``normal_range`` because that field
+    encodes a clinical reference (it would mislabel values as
+    ``abnormal_high`` against an arbitrary observed bound). The observed
+    spread is exposed separately as ``observed_range_text`` so the
+    presentation layer can show it without claiming clinical normality.
+    """
+    meta = (
+        feature_metadata.get(raw_name)
+        or feature_metadata.get(_feature_lookup_name(raw_name))
+        or {}
+    )
+    label = _humanize_feature_name(raw_name)
+    out: dict[str, Any] = {"label_fr": label, "label_en": label}
+
+    min_raw = meta.get("min_raw")
+    max_raw = meta.get("max_raw")
+    if min_raw not in (None, "") and max_raw not in (None, ""):
+        out["observed_range_text"] = f"{min_raw}–{max_raw}"
+    return out
 
 
 def _value_from_input_data(
@@ -246,12 +469,39 @@ class ReportContextBuilder:
         glossary: Any = None,
         top_n: int = 5,
         threshold_value: Optional[float] = None,
+        counterfactual_items: Iterable[dict[str, Any]] | None = None,
     ) -> ReportContext:
-        label = sanitize_for_prompt(str(prediction_value), max_len=_MAX_LABEL_LEN) or "—"
-        confidence_text = bucket_confidence(score, lang)
+        # First strip prompt-injection markers, then route the clean label
+        # through ``sanitize_label`` so clinically-loaded tokens (DECES, 1,
+        # MALIGNE…) become patient-safe phrasings. The order matters: sanitize
+        # for prompt FIRST so the sensitive-map lookup operates on a clean,
+        # uppercase-canonical key without backticks or braces.
+        raw_label_clean = sanitize_for_prompt(str(prediction_value), max_len=_MAX_LABEL_LEN)
+        label = sanitize_label(raw_label_clean, lang=lang) or "—"
+        # Sanitise the class_context fields the LLM (and the frontend) will
+        # read. The dataclass is frozen, so we rebuild it with safe values.
+        cc_in = class_context or PredictionClassContext()
+        safe_class_context = PredictionClassContext(
+            raw_label=sanitize_label(cc_in.raw_label, lang=lang) if cc_in.raw_label else "",
+            target_name=cc_in.target_name,
+            positive_class=sanitize_label(cc_in.positive_class, lang=lang) if cc_in.positive_class else "",
+            label_meaning=sanitize_label(cc_in.label_meaning, lang=lang) if cc_in.label_meaning else "",
+        )
         score_pct: Optional[str] = None
         if score is not None and task_type == "classification":
             score_pct = f"{round(float(score) * 100)} %"
+
+        # Confidence sourcing differs by task:
+        # - classification: distance of probability from 0.5 (existing behaviour).
+        # - regression: there is no "probability" — derive a global reliability
+        #   bucket from R² so the report can still say "low/moderate/high"
+        #   without inventing a per-prediction certainty (which would require
+        #   a quantile model we don't have).
+        if task_type == "regression":
+            r2 = _extract_r2(model_quality or [])
+            confidence_text = _bucket_regression_reliability(r2, lang)
+        else:
+            confidence_text = bucket_confidence(score, lang)
 
         top_features = self._top_features_from_lime(
             lime_items or [],
@@ -270,6 +520,14 @@ class ReportContextBuilder:
                 top_n=top_n,
             )
 
+        cf_changes = self._counterfactual_changes(
+            counterfactual_items or [],
+            lang=lang,
+            glossary=glossary,
+            feature_metadata=feature_metadata or {},
+            input_data=input_data or {},
+        )
+
         return ReportContext(
             prediction_id=sanitize_for_prompt(prediction_id, max_len=64) or "unknown",
             lang=lang,
@@ -277,12 +535,13 @@ class ReportContextBuilder:
             confidence_text=confidence_text,
             score_pct=score_pct,
             top_features=top_features,
-            class_context=class_context or PredictionClassContext(),
+            class_context=safe_class_context,
             model_quality=model_quality or [],
             dataset_summary=dataset_summary or [],
             model_name=sanitize_for_prompt(model_name, max_len=80),
             model_version=sanitize_for_prompt(model_version, max_len=40),
             task_type=task_type,
+            counterfactual_changes=cf_changes,
             score=score,
             threshold_value=threshold_value,
         )
@@ -319,14 +578,24 @@ class ReportContextBuilder:
         ranked.sort(key=lambda item: (item[0], item[1].lower()))
 
         out: list[FeatureContribution] = []
-        for _, raw_name, raw_value, entry in ranked[: max(0, top_n)]:
+        for position, (_, raw_name, raw_value, entry) in enumerate(ranked[: max(0, top_n)]):
             label_key = "label_fr" if lang == "fr" else "label_en"
-            label = sanitize_for_prompt(str(entry.get(label_key, raw_name)), max_len=_MAX_LABEL_LEN)
+            if not entry:
+                entry = _synthetic_entry(raw_name, feature_metadata)
+            label_default = _humanize_feature_name(raw_name)
+            label = sanitize_for_prompt(str(entry.get(label_key, label_default)), max_len=_MAX_LABEL_LEN)
+            label = get_display_label(label, position, lang=lang)
             unit = entry.get("unit")
             rng = entry.get("normal_range")
             normal_range = None
             if isinstance(rng, (list, tuple)) and len(rng) == 2:
                 normal_range = f"{rng[0]}–{rng[1]}{(' ' + unit) if unit else ''}"
+            elif entry.get("observed_range_text"):
+                normal_range = (
+                    f"plage observée : {entry['observed_range_text']}"
+                    if lang == "fr"
+                    else f"observed range: {entry['observed_range_text']}"
+                )
 
             out.append(
                 FeatureContribution(
@@ -387,15 +656,28 @@ class ReportContextBuilder:
         label_key = "label_fr" if lang == "fr" else "label_en"
 
         out: list[FeatureContribution] = []
-        for raw_name, w, raw_value in normalized:
+        for position, (raw_name, w, raw_value) in enumerate(normalized):
             lookup_name = _feature_lookup_name(raw_name)
-            entry = _resolve_glossary_entry(glossary, lookup_name) or _resolve_glossary_entry(glossary, raw_name)
-            label = sanitize_for_prompt(str(entry.get(label_key, lookup_name)), max_len=_MAX_LABEL_LEN)
+            entry = (
+                _resolve_glossary_entry(glossary, lookup_name)
+                or _resolve_glossary_entry(glossary, raw_name)
+                or _synthetic_entry(raw_name, feature_metadata)
+            )
+            label_default = _humanize_feature_name(lookup_name)
+            label = sanitize_for_prompt(str(entry.get(label_key, label_default)), max_len=_MAX_LABEL_LEN)
+            label = get_display_label(label, position, lang=lang)
             unit = entry.get("unit")
             rng = entry.get("normal_range")
             normal_range = None
             if isinstance(rng, (list, tuple)) and len(rng) == 2:
                 normal_range = f"{rng[0]}–{rng[1]}{(' ' + unit) if unit else ''}"
+            elif entry.get("observed_range_text"):
+                # Synthetic fallback — explicitly tagged as observed, not normal.
+                normal_range = (
+                    f"plage observée : {entry['observed_range_text']}"
+                    if lang == "fr"
+                    else f"observed range: {entry['observed_range_text']}"
+                )
 
             effective_value = raw_value
             if effective_value in (None, "", "—", "-"):
@@ -421,6 +703,98 @@ class ReportContextBuilder:
                         or feature_metadata.get(lookup_name, {}).get("global_importance")
                     ),
                     is_fallback=False,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _counterfactual_changes(
+        cf_items: Iterable[dict[str, Any]],
+        *,
+        lang: str,
+        glossary: Any,
+        feature_metadata: dict[str, dict[str, str]],
+        input_data: dict[str, Any],
+    ) -> list[CounterfactualChange]:
+        """Format raw DiCE output into LLM-ready change suggestions.
+
+        Each DiCE item is ``{feature, original_value, suggested_value, delta}``
+        with the ColumnTransformer prefix already stripped. We:
+        - resolve a clinical label + unit from the glossary,
+        - format both values with the unit (so the LLM never sees raw floats),
+        - emit a short ``magnitude_text`` (e.g. ``"−24 mg/dL"``) so the prompt
+          can quote the change without arithmetic,
+        - cap to 5 changes (DiCE may return many; the report stays focused).
+        """
+        items = [it for it in cf_items if isinstance(it, dict)]
+        if not items:
+            return []
+
+        label_key = "label_fr" if lang == "fr" else "label_en"
+        out: list[CounterfactualChange] = []
+        for it in items[:5]:
+            raw_name = sanitize_for_prompt(str(it.get("feature", "")), max_len=_MAX_LABEL_LEN)
+            if not raw_name:
+                continue
+            # Invariant: ``sugg`` must always be the ABSOLUTE target value,
+            # never the delta. Upstream DiCE provides both ``suggested_value``
+            # (absolute) and ``delta`` (signed); when only the delta is
+            # available we derive the target as ``orig - |delta|`` per the
+            # patient-facing contract (CF suggestions for risk factors
+            # reduce the original value).
+            try:
+                orig = float(it.get("original_value"))
+            except (TypeError, ValueError):
+                continue
+            sugg_raw = it.get("suggested_value")
+            delta_raw = it.get("delta")
+            try:
+                if sugg_raw is not None:
+                    sugg = float(sugg_raw)
+                    delta = (
+                        float(delta_raw) if delta_raw is not None else (sugg - orig)
+                    )
+                elif delta_raw is not None:
+                    delta = float(delta_raw)
+                    sugg = round(orig - abs(delta), 2)
+                else:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if abs(delta) < 1e-9:
+                continue
+
+            entry = (
+                _resolve_glossary_entry(glossary, raw_name)
+                or _resolve_glossary_entry(glossary, _feature_lookup_name(raw_name))
+                or _synthetic_entry(raw_name, feature_metadata)
+            )
+            label_default = _humanize_feature_name(raw_name)
+            label = sanitize_for_prompt(str(entry.get(label_key, label_default)), max_len=_MAX_LABEL_LEN)
+            unit = entry.get("unit")
+            rng = entry.get("normal_range")
+            normal_range = None
+            if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                normal_range = f"{rng[0]}–{rng[1]}{(' ' + unit) if unit else ''}"
+
+            current_value = _format_value(orig, unit=unit)
+            suggested_value = _format_value(sugg, unit=unit)
+            sign = "+" if delta > 0 else "−"
+            magnitude_text = f"{sign}{_format_value(abs(delta), unit=unit)}"
+            direction: Direction = "increase" if delta > 0 else "decrease"
+
+            out.append(
+                CounterfactualChange(
+                    label=label,
+                    current_value=current_value,
+                    suggested_value=suggested_value,
+                    direction=direction,
+                    magnitude_text=magnitude_text,
+                    normal_range=normal_range,
+                    training_reference=(
+                        feature_metadata.get(raw_name, {}).get("training_reference")
+                        or feature_metadata.get(_feature_lookup_name(raw_name), {}).get("training_reference")
+                    ),
                 )
             )
         return out

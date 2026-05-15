@@ -140,6 +140,18 @@ def _normalize_input_dtypes(df: pd.DataFrame, pipeline: Any) -> pd.DataFrame:
     categorical_cols_added: list[str] = []
 
     for col in obj_cols:
+        # Normalize whitespace-only / empty strings to NaN so they don't masquerade
+        # as real categorical values. Without this, a CSV cell containing " " (space)
+        # is counted as non-null but fails pd.to_numeric, which both skews the 90%
+        # parse-rate check and lets the bogus string reach the SimpleImputer
+        # downstream, where strategy="median" crashes on "could not convert string
+        # to float: ' '".
+        if df[col].dtype == object:
+            cleaned = df[col].where(
+                ~df[col].apply(lambda v: isinstance(v, str) and v.strip() == "")
+            )
+            df[col] = cleaned
+
         numeric = pd.to_numeric(df[col], errors="coerce")
         non_null = df[col].notna().sum()
         # Accept the numeric conversion if at least 90 % of non-null values parse.
@@ -650,6 +662,67 @@ def predict_rows_json(
     return predict_with_trained_model(trained_model, raw_df)
 
 
+def _synthetic_background_from_stats(
+    *,
+    pipeline: Any,
+    feature_names: List[str],
+    column_stats: Dict[str, Any],
+    n_samples: int = 100,
+) -> Optional[np.ndarray]:
+    """Build a preprocessed background from per-column training statistics.
+
+    Used as a fallback when ``artifacts.shap.background_data`` is absent
+    (older models, pipelines run before SHAP was wired in). Without a
+    realistic background the counterfactual search uses sigma=1.0 for every
+    feature, which produces uniform ±α deltas across all variables — a
+    classic symptom of a flat scale map.
+
+    Sampling strategy:
+    - numeric columns: gaussian draws around ``mean`` with ``std`` spread,
+      clipped to the observed [min, max].
+    - categorical / unknown columns: filled with the column mean if numeric
+      data leaked through, otherwise ``np.nan`` so the pipeline imputer
+      handles them.
+
+    Returns the preprocessed array (samples, n_prep_features) on success, or
+    None if anything goes wrong — the caller treats None the same as
+    "no background available".
+    """
+    if not feature_names or not column_stats:
+        return None
+    rng = np.random.default_rng(42)
+    raw_columns: Dict[str, np.ndarray] = {}
+    has_numeric = False
+    for col in feature_names:
+        cs = column_stats.get(col, {})
+        if isinstance(cs, dict) and cs.get("type") == "numeric":
+            has_numeric = True
+            mean = float(cs.get("mean", 0.0))
+            std = max(float(cs.get("std", 0.0)), 1e-3)
+            lo = float(cs.get("min", mean - 3.0 * std))
+            hi = float(cs.get("max", mean + 3.0 * std))
+            samples = rng.normal(mean, std, n_samples)
+            raw_columns[col] = np.clip(samples, lo, hi)
+        else:
+            # Categorical or missing stats — leave NaN; the pipeline imputer
+            # fills with mode/mean during transform.
+            raw_columns[col] = np.full(n_samples, np.nan, dtype=float)
+
+    if not has_numeric:
+        return None
+
+    try:
+        from app.services.shap.global_shap import _transform_except_model
+        synthetic_df = pd.DataFrame(raw_columns)[feature_names]
+        prep = _transform_except_model(pipeline, synthetic_df)
+        if prep is None or prep.ndim != 2 or prep.shape[0] == 0:
+            return None
+        return np.asarray(prep, dtype=float)
+    except Exception as exc:  # pragma: no cover — defensive guard
+        logger.warning("counterfactual: synthetic background failed (%s)", exc)
+        return None
+
+
 def compute_counterfactual_for_row(
     trained_model: TrainedModel,
     row: Dict[str, Any],
@@ -715,6 +788,17 @@ def compute_counterfactual_for_row(
             background = np.array(raw_bg, dtype=float)
         except Exception:
             pass
+
+    # Fallback: synthesise a background from training_schema.column_stats so the
+    # CF search has a per-feature scale to work with. Without this the pipeline
+    # collapses to sigma=1.0 for every feature and produces constant ±α deltas.
+    if background is None and feature_names:
+        background = _synthetic_background_from_stats(
+            pipeline=pipeline,
+            feature_names=feature_names,
+            column_stats=training_schema.get("column_stats") or {},
+            n_samples=100,
+        )
 
     from app.services.counterfactual import compute_counterfactual
     cf_items = compute_counterfactual(

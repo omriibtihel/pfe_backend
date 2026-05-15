@@ -271,6 +271,29 @@ class TestPredictWithTrainedModel:
         assert result["n_rows"] == len(X)
         assert len(result["rows"]) == len(X)
 
+    def test_whitespace_cells_in_numeric_columns_are_imputed(self):
+        # When a CSV/Excel upload contains a literal space " " or empty string
+        # in a numeric column, pandas reads it as object dtype.  Without
+        # normalisation the column reaches SimpleImputer(strategy="median")
+        # which crashes with:
+        #   "could not convert string to float: ' '"
+        # _normalize_input_dtypes must turn these blanks into NaN so the
+        # pipeline imputer fills them with the training median.
+        X = self.df.drop(columns=["target"]).head(5).copy()
+        # Force the numeric column to object dtype with whitespace/empty cells.
+        X["age"] = X["age"].astype(object)
+        X.loc[X.index[0], "age"] = " "
+        X.loc[X.index[2], "age"] = ""
+        X.loc[X.index[3], "age"] = "  \t "
+
+        m = self._get_mock_model()
+        result = predict_with_trained_model(m, X)
+        # Did not crash; all rows produced a prediction.
+        assert result["n_rows"] == len(X)
+        assert len(result["rows"]) == len(X)
+        for row in result["rows"]:
+            assert row["prediction"] is not None
+
     def test_extra_column_is_ignored(self):
         X = self.df.drop(columns=["target"]).head(5).copy()
         X["unrelated_extra"] = 999
@@ -546,3 +569,198 @@ class TestThresholdedClassifierLabelPreservation:
         wrapper = ThresholdedClassifier(_NoProba(), threshold=0.3, positive_label="b")
         out = wrapper.predict(np.zeros((3, 2)))
         assert list(out) == ["a", "a", "a"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Train/Predict preprocessing parity
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestTrainPredictPreprocessingParity:
+    """The fitted pipeline saved at training time must apply the *exact* same
+    imputation/scaling/encoding transformations at prediction time.  No
+    re-fitting, no parameter drift: the imputer median, the scaler mean/scale,
+    and the encoder category mapping are all frozen at training time and
+    reused verbatim on new data.
+
+    This is what makes the model trustworthy:
+    - The user picks (e.g.) "robust" scaling at training time.
+    - The pipeline learns the train-set median and IQR.
+    - At prediction time, those exact stats are used to scale new rows.
+    - If a row contains a NaN, the imputer fills it with the train median —
+      never the prediction-set median (which would leak distribution).
+    """
+
+    def _build_df(self, n: int = 80, seed: int = 0) -> pd.DataFrame:
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame(
+            {
+                "age":    rng.uniform(20, 80, n),
+                "bmi":    rng.uniform(18, 40, n),
+                "region": rng.choice(["north", "south", "east", "west"], n),
+                "target": rng.integers(0, 2, n),
+            }
+        )
+
+    def _cfg_with_user_preprocessing(self, **overrides) -> TrainingConfig:
+        # User chooses *atypical* methods so we know the test fails loud if
+        # train and predict somehow diverge.
+        prep = {
+            "numericImputation":     "median",
+            "numericScaling":        "robust",     # <-- not the default
+            "categoricalImputation": "most_frequent",
+            "categoricalEncoding":   "onehot",
+        }
+        prep.update(overrides.get("preprocessing", {}))
+        return TrainingConfig.from_front(
+            {
+                "targetColumn": "target",
+                "taskType": "classification",
+                "models": ["logisticregression"],
+                "metrics": ["accuracy"],
+                "splitMethod": "holdout",
+                "trainRatio": 80, "valRatio": 0, "testRatio": 20,
+                "useGridSearch": False,
+                "balancing": {"strategy": "none", "apply_threshold": False},
+                "preprocessing": prep,
+            }
+        )
+
+    def test_predict_uses_frozen_imputer_median(self, tmp_path):
+        # Train with one dataset, predict on a *different* one whose median is
+        # very different.  The imputer must use the TRAIN median, not the
+        # predict-set median.
+        df_train = self._build_df(seed=0)
+        cfg = self._cfg_with_user_preprocessing()
+
+        from app.services.training.orchestrator import run_one_model
+        result = run_one_model(df_train, cfg, "logisticregression")
+        pipeline = result.fitted_pipeline
+
+        # Sanity: the prep step is a ColumnTransformer with a SimpleImputer.
+        prep = pipeline.named_steps["prep"]
+        from sklearn.compose import ColumnTransformer
+        assert isinstance(prep, ColumnTransformer)
+
+        # Find the numeric SimpleImputer and capture its frozen median.
+        train_imputer = None
+        for _name, sub_pipe, _cols in prep.transformers_:
+            if hasattr(sub_pipe, "named_steps") and "imputer" in sub_pipe.named_steps:
+                imp = sub_pipe.named_steps["imputer"]
+                if hasattr(imp, "statistics_") and imp.strategy == "median":
+                    train_imputer = imp
+                    break
+        assert train_imputer is not None
+        train_medians = train_imputer.statistics_.copy()
+
+        # Build a prediction dataframe with a totally different scale for "age".
+        df_pred = self._build_df(n=10, seed=99).drop(columns=["target"])
+        df_pred["age"] = df_pred["age"] + 1000  # shift far away from train median
+        df_pred.loc[df_pred.index[0], "age"] = np.nan  # NaN to be imputed
+
+        # Predict — must not fail, must use train median for imputation.
+        from app.services.training.output.predictor import predict_with_trained_model
+        m, path = _make_mock_trained_model(pipeline, result.artifacts_json)
+        predict_with_trained_model(m, df_pred)
+
+        # After predict, the imputer statistics_ must be UNCHANGED.
+        np.testing.assert_array_equal(train_imputer.statistics_, train_medians)
+
+    def test_predict_uses_frozen_scaler_stats(self, tmp_path):
+        df_train = self._build_df(seed=1)
+        cfg = self._cfg_with_user_preprocessing()  # numericScaling="robust"
+
+        from app.services.training.orchestrator import run_one_model
+        result = run_one_model(df_train, cfg, "logisticregression")
+        pipeline = result.fitted_pipeline
+
+        prep = pipeline.named_steps["prep"]
+        train_scaler = None
+        for _name, sub_pipe, _cols in prep.transformers_:
+            if hasattr(sub_pipe, "named_steps") and "scaler" in sub_pipe.named_steps:
+                train_scaler = sub_pipe.named_steps["scaler"]
+                break
+        assert train_scaler is not None
+        # RobustScaler exposes center_ (median) and scale_ (IQR) after fit.
+        train_center = train_scaler.center_.copy()
+        train_scale = train_scaler.scale_.copy()
+
+        # Predict on a dataset with much wider numeric range.
+        df_pred = self._build_df(n=20, seed=42).drop(columns=["target"])
+        df_pred["age"] = df_pred["age"] * 5  # huge shift in scale
+
+        from app.services.training.output.predictor import predict_with_trained_model
+        m, _path = _make_mock_trained_model(pipeline, result.artifacts_json)
+        predict_with_trained_model(m, df_pred)
+
+        # Scaler stats must NOT have moved — proves predict uses transform(),
+        # not fit_transform().
+        np.testing.assert_array_equal(train_scaler.center_, train_center)
+        np.testing.assert_array_equal(train_scaler.scale_, train_scale)
+
+    def test_predict_uses_frozen_onehot_categories(self, tmp_path):
+        # If a category appears at predict time but was NOT in train,
+        # OneHotEncoder(handle_unknown="ignore") must NOT learn it — it must
+        # be silently dropped, exactly as if the column were missing.
+        df_train = self._build_df(seed=2)
+        cfg = self._cfg_with_user_preprocessing()
+
+        from app.services.training.orchestrator import run_one_model
+        result = run_one_model(df_train, cfg, "logisticregression")
+        pipeline = result.fitted_pipeline
+
+        prep = pipeline.named_steps["prep"]
+        train_encoder = None
+        for _name, sub_pipe, _cols in prep.transformers_:
+            if hasattr(sub_pipe, "named_steps") and "encoder" in sub_pipe.named_steps:
+                train_encoder = sub_pipe.named_steps["encoder"]
+                break
+        assert train_encoder is not None
+        train_categories = [arr.copy() for arr in train_encoder.categories_]
+
+        # Inject an unseen category "moon" into region.
+        df_pred = self._build_df(n=8, seed=7).drop(columns=["target"])
+        df_pred["region"] = ["moon"] * len(df_pred)
+
+        from app.services.training.output.predictor import predict_with_trained_model
+        m, _path = _make_mock_trained_model(pipeline, result.artifacts_json)
+        # Must NOT raise (handle_unknown="ignore"); must NOT learn "moon".
+        predict_with_trained_model(m, df_pred)
+
+        for before, after in zip(train_categories, train_encoder.categories_):
+            np.testing.assert_array_equal(before, after)
+        # And "moon" is nowhere in the encoder's categories.
+        all_cats = [str(c) for arr in train_encoder.categories_ for c in arr]
+        assert "moon" not in all_cats
+
+    def test_transform_output_identical_when_input_identical(self, tmp_path):
+        # The strongest parity check: feeding the *training rows* back through
+        # the loaded pipeline must produce the exact same preprocessed array
+        # whether we call prep.transform(X) directly or via the full pipeline.
+        df_train = self._build_df(seed=3)
+        cfg = self._cfg_with_user_preprocessing()
+
+        from app.services.training.orchestrator import run_one_model
+        result = run_one_model(df_train, cfg, "logisticregression")
+        pipeline = result.fitted_pipeline
+
+        # Save & reload (matches what happens in production).
+        from app.services.training.output.persistence import save_pipeline, load_pipeline
+        pkl = save_pipeline(pipeline, tmp_path, "lr", threshold=0.5)
+        reloaded = load_pipeline(pkl)
+
+        X_sample = df_train.drop(columns=["target"]).head(5)
+
+        # Apply each step manually up to (but excluding) the model.
+        x = X_sample
+        for name, step in reloaded.named_steps.items():
+            if name == "model":
+                break
+            x = step.transform(x)
+
+        # Same input passed through pipeline.predict_proba — internally calls
+        # the same .transform() chain, so the underlying preprocessed array is
+        # identical.  We assert that the model's decision_function on x equals
+        # the one obtained through the full pipeline.
+        manual_scores = reloaded.named_steps["model"].decision_function(x)
+        pipeline_scores = reloaded.decision_function(X_sample)
+        np.testing.assert_allclose(manual_scores, pipeline_scores, rtol=1e-10)

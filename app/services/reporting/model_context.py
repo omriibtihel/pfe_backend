@@ -48,12 +48,14 @@ def build_reporting_model_context(
     artifacts = model.artifacts_json if isinstance(model.artifacts_json, dict) else {}
     metrics = model.metrics_json if isinstance(model.metrics_json, dict) else {}
     schema = artifacts.get("training_schema") if isinstance(artifacts.get("training_schema"), dict) else {}
+    task_type = str(getattr(model, "task_type", "classification") or "classification").lower()
 
     class_ctx, display_prediction = _build_class_context(
         raw_prediction=raw_prediction,
         schema=schema,
         metrics=metrics,
         lang=lang,
+        task_type=task_type,
     )
     feature_metadata = _build_feature_metadata(
         artifacts=artifacts,
@@ -75,7 +77,7 @@ def build_reporting_model_context(
     return ReportingModelContext(
         display_prediction=display_prediction,
         class_context=class_ctx,
-        model_quality=_build_model_quality(metrics, lang=lang),
+        model_quality=_build_model_quality(metrics, lang=lang, task_type=task_type),
         dataset_summary=_build_dataset_summary(artifacts, metrics, lang=lang),
         feature_metadata=feature_metadata,
         threshold_value=threshold_value,
@@ -88,9 +90,39 @@ def _build_class_context(
     schema: dict[str, Any],
     metrics: dict[str, Any],
     lang: str,
+    task_type: str = "classification",
 ) -> tuple[PredictionClassContext, Any]:
     raw = sanitize_for_prompt(str(raw_prediction), max_len=40)
     target = sanitize_for_prompt(str(schema.get("target", "")), max_len=80)
+
+    # Regression: there is no positive/negative class. Surface the predicted
+    # numeric value as a clean "<target> estimée à <value>" phrase so the
+    # downstream prompt and PDF show a meaningful headline.
+    if task_type == "regression":
+        try:
+            v = float(raw_prediction)
+            value_text = _format_number(v)
+        except (TypeError, ValueError):
+            value_text = raw
+        target_label = target or ("la valeur cible" if lang == "fr" else "the target value")
+        display_prediction = (
+            f"{target_label} estimee a {value_text}"
+            if lang == "fr"
+            else f"{target_label} estimated at {value_text}"
+        )
+        return (
+            PredictionClassContext(
+                raw_label=raw,
+                target_name=target,
+                positive_class="",
+                label_meaning=sanitize_for_prompt(
+                    (f"valeur numerique estimee : {value_text}" if lang == "fr"
+                     else f"estimated numeric value: {value_text}"),
+                    max_len=120,
+                ),
+            ),
+            display_prediction,
+        )
 
     positive_class = ""
     test_meta = _dig(metrics, "test", "meta") or _dig(metrics, "holdout_test_metrics", "meta") or {}
@@ -131,10 +163,18 @@ def _build_class_context(
     )
 
 
-def _build_model_quality(metrics: dict[str, Any], *, lang: str) -> list[ModelQualitySignal]:
+def _build_model_quality(
+    metrics: dict[str, Any],
+    *,
+    lang: str,
+    task_type: str = "classification",
+) -> list[ModelQualitySignal]:
     source = _metric_source(metrics)
     if not source:
         return []
+
+    if task_type == "regression":
+        return _build_regression_quality(source, lang=lang)
 
     labels = _METRIC_LABELS.get(lang, _METRIC_LABELS["en"])
     interpretations = _METRIC_INTERPRETATIONS.get(lang, _METRIC_INTERPRETATIONS["en"])
@@ -172,6 +212,105 @@ def _build_model_quality(metrics: dict[str, Any], *, lang: str) -> list[ModelQua
                     "au-dela de ce score, l'outil signale un resultat preoccupant"
                     if lang == "fr"
                     else "above this score, the tool signals a concerning result"
+                ),
+            )
+        )
+
+    return out[:7]
+
+
+def _build_regression_quality(source: dict[str, Any], *, lang: str) -> list[ModelQualitySignal]:
+    """Patient-friendly regression quality signals.
+
+    R² is exposed as "Part de la variation expliquée par l'outil" so a
+    layperson can read it as a percentage. MAE / RMSE are kept in the
+    target's natural units (formatted via ``_format_number``, NOT as a
+    percentage), so the report can say "écart moyen de 12.4 mg/dL" rather
+    than the meaningless "12.4 %". MAPE is the only metric naturally on
+    a 0–100 scale.
+    """
+    out: list[ModelQualitySignal] = []
+
+    r2 = source.get("r2")
+    if r2 is not None:
+        try:
+            r2_pct = max(0.0, min(1.0, float(r2)))
+            value = f"{round(r2_pct * 100, 1)} %"
+        except (TypeError, ValueError):
+            value = _format_metric(r2)
+        out.append(
+            ModelQualitySignal(
+                label=(
+                    "Part de la variation expliquee par l'outil"
+                    if lang == "fr"
+                    else "Share of variation explained by the tool"
+                ),
+                value=value,
+                interpretation=(
+                    "plus le pourcentage est eleve, plus l'estimation suit les variations reelles"
+                    if lang == "fr"
+                    else "the higher the percentage, the more the estimate tracks real variations"
+                ),
+            )
+        )
+
+    mae = source.get("mae")
+    if mae is not None:
+        out.append(
+            ModelQualitySignal(
+                label=(
+                    "Ecart moyen entre l'estimation et la valeur reelle"
+                    if lang == "fr"
+                    else "Average gap between the estimate and the real value"
+                ),
+                value=_format_number(mae),
+                interpretation=(
+                    "en moyenne, l'estimation s'ecarte de la valeur reelle de cette quantite"
+                    if lang == "fr"
+                    else "on average, the estimate differs from the real value by this amount"
+                ),
+            )
+        )
+
+    rmse = source.get("rmse")
+    if rmse is not None:
+        out.append(
+            ModelQualitySignal(
+                label=(
+                    "Ecart typique attendu"
+                    if lang == "fr"
+                    else "Typical expected gap"
+                ),
+                value=_format_number(rmse),
+                interpretation=(
+                    "ecart moyen pondere qui penalise davantage les grandes erreurs"
+                    if lang == "fr"
+                    else "weighted average gap that penalises larger errors more"
+                ),
+            )
+        )
+
+    mape = source.get("mape")
+    if mape is not None:
+        try:
+            mape_v = float(mape)
+            # Stored as a fraction (0.12 = 12 %).
+            mape_pct = mape_v * 100 if 0 <= mape_v <= 1 else mape_v
+            value = f"{round(mape_pct, 1)} %"
+        except (TypeError, ValueError):
+            value = _format_metric(mape)
+        out.append(
+            ModelQualitySignal(
+                label=(
+                    "Ecart moyen en pourcentage"
+                    if lang == "fr"
+                    else "Average percentage gap"
+                ),
+                value=value,
+                interpretation=(
+                    "en moyenne, l'estimation s'ecarte de la valeur reelle de ce pourcentage"
+                    if lang == "fr"
+                    else "on average, the estimate differs from the real value by this percentage"
                 ),
             )
         )
@@ -291,6 +430,12 @@ def _build_feature_metadata(
         imp = importance_by_feature.get(_canonical(name))
         if imp:
             meta["global_importance"] = imp
+        # Raw min/max/mean — consumed by the synthetic-glossary fallback in
+        # context_builder when a feature is absent from feature_glossary.yaml.
+        for stat_key, meta_key in (("min", "min_raw"), ("max", "max_raw"), ("mean", "mean_raw")):
+            v = stats.get(stat_key)
+            if v is not None:
+                meta[meta_key] = _format_number(v)
         _add_aliases(out, name, meta)
 
     # Importance can exist for features not present in column_stats.

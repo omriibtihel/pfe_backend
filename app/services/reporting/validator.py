@@ -174,7 +174,13 @@ class ReportValidator:
                 v = factor.get(k)
                 if isinstance(v, str):
                     yield v
-
+        for change in report.get("what_to_change") or []:
+            if not isinstance(change, dict):
+                continue
+            for k in ("factor", "current", "target", "change_text", "why_it_matters"):
+                v = change.get(k)
+                if isinstance(v, str):
+                    yield v
     def _scan_blocklist(self, report: dict[str, Any], lang: str) -> tuple[str, ...]:
         forbidden = _forbidden_for(lang)
         hits: list[str] = []

@@ -54,7 +54,10 @@ from .capabilities import (
 )
 # normalize_model_hyperparams lives in config/normalization.py but is re-exported
 # here for backward compatibility (consumers import it from config.schema).
-from app.services.training.config.normalization import normalize_model_hyperparams
+from app.services.training.config.normalization import (
+    inject_class_weight_for_imbalance,
+    normalize_model_hyperparams,
+)
 
 __all__ = [
     # types
@@ -96,4 +99,5 @@ __all__ = [
     "get_training_capabilities",
     # normalization (re-exported for backward compat)
     "normalize_model_hyperparams",
+    "inject_class_weight_for_imbalance",
 ]

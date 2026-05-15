@@ -25,7 +25,11 @@ from sklearn.preprocessing import label_binarize
 
 from app.services.training.utils import to_python_scalar
 from .binary import _is_zero_one_label_set, _detect_classification_type, get_class_labels
-from .curves import compute_roc_pr_curves, compute_calibration_curve
+from .curves import (
+    compute_calibration_curve,
+    compute_multiclass_ovr_curves,
+    compute_roc_pr_curves,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +396,17 @@ def compute_classification_metrics(
     y_pred_arr = np.asarray(y_pred)
     warnings: list[str] = []
     estimator_classes = get_class_labels(estimator) if estimator is not None else None
-    model_classes = [to_python_scalar(v) for v in (estimator_classes or labels or [])]
+    # `estimator_classes` and `labels` may be numpy arrays — `a or b` would call
+    # `bool(a)` which raises on multi-element arrays. Pick the first non-empty
+    # source explicitly instead.
+    _class_source: Any
+    if estimator_classes is not None and len(estimator_classes) > 0:
+        _class_source = estimator_classes
+    elif labels is not None and len(labels) > 0:
+        _class_source = labels
+    else:
+        _class_source = []
+    model_classes = [to_python_scalar(v) for v in _class_source]
 
     if str(task_type or "").strip().lower() != "classification":
         return {}
@@ -764,6 +778,10 @@ def compute_classification_metrics(
                 if cal_result is not None:
                     curves["calibration"] = cal_result
                 out["curves"] = curves if curves else None
+    elif classification_type == "multiclass" and proba is not None and score_labels:
+        mc_curves = compute_multiclass_ovr_curves(y_true_arr, np.asarray(proba), score_labels)
+        if mc_curves is not None:
+            out["curves"] = mc_curves
 
     out.update(legacy_flat)
     return out

@@ -121,6 +121,17 @@ _REGRESSION_CANDIDATES = ["rmse", "r2", "mae", "mse"]
 # Internal metric extraction helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _select_displayed_test_block(metrics_all: dict) -> Any:
+    # CV without holdout + threshold optimization: cv_mean is computed at the
+    # default threshold (0.5), but the model is deployed with optimal_threshold.
+    # Prefer cv_mean_at_threshold so displayed f1/recall match the deployed model.
+    if bool(metrics_all.get("cv", False)) and not bool(metrics_all.get("has_holdout_test", False)):
+        at_thr = metrics_all.get("cv_mean_at_threshold")
+        if isinstance(at_thr, dict) and at_thr:
+            return at_thr
+    return metrics_all.get("test")
+
+
 def _resolve_metrics(metrics_all: dict) -> tuple[dict, callable]:
     """
     Returns (flat_metrics_dict, mget_fn).
@@ -133,7 +144,7 @@ def _resolve_metrics(metrics_all: dict) -> tuple[dict, callable]:
     train metric value (which would mislabel a train score as a test score).
     """
     strategy = metrics_all.get("evaluation_strategy", "")
-    test_block = metrics_all.get("test")
+    test_block = _select_displayed_test_block(metrics_all)
 
     if strategy == "train_only" or not (isinstance(test_block, dict) and test_block):
         empty: dict = {}
@@ -319,7 +330,15 @@ def _build_cv_info(metrics_all: dict, *, primary_name: Optional[str]) -> tuple[O
     has_holdout = bool(metrics_all.get("has_holdout_test", False))
     cv_summary = metrics_all.get("cv_summary") if isinstance(metrics_all.get("cv_summary"), dict) else None
     holdout_metrics = metrics_all.get("holdout_test_metrics") if isinstance(metrics_all.get("holdout_test_metrics"), dict) else None
-    cv_mean = metrics_all.get("cv_mean") if isinstance(metrics_all.get("cv_mean"), dict) else None
+    cv_mean_default = metrics_all.get("cv_mean") if isinstance(metrics_all.get("cv_mean"), dict) else None
+    cv_mean_at_threshold = (
+        metrics_all.get("cv_mean_at_threshold")
+        if isinstance(metrics_all.get("cv_mean_at_threshold"), dict)
+        else None
+    )
+    # Prefer at-threshold OOF metrics over default-threshold cv_mean when present
+    # (CV without holdout + threshold optimization). See _select_displayed_test_block.
+    cv_mean = cv_mean_at_threshold if (not has_holdout and cv_mean_at_threshold) else cv_mean_default
 
     test_score_override: Optional[float] = None
     if primary_name:
@@ -334,6 +353,11 @@ def _build_cv_info(metrics_all: dict, *, primary_name: Optional[str]) -> tuple[O
                     test_score_override = float(raw)
                 except Exception:
                     pass
+        elif cv_mean_at_threshold and primary_name in cv_mean_at_threshold:
+            try:
+                test_score_override = float(cv_mean_at_threshold[primary_name])
+            except Exception:
+                pass
         elif isinstance(cv_summary, dict):
             cv_mean_block = cv_summary.get("mean", {})
             if isinstance(cv_mean_block, dict) and primary_name in cv_mean_block:
@@ -618,6 +642,8 @@ def model_to_curves(m: TrainedModel) -> CurvesResponse:
         roc=curves.get("roc"),
         pr=curves.get("pr"),
         calibration=curves.get("calibration"),
+        multiclassRoc=curves.get("multiclassRoc"),
+        multiclassPr=curves.get("multiclassPr"),
         learningCurves=artifacts.get("learning_curves"),
         artifactWarnings=[w for w in raw_artifact_warnings if isinstance(w, dict) and w.get("artifact") == "learning_curves"],
     )

@@ -459,12 +459,11 @@ def run_automl_session(session_id: int) -> None:
                 res.artifacts_json["model_pkl"] = None
             res.artifacts_json["dataset_version_id"] = dv_id
 
-            model_type_str = "automl" if res.is_best else est_name
             persist_trained_model(
                 db,
                 session_id=session_id,
                 project_id=s.project_id,
-                model_type=model_type_str,
+                model_type=est_name,
                 task_type=str(res.task_type),
                 metrics_json=res.metrics_json,
                 artifacts_json=res.artifacts_json,

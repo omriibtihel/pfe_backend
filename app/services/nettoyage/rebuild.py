@@ -463,6 +463,11 @@ def _apply_one(
             raise ValueError("substitute_values: l'opération doit cibler exactement 1 colonne (payload.columns).")
         col = cols[0]
 
+        present, missing = _split_existing_missing(df, [col])
+        if missing:
+            extra["ignored_missing_cols"] = missing
+            return df, extra
+
         df2, sub_eff = _substitute_values(
             df,
             col,

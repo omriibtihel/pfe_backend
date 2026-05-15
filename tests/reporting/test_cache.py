@@ -6,30 +6,40 @@ metadata so we don't depend on the alembic stack at test time.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import Column, Integer, Table, create_engine
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.db.base_class import Base
+# Importing ``app.db.base`` registers every model on ``Base.metadata`` so
+# that foreign keys resolve at DDL compile time. This avoids the previous
+# pattern of stubbing ``trained_models`` directly on ``Base.metadata``,
+# which collided with the real ``TrainedModel`` whenever another test
+# module imported ``app.models.training`` later in the pytest session
+# (e.g. ``tests/services/training/*`` or ``tests/datasets/*``), raising
+# "Table 'trained_models' is already defined".
+import app.db.base  # noqa: F401  (side effect: register all models)
 from app.models.prediction_report import PredictionReport
+from app.models.training import TrainedModel
 from app.services.reporting.cache import (
     ReportCache,
     compute_request_hash,
     report_cache,
 )
 
-# Register a stub ``trained_models`` table on Base.metadata so the FK from
-# prediction_reports resolves at schema-creation time. We deliberately avoid
-# importing the real ``TrainedModel`` model — it uses Postgres-only JSONB,
-# which SQLite cannot render. SQLite also doesn't enforce FK constraints by
-# default, so cache CRUD tests don't need a real referenced row.
-if "trained_models" not in Base.metadata.tables:
-    Table("trained_models", Base.metadata, Column("id", Integer, primary_key=True))
-
 
 @pytest.fixture()
 def db_session():
+    """In-memory SQLite seeded with the bare minimum schema for cache tests.
+
+    We create only the two tables we actually exercise — ``trained_models``
+    and ``prediction_reports``. The other models in ``Base.metadata``
+    (e.g. ``balancing_audit``) use Postgres-only JSONB which SQLite cannot
+    render; their FK targets are still resolvable at DDL time because they
+    live in the same ``Base.metadata`` namespace, but we deliberately skip
+    creating them in the DB. SQLite does not enforce foreign keys without
+    PRAGMA, so the unsatisfiable FK chain at runtime is harmless.
+    """
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.tables["trained_models"].create(engine)
+    TrainedModel.__table__.create(engine)
     PredictionReport.__table__.create(engine)
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import warnings
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import FitFailedWarning
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 
 # HalvingRandomSearchCV is experimental in sklearn 1.x — the enable import
@@ -20,11 +22,9 @@ except ImportError:  # pragma: no cover
 
 from app.services.preparation_ml.balancing.profiler import minority_ratio
 from app.services.training.pipeline.models import (
-    get_adaptive_model_grid,
     get_adaptive_n_iter,
     get_halving_n_candidates,
     get_model_distributions,
-    get_model_grid,
 )
 from app.services.training.utils import log_event
 from app.services.training.pipeline.cv_utils import (
@@ -111,6 +111,37 @@ def _compute_min_resources(
     train_frac = (cv_splits - 1) / max(cv_splits, 2)
     min_r = int(np.ceil((smote_k_neighbors + 1) / (float(mr) * train_frac)))
     return max(min_r, 20)  # absolute floor to avoid degenerate 1-sample halving
+
+
+def _run_search_quietly(
+    search: Any,
+    X: Any,
+    y: Any,
+    fit_params: Dict[str, Any],
+    *,
+    model_type: str,
+    search_type: str,
+) -> None:
+    """Run search.fit silently; report partial failures via a single log event."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FitFailedWarning)
+        search.fit(X, y, **fit_params)
+
+    try:
+        scores = np.asarray(search.cv_results_.get("mean_test_score", np.array([])))
+    except Exception:
+        return
+    if not scores.size:
+        return
+    n_failed = int(np.isnan(scores).sum())
+    if 0 < n_failed < scores.size:
+        log_event(
+            "training.search.partial_failures",
+            model_type=model_type,
+            search_type=search_type,
+            n_failed=n_failed,
+            n_total=int(scores.size),
+        )
 
 
 def _warn_if_all_nan_scores(search: Any, search_type: str, model_type: str) -> bool:
@@ -319,7 +350,10 @@ class Trainer:
                     return_train_score=True,
                     verbose=0,
                 )
-                hs.fit(X_train, y_train, **fit_params)
+                _run_search_quietly(
+                    hs, X_train, y_train, fit_params,
+                    model_type=model_type, search_type="halving_random",
+                )
                 _hs_all_nan = _warn_if_all_nan_scores(hs, "halving_random", model_type)
 
                 return TrainerFitResult(
@@ -385,7 +419,10 @@ class Trainer:
                 return_train_score=True,
                 verbose=0,
             )
-            rs.fit(X_train, y_train, **fit_params)
+            _run_search_quietly(
+                rs, X_train, y_train, fit_params,
+                model_type=model_type, search_type="random",
+            )
             _rs_all_nan = _warn_if_all_nan_scores(rs, "random", model_type)
 
             return TrainerFitResult(
@@ -403,19 +440,12 @@ class Trainer:
             )
 
         # ── GridSearchCV ──────────────────────────────────────────────────────
-        if isinstance(model_param_grid, dict) and model_param_grid:
-            # Caller provided an explicit grid (e.g. from user hyperparams) — use it verbatim.
-            model_grid = dict(model_param_grid)
-        elif n_samples is not None:
-            # Use the adaptive grid that scales with dataset size and injects
-            # class_weight for imbalanced datasets on supporting models.
-            model_grid = get_adaptive_model_grid(
-                model_type, task_type,
-                n_samples=n_samples,
-                imbalanced=imbalanced,
-            )
-        else:
-            model_grid = get_model_grid(model_type, task_type)
+        # MODEL_HP_SCHEMA is the single source of truth: the caller (orchestrator
+        # / cv_runner) builds ``model_param_grid`` from ``normalize_model_hyperparams``
+        # which auto-fills schema-defined ``grid_values`` for every HP the user
+        # did not override. If the resulting grid is empty (no HP has
+        # ``grid_values``), grid search is skipped and a plain fit runs.
+        model_grid = dict(model_param_grid) if isinstance(model_param_grid, dict) else {}
         if not model_grid:
             log_event("training.fit", model_type=model_type, tuning=False, reason="empty_param_grid")
             pipeline.fit(X_train, y_train, **fit_params)
@@ -469,7 +499,10 @@ class Trainer:
             return_train_score=True,
             verbose=0,
         )
-        gs.fit(X_train, y_train, **fit_params)
+        _run_search_quietly(
+            gs, X_train, y_train, fit_params,
+            model_type=model_type, search_type="grid",
+        )
         _gs_all_nan = _warn_if_all_nan_scores(gs, "grid", model_type)
 
         return TrainerFitResult(

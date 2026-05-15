@@ -156,7 +156,24 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "enum",
             "enum": ["sqrt", "log2"],
             "default": "sqrt",
+            "grid_values": ["sqrt", "log2"],
             "help": "Number of features to consider at each split.",
+        },
+        "min_samples_leaf": {
+            "type": "int",
+            "default": 1,
+            "min": 1,
+            "max": 100,
+            "grid_values": [1, 2, 4, 10],
+            "help": "Minimum number of samples required to be at a leaf node.",
+        },
+        "min_samples_split": {
+            "type": "int",
+            "default": 2,
+            "min": 2,
+            "max": 100,
+            "grid_values": [2, 5, 10],
+            "help": "Minimum number of samples required to split an internal node.",
         },
         "class_weight": {
             "type": "enum_or_null",
@@ -216,6 +233,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "enum",
             "enum": ["linear", "rbf", "poly", "sigmoid"],
             "default": "rbf",
+            "grid_values": ["rbf", "linear"],
             "help": "SVM kernel function.",
         },
         "gamma": {
@@ -225,6 +243,14 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "gt": 0.0,
             "grid_values": ["scale", "auto", 0.001, 0.01, 0.1],
             "help": "Kernel coefficient. Ignored when kernel='linear'.",
+        },
+        "epsilon": {
+            "type": "float",
+            "default": 0.1,
+            "ge": 0.0,
+            "grid_values": [0.01, 0.1, 0.5],
+            "supported_in": ["regression"],
+            "help": "Epsilon-insensitive tube width (regression only). Errors smaller than this are not penalized.",
         },
         "class_weight": {
             "type": "enum_or_null",
@@ -247,6 +273,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "enum",
             "enum": ["uniform", "distance"],
             "default": "uniform",
+            "grid_values": ["uniform", "distance"],
             "help": "Weight function used in prediction.",
         },
         "metric": {
@@ -278,7 +305,17 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "enum",
             "enum": ["gini", "entropy", "log_loss"],
             "default": "gini",
-            "help": "Function to measure the quality of a split.",
+            "grid_values": ["gini", "entropy"],
+            "supported_in": ["classification"],
+            "help": "Function to measure the quality of a split (classification only).",
+        },
+        "min_samples_leaf": {
+            "type": "int",
+            "default": 1,
+            "min": 1,
+            "max": 100,
+            "grid_values": [1, 4, 10],
+            "help": "Minimum number of samples required to be at a leaf node.",
         },
         "class_weight": {
             "type": "enum_or_null",
@@ -329,6 +366,20 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "grid_values": [0.5, 0.7, 0.9, 1.0],
             "help": "Subsample ratio of columns when constructing each tree.",
         },
+        "min_child_weight": {
+            "type": "float",
+            "default": 1.0,
+            "ge": 0.0,
+            "grid_values": [1, 3, 5],
+            "help": "Minimum sum of instance weight (hessian) needed in a child node. Higher values reduce overfitting.",
+        },
+        "reg_alpha": {
+            "type": "float",
+            "default": 0.0,
+            "ge": 0.0,
+            "grid_values": [0, 0.1, 1.0],
+            "help": "L1 regularization on leaf weights. Higher values reduce overfitting.",
+        },
     },
     "lightgbm": {
         "n_estimators": {
@@ -371,6 +422,28 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "grid_values": [0.7, 0.8, 0.9, 1.0],
             "help": "Fraction of data sampled per tree (requires bagging_freq > 0, set automatically).",
         },
+        "min_child_samples": {
+            "type": "int",
+            "default": 20,
+            "min": 1,
+            "max": 500,
+            "grid_values": [10, 20, 30],
+            "help": "Minimum number of samples in a leaf. Higher values reduce overfitting.",
+        },
+        "reg_alpha": {
+            "type": "float",
+            "default": 0.0,
+            "ge": 0.0,
+            "grid_values": [0, 0.1, 1.0],
+            "help": "L1 regularization on leaf weights.",
+        },
+        "reg_lambda": {
+            "type": "float",
+            "default": 0.0,
+            "ge": 0.0,
+            "grid_values": [0.1, 1.0, 5.0],
+            "help": "L2 regularization on leaf weights.",
+        },
     },
     "extratrees": {
         "n_estimators": {
@@ -393,6 +466,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "enum",
             "enum": ["sqrt", "log2"],
             "default": "sqrt",
+            "grid_values": ["sqrt", "log2"],
             "help": "Number of features to consider at each split.",
         },
         "min_samples_leaf": {
@@ -402,6 +476,14 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "max": 100,
             "grid_values": [1, 2, 5, 10],
             "help": "Minimum number of samples required to be at a leaf node.",
+        },
+        "min_samples_split": {
+            "type": "int",
+            "default": 2,
+            "min": 2,
+            "max": 100,
+            "grid_values": [2, 5, 10],
+            "help": "Minimum number of samples required to split an internal node.",
         },
         "class_weight": {
             "type": "enum_or_null",
@@ -471,6 +553,7 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "type": "enum",
             "enum": ["relu", "tanh", "logistic"],
             "default": "relu",
+            "grid_values": ["relu", "tanh"],
             "help": "Fonction d'activation des neurones cachés. relu est recommandé en général.",
         },
         "alpha": {
@@ -536,6 +619,16 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
             "max": 20000,
             "grid_values": [500, 1000, 2000],
             "help": "Nombre maximal d'itérations pour la descente de coordonnées.",
+        },
+    },
+    "ridge": {
+        "alpha": {
+            "type": "float",
+            "default": 1.0,
+            "gt": 0.0,
+            "grid_values": [0.01, 0.1, 1.0, 10.0, 100.0],
+            "supported_in": ["regression"],
+            "help": "Force de régularisation L2. Plus alpha est élevé, plus les coefficients sont contraints (réduit l'overfitting).",
         },
     },
     "catboost": {

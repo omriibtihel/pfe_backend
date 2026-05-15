@@ -40,33 +40,43 @@ _LINEAR_CLASSES = (
 # All other estimators fall back to KernelExplainer (slow, sampled)
 
 
+def _unwrap_flaml(obj: Any) -> Any:
+    """Peel FLAML wrappers until the raw sklearn estimator is exposed.
+
+    Handles three concrete shapes:
+      - ``flaml.AutoML``           — ``.model`` is a FLAML ``BaseEstimator``,
+                                     ``.estimator`` is the sklearn learner.
+      - ``flaml.BaseEstimator``    — ``.model`` *is* the sklearn learner;
+                                     ``.estimator`` may also be the sklearn learner.
+      - bare sklearn estimator     — neither attribute → returned unchanged.
+
+    SHAP explainer routing keys off ``type(estimator).__name__`` (TreeExplainer
+    needs ``LGBMClassifier`` etc., not the FLAML wrapper), so getting this
+    unwrap right is what makes the fast path available for AutoML models.
+    """
+    inner = getattr(obj, "model", None)
+    if inner is None:
+        return obj
+    return getattr(inner, "estimator", inner)
+
+
 def extract_model_from_pipeline(pipeline: Any) -> Any:
     """
-    Return the raw estimator from the last step of a sklearn Pipeline.
+    Return the raw estimator from a fitted pipeline.
 
     Works with:
-    - sklearn Pipeline  (named_steps["model"])
-    - FLAML AutoML      (pipeline.model.estimator)
+    - sklearn Pipeline  (named_steps["model"]) — including AutoMLPipeline
+    - bare FLAML AutoML / FLAML BaseEstimator
     - Bare estimator    (returned as-is)
     """
-    # sklearn Pipeline
     named = getattr(pipeline, "named_steps", None)
     if named is not None:
-        # The last step is always the model; try "model" key first
         model = named.get("model")
-        if model is not None:
-            return model
-        # Fallback: return the last step value
-        return list(named.values())[-1]
+        if model is None:
+            model = list(named.values())[-1]
+        return _unwrap_flaml(model)
 
-    # FLAML AutoML wraps estimator in pipeline.model.estimator
-    flaml_model = getattr(pipeline, "model", None)
-    if flaml_model is not None:
-        inner = getattr(flaml_model, "estimator", None)
-        if inner is not None:
-            return inner
-
-    return pipeline
+    return _unwrap_flaml(pipeline)
 
 
 def get_explainer_type(estimator: Any) -> str:

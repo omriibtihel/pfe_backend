@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import tempfile
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
+from sklearn.exceptions import FitFailedWarning
 from sklearn.metrics import precision_recall_curve
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_sample_weight
 
 from app.services.training.config.automl import AutoMLConfig
 from app.services.training.pipeline.evaluator import Evaluator
+from app.services.training.pipeline.learning_curves import compute_learning_curve
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,55 @@ _AUTO_METRIC: dict[str, str] = {
     "classification": "roc_auc",      # binary — overridden at runtime for multiclass
     "regression": "rmse",
 }
+
+
+# FLAML estimators kept after excluding LightGBM (feature-name issues on ndarray
+# inputs) and SAGA Logistic Regression ("lrl1"/"lrl2", unstable on tiny folds).
+_AUTOML_ESTIMATORS: tuple[str, ...] = (
+    "rf",
+    "extra_tree",
+    "xgboost",
+    "xgb_limitdepth",
+    "catboost",
+    "kneighbor",
+)
+
+# Warnings FLAML emits during internal CV that we cannot fix from this layer
+# (ndarray↔DataFrame wrapping, 1-class folds). FLAML handles them via NaN
+# scores already; suppression here only quiets stderr.
+_FLAML_QUIET_MESSAGE_PATTERNS: tuple[str, ...] = (
+    r"X does not have valid feature names",
+    r"X has feature names",
+    r"Scoring failed",
+    r"pos_label=.* is not a valid label",
+)
+
+
+@contextlib.contextmanager
+def _quiet_flaml_warnings():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FitFailedWarning)
+        for pattern in _FLAML_QUIET_MESSAGE_PATTERNS:
+            warnings.filterwarnings("ignore", message=pattern, category=UserWarning)
+        yield
+
+
+_FORBIDDEN_NAME_CHARS = frozenset('"]{,}:[<>')
+
+
+def _sanitize_feature_names(names: List[str]) -> List[str]:
+    """Strip JSON-special characters from feature names; duplicates get a numeric suffix."""
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for raw in names:
+        clean = "".join("_" if ch in _FORBIDDEN_NAME_CHARS else ch for ch in str(raw)).strip() or "feat"
+        if clean in seen:
+            seen[clean] += 1
+            clean = f"{clean}_{seen[clean]}"
+        else:
+            seen[clean] = 0
+        out.append(clean)
+    return out
 
 
 # ── Explicit sklearn preprocessing before FLAML ───────────────────────────────
@@ -121,6 +175,11 @@ def _build_automl_preprocessor(
     except Exception:
         prep_names = [f"feat_{i}" for i in range(X_arr.shape[1])]
 
+    # LightGBM rejects JSON-special characters in feature names. Sanitize once
+    # here so every downstream split (test, threshold, SMOTE) inherits safe
+    # names without each call site having to remember to do it.
+    prep_names = _sanitize_feature_names(prep_names)
+
     # Pandas 3.0 infers StringDtype for string column names — force object dtype
     # so that FLAML's internal np.array() calls on column indices don't crash.
     cols_idx = pd.Index(prep_names, dtype=object)
@@ -130,9 +189,19 @@ def _build_automl_preprocessor(
 
 class AutoMLPipeline:
     """
-    Wraps (sklearn preprocessor + FLAML AutoML) into a single picklable object.
-    At inference time, raw data is preprocessed transparently before FLAML predicts.
-    The existing predictor needs no changes — it calls predict_proba(X) as usual.
+    Wraps (sklearn preprocessor + FLAML predictor) into a single picklable object.
+    At inference time, raw data is preprocessed transparently before predict.
+
+    The ``inner`` attribute (kept as ``automl`` for pickle backward-compat) can be:
+      - a ``flaml.AutoML`` object (the best-of-run result, with full HPO history)
+      - a FLAML ``BaseEstimator`` (a per-estimator result like LGBMEstimator)
+
+    Both expose ``predict``/``predict_proba`` on already-preprocessed input, which
+    is all this wrapper needs.
+
+    ``named_steps`` is exposed so that downstream SHAP/LIME machinery — which
+    iterates sklearn-style steps to extract the preprocessor — treats this object
+    interchangeably with a sklearn ``Pipeline``.
     """
 
     def __init__(
@@ -143,9 +212,14 @@ class AutoMLPipeline:
         prep_cols: Optional[List[str]] = None,
     ) -> None:
         self.preprocessor = preprocessor
-        self.automl = automl
+        self.automl = automl                       # flaml.AutoML OR a single flaml learner
         self.feature_names_in = feature_names_in  # original column names expected at inference
         self._prep_cols = prep_cols               # column names after preprocessing
+
+    @property
+    def named_steps(self) -> Dict[str, Any]:
+        # sklearn-compatible introspection — used by SHAP/LIME helpers.
+        return {"prep": self.preprocessor, "model": self.automl}
 
     # ── internal helper ───────────────────────────────────────────────────────
 
@@ -164,32 +238,32 @@ class AutoMLPipeline:
     # ── sklearn-compatible API ────────────────────────────────────────────────
 
     def predict(self, X: Any) -> np.ndarray:
-        return self.automl.predict(self._preprocess(X))
+        with _quiet_flaml_warnings():
+            return self.automl.predict(self._preprocess(X))
 
     def predict_proba(self, X: Any) -> np.ndarray:
-        return self.automl.predict_proba(self._preprocess(X))
+        with _quiet_flaml_warnings():
+            return self.automl.predict_proba(self._preprocess(X))
 
     @property
     def classes_(self) -> Any:
         return getattr(self.automl, "classes_", None)
 
-    @property
-    def model(self) -> Any:
-        return getattr(self.automl, "model", None)
 
-    def _inner_estimator(self) -> Any:
-        model = self.model
-        if model is None:
-            return self.automl
-        return getattr(model, "estimator", model)
+def _unwrap_to_sklearn(obj: Any) -> Any:
+    """Peel FLAML wrappers (and AutoMLPipeline) to reach the underlying sklearn learner.
 
-    @property
-    def feature_importances_(self) -> Optional[np.ndarray]:
-        return getattr(self._inner_estimator(), "feature_importances_", None)
-
-    @property
-    def coef_(self) -> Optional[np.ndarray]:
-        return getattr(self._inner_estimator(), "coef_", None)
+    Single source of truth used by every helper in this module that needs the
+    raw estimator (feature importance extraction, learning-curve cloning, …).
+    The mirror function in ``shap._utils`` exists to avoid a cross-module
+    dependency from SHAP back to the training package.
+    """
+    if isinstance(obj, AutoMLPipeline):
+        obj = obj.automl
+    inner = getattr(obj, "model", None)
+    if inner is None:
+        return obj
+    return getattr(inner, "estimator", inner)
 
 
 # ── Medical preparation ────────────────────────────────────────────────────────
@@ -271,16 +345,8 @@ def _prepare_medical_automl(
     n_splits = 5   # 5-fold: better generalization estimate than 3-fold
     logger.info("MedAutoML Opt2: budget=%ds, eval=cv/5-fold", effective_budget)
 
-    # ── Opt 3 : Wider HP search space ─────────────────────────────────────────
+    # HPs only for estimators present in _AUTOML_ESTIMATORS.
     custom_hp: Dict[str, Any] = {
-        "lgbm": {
-            "n_estimators":      {"domain": tune.lograndint(lower=50, upper=2000),   "init_value": 300},
-            "max_depth":         {"domain": tune.randint(lower=3, upper=12),          "init_value": 6},
-            "learning_rate":     {"domain": tune.loguniform(lower=0.005, upper=0.3),  "init_value": 0.05},
-            "min_child_samples": {"domain": tune.randint(lower=5, upper=100),         "init_value": 20},
-            "reg_alpha":         {"domain": tune.loguniform(lower=1e-4, upper=10.0),  "init_value": 0.1},
-            "reg_lambda":        {"domain": tune.loguniform(lower=1e-4, upper=10.0),  "init_value": 0.1},
-        },
         "xgboost": {
             "n_estimators":    {"domain": tune.lograndint(lower=50, upper=2000),   "init_value": 300},
             "max_depth":       {"domain": tune.randint(lower=3, upper=12),          "init_value": 6},
@@ -354,6 +420,157 @@ def _find_optimal_threshold(
         return max(0.01, min(0.99, optimal))
     except Exception:
         return 0.5
+
+
+# ── Artifact helpers: preprocessing summary, curves, learning curves ─────────
+
+def _build_preprocessing_summary(
+    preprocessor: Any,
+    feature_names_in: List[str],
+    prep_names: List[str],
+    *,
+    imbalance_applied: bool,
+    imbalance_ratio: Optional[float],
+    smote_applied: bool,
+    eval_method: str,
+    n_splits: int,
+) -> Dict[str, Any]:
+    """
+    Describe the automatic preparation AutoML performs.
+
+    AutoML runs as a black box — user-defined PreparationML / FeatureEngineering /
+    Balancing are intentionally bypassed.  This block lets the UI surface that
+    fact, so the user understands what happened.
+    """
+    numeric_cols: List[str] = []
+    categorical_cols: List[str] = []
+    try:
+        ct = preprocessor.named_steps.get("ct")
+        for name, _trans, cols in getattr(ct, "transformers_", []) or []:
+            if name == "num":
+                numeric_cols = list(cols)
+            elif name == "cat":
+                categorical_cols = list(cols)
+    except Exception:
+        pass
+
+    steps: List[Dict[str, Any]] = []
+    if numeric_cols:
+        steps.append({
+            "step": "Imputation numérique",
+            "method": "SimpleImputer(strategy=median)",
+            "columns": numeric_cols,
+        })
+        steps.append({
+            "step": "Standardisation",
+            "method": "StandardScaler",
+            "columns": numeric_cols,
+        })
+    if categorical_cols:
+        steps.append({
+            "step": "Imputation catégorielle",
+            "method": "SimpleImputer(strategy=most_frequent)",
+            "columns": categorical_cols,
+        })
+        steps.append({
+            "step": "Encodage catégoriel",
+            "method": "OrdinalEncoder(handle_unknown=use_encoded_value)",
+            "columns": categorical_cols,
+        })
+    steps.append({
+        "step": "Sélection de variance",
+        "method": "VarianceThreshold(0.0) — supprime les variables constantes",
+    })
+
+    return {
+        "mode": "automl",
+        "note": (
+            "AutoML est un mode boîte noire : la préparation, le feature engineering "
+            "et la stratégie de balancing configurés ailleurs dans l'application "
+            "ne sont PAS appliqués. AutoML utilise sa propre préparation standard."
+        ),
+        "steps": steps,
+        "columnsIn": list(feature_names_in),
+        "columnsOut": list(prep_names),
+        "imbalanceHandling": None if imbalance_ratio is None else {
+            "applied": bool(imbalance_applied),
+            "method": "sample_weight=balanced" if imbalance_applied else "none",
+            "imbalanceRatio": float(imbalance_ratio),
+        },
+        "smote": None if imbalance_ratio is None else {
+            "applied": bool(smote_applied),
+            "trigger": "IR > 2.0 (binaire uniquement)",
+        },
+        "crossValidation": {
+            "evalMethod": eval_method,
+            "nSplits": int(n_splits),
+        },
+    }
+
+
+def _extract_curves_from_metrics(metrics: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pull the {roc, pr, calibration} block out of an evaluator's metrics dict."""
+    if not isinstance(metrics, dict):
+        return None
+    curves = metrics.get("curves")
+    return curves if isinstance(curves, dict) and curves else None
+
+
+def _learning_curve_estimator(model_or_pipeline: Any) -> Optional[Any]:
+    """Return a fresh clone of the underlying sklearn estimator, or None."""
+    try:
+        inner = _unwrap_to_sklearn(model_or_pipeline)
+        return clone(inner) if inner is not None else None
+    except Exception as exc:
+        logger.debug("AutoML learning-curve estimator unwrap failed: %s", exc)
+        return None
+
+
+_SHAP_BACKGROUND_MAX_ROWS = 50
+
+
+def _build_shap_background(X_train_prep_for_eval: Any) -> Dict[str, Any]:
+    """Sample preprocessed training rows for downstream SHAP/LIME explanations.
+
+    The prediction-time enrichers (``compute_local_shap``, ``compute_local_lime``)
+    read ``artifacts["shap"]["background_data"]`` to anchor their local explanation
+    in the training distribution.  AutoML doesn't compute a global SHAP at training
+    time (would double the runtime), so we just persist a representative sample of
+    the preprocessed training matrix — enough for both explainers to function.
+
+    Returns a JSON-serialisable dict matching the shape expected by predictor.py.
+    """
+    arr = np.asarray(X_train_prep_for_eval, dtype=float)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return {}
+    n = arr.shape[0]
+    if n > _SHAP_BACKGROUND_MAX_ROWS:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n, size=_SHAP_BACKGROUND_MAX_ROWS, replace=False)
+        arr = arr[idx]
+    return {"background_data": arr.tolist()}
+
+
+def _compute_automl_learning_curve(
+    model_or_pipeline: Any,
+    X_train_prep: pd.DataFrame,
+    y_train: np.ndarray,
+    task_type: str,
+) -> Optional[Dict[str, Any]]:
+    """Run the standard learning-curve module on the preprocessed training matrix."""
+    est = _learning_curve_estimator(model_or_pipeline)
+    if est is None:
+        return None
+    try:
+        return compute_learning_curve(
+            est,
+            np.asarray(X_train_prep),
+            np.asarray(y_train),
+            task_type=task_type,
+        )
+    except Exception as exc:
+        logger.warning("AutoML learning curve failed: %s", exc)
+        return None
 
 
 @dataclass
@@ -483,14 +700,15 @@ def run_automl(
     # Check eligibility BEFORE copying — only copy if SMOTE will actually run.
     smote_applied = False
     _smote_eligible = False
-    _ir_sm = 1.0
+    original_ir: Optional[float] = None
     _k_nn = 0
     if cfg.task_type == "classification":
         classes_sm, counts_sm = np.unique(y_train, return_counts=True)
+        if len(classes_sm) >= 2 and counts_sm.min() > 0:
+            original_ir = float(counts_sm.max()) / float(counts_sm.min())
         if len(classes_sm) == 2 and counts_sm.min() > 0:
-            _ir_sm = float(counts_sm.max()) / float(counts_sm.min())
             _k_nn = min(5, int(counts_sm.min()) - 1)
-            _smote_eligible = _ir_sm > 2.0 and _k_nn >= 1 and X_train_prep.shape[0] >= 12
+            _smote_eligible = (original_ir or 0.0) > 2.0 and _k_nn >= 1 and X_train_prep.shape[0] >= 12
 
     # Only allocate the pre-SMOTE evaluation copy when SMOTE will actually run.
     if _smote_eligible:
@@ -507,7 +725,7 @@ def run_automl(
             smote_applied = True
             logger.info(
                 "MedAutoML: SMOTE applied (IR=%.2f), train size %d → %d",
-                _ir_sm, len(y_train_for_eval), len(y_train),
+                original_ir or 0.0, len(y_train_for_eval), len(y_train),
             )
         except Exception as exc:
             logger.warning("MedAutoML: SMOTE failed, continuing without: %s", exc)
@@ -531,6 +749,16 @@ def run_automl(
 
     # ── 6. Medical pre-fit optimizations (sample weights, CV folds, HP bounds) ─
     med = _prepare_medical_automl(X_train_prep, y_train, cfg, flaml_metric, n_samples)
+
+    # FLAML/LightGBM has chronic issues when feature names are propagated from a
+    # DataFrame ("Wrong size of feature_names", "JSON characters", etc.). Strip
+    # to plain ndarrays at the boundary — LightGBM then uses positional features
+    # and never serializes names. We retain ``prep_names`` separately so that
+    # feature importance and report output still display meaningful labels.
+    X_train_prep_arr = np.asarray(X_train_prep)
+    X_test_prep_arr = np.asarray(X_test_prep) if X_test_prep is not None else None
+    X_thresh_arr = np.asarray(X_thresh) if X_thresh is not None else None
+    X_train_prep_for_eval_arr = np.asarray(X_train_prep_for_eval)
 
     # ── 7. Progress thread ────────────────────────────────────────────────────
     _stop = threading.Event()
@@ -559,23 +787,25 @@ def run_automl(
 
     automl = AutoML()
     try:
-        automl.fit(
-            X_train_prep,           # clean numeric DataFrame — no raw categoricals
-            y_train,
-            task=cfg.task_type,
-            time_budget=med.effective_budget,
-            metric=med.flaml_metric,
-            eval_method=med.eval_method,    # "cv"
-            n_splits=med.n_splits,          # 5-fold
-            n_jobs=-1,
-            ensemble=use_ensemble,
-            early_stop=True,
-            custom_hp=med.custom_hp,
-            verbose=0,
-            log_file_name=log_path,
-            sample_weight=med.sample_weight,
-            model_history=True,
-        )
+        with _quiet_flaml_warnings():
+            automl.fit(
+                X_train_prep_arr,
+                y_train,
+                task=cfg.task_type,
+                time_budget=med.effective_budget,
+                metric=med.flaml_metric,
+                eval_method=med.eval_method,    # "cv"
+                n_splits=med.n_splits,          # 5-fold
+                n_jobs=-1,
+                ensemble=use_ensemble,
+                early_stop=True,
+                estimator_list=list(_AUTOML_ESTIMATORS),
+                custom_hp=med.custom_hp,
+                verbose=0,
+                log_file_name=log_path,
+                sample_weight=med.sample_weight,
+                model_history=True,
+            )
     finally:
         _stop.set()
         prog_thread.join(timeout=5)
@@ -600,31 +830,32 @@ def run_automl(
     # never touched here, preserving its independence for final evaluation.
     optimal_threshold = 0.5
     threshold_optimized = False
-    if cfg.task_type == "classification":
-        if X_thresh is not None and y_thresh is not None:
-            optimal_threshold = _find_optimal_threshold(
-                automl, X_thresh, y_thresh,
-                positive_label=cfg.positive_label,
-                beta=float(getattr(cfg, "f_beta", 1.0)),
-            )
-        threshold_optimized = optimal_threshold != 0.5
-        if threshold_optimized:
-            logger.info("MedAutoML: optimal threshold = %.3f", optimal_threshold)
+    with _quiet_flaml_warnings():
+        if cfg.task_type == "classification":
+            if X_thresh_arr is not None and y_thresh is not None:
+                optimal_threshold = _find_optimal_threshold(
+                    automl, X_thresh_arr, y_thresh,
+                    positive_label=cfg.positive_label,
+                    beta=float(getattr(cfg, "f_beta", 1.0)),
+                )
+            threshold_optimized = optimal_threshold != 0.5
+            if threshold_optimized:
+                logger.info("MedAutoML: optimal threshold = %.3f", optimal_threshold)
 
-    # ── 11. Evaluate on preprocessed test / pre-SMOTE train ──────────────────
-    evaluator = Evaluator(
-        task_type=cfg.task_type,
-        positive_label=cfg.positive_label,
-    )
-    eval_test = (
-        evaluator.evaluate(automl, X_test_prep, y_test, threshold=optimal_threshold)
-        if has_test and X_test_prep is not None
-        else None
-    )
-    # Evaluate on pre-SMOTE training data (unbiased — SMOTE samples not present)
-    eval_train = evaluator.evaluate(
-        automl, X_train_prep_for_eval, y_train_for_eval, threshold=optimal_threshold
-    )
+        # ── 11. Evaluate on preprocessed test / pre-SMOTE train ──────────────────
+        evaluator = Evaluator(
+            task_type=cfg.task_type,
+            positive_label=cfg.positive_label,
+        )
+        eval_test = (
+            evaluator.evaluate(automl, X_test_prep_arr, y_test, threshold=optimal_threshold)
+            if has_test and X_test_prep_arr is not None
+            else None
+        )
+        # Evaluate on pre-SMOTE training data (unbiased — SMOTE samples not present)
+        eval_train = evaluator.evaluate(
+            automl, X_train_prep_for_eval_arr, y_train_for_eval, threshold=optimal_threshold
+        )
 
     # ── 12. Feature importance (from preprocessed feature space) ─────────────
     feature_importance = _extract_feature_importance(automl, prep_names)
@@ -636,6 +867,24 @@ def run_automl(
         feature_names_in=original_feature_names,
         prep_cols=prep_names,
     )
+
+    # ── 13b. Build artifact extras: curves, learning curves, preprocessing ───
+    curves_block = _extract_curves_from_metrics(eval_test.metrics) if eval_test is not None else None
+    with _quiet_flaml_warnings():
+        learning_curve_block = _compute_automl_learning_curve(
+            automl, X_train_prep_for_eval_arr, y_train_for_eval, cfg.task_type,
+        )
+    preprocessing_block = _build_preprocessing_summary(
+        preprocessor,
+        original_feature_names,
+        prep_names,
+        imbalance_applied=med.imbalance_applied,
+        imbalance_ratio=original_ir,
+        smote_applied=smote_applied,
+        eval_method=med.eval_method,
+        n_splits=med.n_splits,
+    )
+    shap_background_block = _build_shap_background(X_train_prep_for_eval)
 
     # ── 14. Build metrics_json ────────────────────────────────────────────────
     best_estimator = str(getattr(automl, "best_estimator", "unknown"))
@@ -720,7 +969,14 @@ def run_automl(
         "training_schema": {
             "feature_names": original_feature_names,
         },
+        "preprocessing": preprocessing_block,
     }
+    if curves_block is not None:
+        artifacts_json["curves"] = curves_block
+    if learning_curve_block is not None:
+        artifacts_json["learning_curves"] = learning_curve_block
+    if shap_background_block:
+        artifacts_json["shap"] = shap_background_block
 
     best_result = AutoMLRunResult(
         metrics_json=metrics_json,
@@ -752,14 +1008,15 @@ def run_automl(
                 continue
 
             # Evaluate the learner directly — no need to mutate automl's internal state.
-            est_eval_test = (
-                evaluator.evaluate(est_learner, X_test_prep, y_test, threshold=0.5)
-                if has_test and X_test_prep is not None
-                else None
-            )
-            est_eval_train = evaluator.evaluate(
-                est_learner, X_train_prep_for_eval, y_train_for_eval, threshold=0.5
-            )
+            with _quiet_flaml_warnings():
+                est_eval_test = (
+                    evaluator.evaluate(est_learner, X_test_prep_arr, y_test, threshold=0.5)
+                    if has_test and X_test_prep_arr is not None
+                    else None
+                )
+                est_eval_train = evaluator.evaluate(
+                    est_learner, X_train_prep_for_eval_arr, y_train_for_eval, threshold=0.5
+                )
 
             est_loss = per_estimator_losses.get(est_name)
 
@@ -794,6 +1051,12 @@ def run_automl(
                 est_metrics_json["test_label"] = "Aucun jeu de test disponible"
                 est_metrics_json["evaluation_strategy"] = "train_only"
 
+            est_curves = _extract_curves_from_metrics(est_eval_test.metrics) if est_eval_test is not None else None
+            with _quiet_flaml_warnings():
+                est_learning_curve = _compute_automl_learning_curve(
+                    est_learner, X_train_prep_for_eval_arr, y_train_for_eval, cfg.task_type,
+                )
+
             est_artifacts_json: Dict[str, Any] = {
                 "automl": {
                     "best_estimator": est_name,
@@ -810,12 +1073,30 @@ def run_automl(
                 "feature_importance": _extract_feature_importance(est_learner, prep_names),
                 "confusion_matrix": est_cm,
                 "model": {"class_name": est_name, "params": _safe_dict(est_config)},
+                "preprocessing": preprocessing_block,
             }
+            if est_curves is not None:
+                est_artifacts_json["curves"] = est_curves
+            if est_learning_curve is not None:
+                est_artifacts_json["learning_curves"] = est_learning_curve
+            if shap_background_block:
+                est_artifacts_json["shap"] = shap_background_block
+
+            # Wrap the learner in an AutoMLPipeline so it shares the same
+            # raw-input → preprocess → predict contract as the best result.
+            # This makes prediction-time inference and SHAP/LIME work uniformly
+            # across all AutoML results — no special-casing downstream.
+            est_pipeline = AutoMLPipeline(
+                preprocessor=preprocessor,
+                automl=est_learner,
+                feature_names_in=original_feature_names,
+                prep_cols=prep_names,
+            )
 
             all_results.append(AutoMLRunResult(
                 metrics_json=est_metrics_json,
                 artifacts_json=est_artifacts_json,
-                fitted_model=est_learner,   # individual estimator (no preprocessing wrap)
+                fitted_model=est_pipeline,
                 task_type=cfg.task_type,
                 is_best=False,
             ))
@@ -851,11 +1132,7 @@ def _extract_feature_importance(estimator: Any, feature_names: List[str]) -> Lis
     Returns top 20 features sorted by importance descending.
     """
     try:
-        # Unwrap AutoMLPipeline if needed
-        real = estimator.automl if isinstance(estimator, AutoMLPipeline) else estimator
-
-        model = getattr(real, "model", None)
-        inner = getattr(model, "estimator", model) if model is not None else real
+        inner = _unwrap_to_sklearn(estimator)
 
         importances: Optional[np.ndarray] = None
         if hasattr(inner, "feature_importances_"):

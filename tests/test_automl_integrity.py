@@ -407,6 +407,44 @@ class TestAutoMLRunner:
         )
         assert budget_used <= 120, "budget_used_s dépasse le budget demandé par l'utilisateur"
 
+    def test_artifacts_expose_preprocessing_curves_and_learning_curves(self):
+        """
+        Pour permettre à la card UI d'afficher courbes ROC/PR, learning curve et
+        la préparation automatique, l'AutoML doit injecter trois artefacts :
+
+          - artifacts["preprocessing"]  : description du pipeline boîte noire
+          - artifacts["curves"]         : ROC/PR/calibration (binaire + has_test)
+          - artifacts["learning_curves"]: train size → score CV
+
+        L'absence d'un seul rend la section correspondante vide dans l'UI.
+        """
+        from app.services.training.automl_runner import run_automl
+        df = _make_binary_df(n=300, ir=1.0, seed=0)
+        results = run_automl(df, self._cfg(time_budget=10))
+        best = next(r for r in results if r.is_best)
+        artifacts = best.artifacts_json
+
+        prep = artifacts.get("preprocessing")
+        assert isinstance(prep, dict) and prep.get("mode") == "automl", (
+            f"artifacts['preprocessing'] absent ou mal formé : {prep!r}. "
+            "L'onglet 'Détails' n'afficherait pas la préparation automatique."
+        )
+        assert isinstance(prep.get("steps"), list) and len(prep["steps"]) > 0, (
+            "preprocessing['steps'] vide — l'utilisateur ne verrait aucune étape listée."
+        )
+
+        curves = artifacts.get("curves")
+        assert isinstance(curves, dict) and (curves.get("roc") or curves.get("pr")), (
+            f"artifacts['curves'] absent en binaire+holdout : {curves!r}. "
+            "L'onglet 'Courbes' afficherait 'Aucune courbe disponible'."
+        )
+
+        lc = artifacts.get("learning_curves")
+        assert isinstance(lc, dict) and isinstance(lc.get("train_sizes"), list), (
+            f"artifacts['learning_curves'] absent ou mal formé : {lc!r}. "
+            "La learning curve ne s'afficherait pas dans l'onglet 'Courbes'."
+        )
+
     def test_regression_task_type_and_rmse_in_results(self):
         """
         En mode régression, task_type doit être 'regression' et rmse (ou mae)
