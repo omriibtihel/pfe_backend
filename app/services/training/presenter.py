@@ -11,13 +11,6 @@ import logging
 from typing import Any, Optional
 
 from app.models.training import TrainedModel, TrainingSession
-from app.services.training.pipeline.cv_utils import _clean_scoring_name
-
-logger = logging.getLogger(__name__)
-
-
-class MetricNotApplicable(Exception):
-    """No valid metric is available for this model (expected, not a pipeline error)."""
 from app.schemas.training.results import (
     AnalysisBlock,
     AutoMLInfo,
@@ -36,6 +29,13 @@ from app.schemas.training.results import (
     ThresholdInfo,
     TrainingSessionResponse,
 )
+from app.services.training.pipeline.cv_utils import _clean_scoring_name
+
+logger = logging.getLogger(__name__)
+
+
+class MetricNotApplicable(Exception):
+    """No valid metric is available for this model (expected, not a pipeline error)."""
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Metric direction and evaluation source helpers

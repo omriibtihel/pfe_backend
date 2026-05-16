@@ -5,6 +5,7 @@ from typing import Tuple
 import pandas as pd
 from sqlalchemy.orm import Session
 
+from app.api.utils_shared.df import read_df
 from app.models.dataset_version import DatasetVersion
 
 
@@ -72,7 +73,6 @@ def _coerce_decimal_commas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_dataframe(path: Path) -> pd.DataFrame:
-    suffix = path.suffix.lower()
-    df = pd.read_excel(path) if suffix in (".xlsx", ".xls") else pd.read_csv(path)
+    df = read_df(path)
     df = _coerce_blank_strings_to_nan(df)
     return _coerce_decimal_commas(df)

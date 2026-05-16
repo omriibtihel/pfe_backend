@@ -943,6 +943,7 @@ def _run_holdout(
                 X_train_prepared,
                 np.asarray(split.y_train),
                 task_type=cfg.task_type,
+                random_state=cfg.random_state,
             )
         except Exception as e:
             _lc_result = None

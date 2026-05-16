@@ -18,8 +18,7 @@ def processed_path_for(dataset_file_path: str, dataset_id: int) -> Path:
 def load_current_df(dataset_file_path: str, dataset_id: int) -> pd.DataFrame:
     p = processed_path_for(dataset_file_path, dataset_id)
     if p.exists():
-        # low_memory=False pour eviter types bizarres
-        return pd.read_csv(p, low_memory=False)
+        return read_df(p)
     return read_df(Path(dataset_file_path))
 
 

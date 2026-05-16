@@ -1,15 +1,13 @@
-# app/api/routes/prediction.py
 from __future__ import annotations
 
 import io
 from datetime import datetime, timezone as _tz
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_current_user
+from app.api.deps import get_db, get_current_user, ensure_project_owner
 from app.models.project import Project
 from app.models.training import TrainedModel
 from app.schemas.training import ActiveModelOut, ManualPredictIn
@@ -28,13 +26,12 @@ from app.services.training.output.predictor import (
     compute_counterfactual_for_row,
     get_feature_ranges_for_model,
 )
-
-ExplainMethod = str  # "shap" | "lime" | "both" — validated below
-from app.api.deps import ensure_project_owner
 from app.services.training.presenter import (
     extract_feature_names_for_prediction,
     extract_threshold,
 )
+
+ExplainMethod = str  # "shap" | "lime" | "both" — validated below
 
 router = APIRouter()
 

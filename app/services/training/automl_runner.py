@@ -47,15 +47,18 @@ _AUTO_METRIC: dict[str, str] = {
 }
 
 
-# FLAML estimators kept after excluding LightGBM (feature-name issues on ndarray
-# inputs) and SAGA Logistic Regression ("lrl1"/"lrl2", unstable on tiny folds).
+# FLAML estimators kept after excluding:
+#   - LightGBM       (feature-name issues on ndarray inputs)
+#   - SAGA LogReg    ("lrl1"/"lrl2", unstable on tiny folds)
+#   - KNeighbors     (sklearn KNN.fit() rejects sample_weight; FLAML propagates
+#                     the run-level sample_weight to every estimator, so KNN
+#                     crashes the whole AutoML search whenever balancing is on).
 _AUTOML_ESTIMATORS: tuple[str, ...] = (
     "rf",
     "extra_tree",
     "xgboost",
     "xgb_limitdepth",
     "catboost",
-    "kneighbor",
 )
 
 # Warnings FLAML emits during internal CV that we cannot fix from this layer
@@ -76,6 +79,28 @@ def _quiet_flaml_warnings():
         for pattern in _FLAML_QUIET_MESSAGE_PATTERNS:
             warnings.filterwarnings("ignore", message=pattern, category=UserWarning)
         yield
+
+
+@contextlib.contextmanager
+def _isolated_cwd_for_training():
+    """Run the wrapped block from a throwaway directory.
+
+    FLAML's CatBoost estimator (and any other backend that writes training
+    artifacts relative to CWD) drops a ``catboost_<timestamp>/`` folder at the
+    process working directory. Without this guard the project root accumulates
+    one such folder per AutoML run. We chdir into a tmp dir, let those writes
+    happen there, and remove the dir on exit.
+    """
+    import shutil
+
+    original_cwd = os.getcwd()
+    tmp_dir = tempfile.mkdtemp(prefix="mv_automl_")
+    try:
+        os.chdir(tmp_dir)
+        yield tmp_dir
+    finally:
+        os.chdir(original_cwd)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 _FORBIDDEN_NAME_CHARS = frozenset('"]{,}:[<>')
@@ -520,7 +545,15 @@ def _learning_curve_estimator(model_or_pipeline: Any) -> Optional[Any]:
     """Return a fresh clone of the underlying sklearn estimator, or None."""
     try:
         inner = _unwrap_to_sklearn(model_or_pipeline)
-        return clone(inner) if inner is not None else None
+        if inner is None:
+            return None
+        cloned = clone(inner)
+        if "CatBoost" in type(cloned).__name__:
+            try:
+                cloned.set_params(allow_writing_files=False)
+            except Exception:
+                pass
+        return cloned
     except Exception as exc:
         logger.debug("AutoML learning-curve estimator unwrap failed: %s", exc)
         return None
@@ -556,6 +589,7 @@ def _compute_automl_learning_curve(
     X_train_prep: pd.DataFrame,
     y_train: np.ndarray,
     task_type: str,
+    random_state: int = 42,
 ) -> Optional[Dict[str, Any]]:
     """Run the standard learning-curve module on the preprocessed training matrix."""
     est = _learning_curve_estimator(model_or_pipeline)
@@ -567,6 +601,7 @@ def _compute_automl_learning_curve(
             np.asarray(X_train_prep),
             np.asarray(y_train),
             task_type=task_type,
+            random_state=random_state,
         )
     except Exception as exc:
         logger.warning("AutoML learning curve failed: %s", exc)
@@ -637,11 +672,11 @@ def run_automl(
         stratify = y if cfg.task_type == "classification" else None
         try:
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=cfg.test_ratio, random_state=42, stratify=stratify
+                X, y, test_size=cfg.test_ratio, random_state=cfg.random_state, stratify=stratify
             )
         except ValueError:
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=cfg.test_ratio, random_state=42
+                X, y, test_size=cfg.test_ratio, random_state=cfg.random_state
             )
         has_test = True
     else:
@@ -686,14 +721,14 @@ def run_automl(
                     X_train_prep, y_train,
                     test_size=0.15,
                     stratify=y_train,
-                    random_state=42,
+                    random_state=cfg.random_state,
                 )
             except ValueError:
                 # stratify fails when a class has too few samples — fall back to unstratified
                 X_train_prep, X_thresh, y_train, y_thresh = train_test_split(
                     X_train_prep, y_train,
                     test_size=0.15,
-                    random_state=42,
+                    random_state=cfg.random_state,
                 )
 
     # ── 4. SMOTE oversampling (binary classification, severe imbalance only) ─
@@ -716,7 +751,7 @@ def run_automl(
         y_train_for_eval = y_train.copy()
         try:
             from imblearn.over_sampling import SMOTE
-            smote = SMOTE(k_neighbors=_k_nn, random_state=42)
+            smote = SMOTE(k_neighbors=_k_nn, random_state=cfg.random_state)
             X_train_resampled, y_train_resampled = smote.fit_resample(
                 X_train_prep.values, y_train
             )
@@ -787,7 +822,7 @@ def run_automl(
 
     automl = AutoML()
     try:
-        with _quiet_flaml_warnings():
+        with _quiet_flaml_warnings(), _isolated_cwd_for_training():
             automl.fit(
                 X_train_prep_arr,
                 y_train,
@@ -873,6 +908,7 @@ def run_automl(
     with _quiet_flaml_warnings():
         learning_curve_block = _compute_automl_learning_curve(
             automl, X_train_prep_for_eval_arr, y_train_for_eval, cfg.task_type,
+            random_state=cfg.random_state,
         )
     preprocessing_block = _build_preprocessing_summary(
         preprocessor,
@@ -1055,6 +1091,7 @@ def run_automl(
             with _quiet_flaml_warnings():
                 est_learning_curve = _compute_automl_learning_curve(
                     est_learner, X_train_prep_for_eval_arr, y_train_for_eval, cfg.task_type,
+                    random_state=cfg.random_state,
                 )
 
             est_artifacts_json: Dict[str, Any] = {

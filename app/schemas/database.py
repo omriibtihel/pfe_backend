@@ -1,49 +1,10 @@
-# app/schemas/database.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Literal
 
-
-from app.schemas.dataset import DatasetOut
-
-
-from typing import Any
 from pydantic import BaseModel, Field
 
-
-class NumericStats(BaseModel):
-    count: int
-    mean: float | None = None
-    std: float | None = None
-    min: float | None = None
-    p25: float | None = None
-    p50: float | None = None
-    p75: float | None = None
-    max: float | None = None
-
-
-class TopValue(BaseModel):
-    value: str
-    count: int
-
-
-class CategoricalStats(BaseModel):
-    top_values: List[TopValue]
-
-
-
-class ColumnProfile(BaseModel):
-    name: str
-    kind: str  # "numeric" | "categorical" | "text" | "datetime" | "unknown"
-    dtype: str
-    missing: int
-    missing_pct: float
-    unique: int
-    unique_pct: float
-
-    # spécifiques
-    numeric: NumericStats | None = None
-    categorical: CategoricalStats | None = None
+from app.schemas.dataset import DatasetOut
 
 
 class CorrelationOut(BaseModel):

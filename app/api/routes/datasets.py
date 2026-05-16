@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user, ensure_project_owner
-from app.api.utils_shared.df import read_df
+from app.api.utils_shared.df import AmbiguousCsvSeparatorError, read_df
 from app.core.config import PROJECTS_PATH
 from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion
@@ -118,10 +118,9 @@ async def upload_dataset(
     )
 
     db.add(dataset)
-    db.flush()  # obtenir dataset.id sans commit
+    db.flush()
 
-    # Créer la version initiale dans la même transaction.
-    # Si elle échoue, on rollback ET on supprime le fichier déjà écrit.
+    # Si la création de la version initiale échoue, on rollback ET on supprime le fichier déjà écrit.
     versions_dir = PROJECTS_PATH / str(project_id) / "dataset_versions"
     versions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,9 +146,13 @@ async def upload_dataset(
         )
         db.add(raw_version)
         db.commit()
+    except AmbiguousCsvSeparatorError as exc:
+        db.rollback()
+        dst_path.unlink(missing_ok=True)
+        raw_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         db.rollback()
-        # Nettoyer les fichiers écrits sur disque
         dst_path.unlink(missing_ok=True)
         raw_path.unlink(missing_ok=True)
         raise HTTPException(

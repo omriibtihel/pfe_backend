@@ -22,6 +22,10 @@ env/
 storage/
 *.sqlite3
 
+# CatBoost training artifacts (legacy — kept as a safety net in case any
+# code path bypasses the isolated-cwd guard in automl_runner.py).
+catboost_*/
+
 models/*.pth
 *.pth
 

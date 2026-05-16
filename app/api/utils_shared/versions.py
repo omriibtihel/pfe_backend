@@ -6,17 +6,9 @@ import pandas as pd
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.api.utils_shared.df import read_df
 from app.core.config import PROJECTS_PATH
 from app.models.dataset_version import DatasetVersion
-
-
-def write_df_csv(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-
-
-def file_size_bytes(path: Path) -> int:
-    return path.stat().st_size if path.exists() else 0
 
 
 def resolve_version_path(project_id: int, version: DatasetVersion) -> Path:
@@ -47,6 +39,6 @@ def load_version_df(db: Session, project_id: int, version_id: int) -> pd.DataFra
     try:
         if path.suffix.lower() == ".parquet":
             return pd.read_parquet(path)
-        return pd.read_csv(path)
+        return read_df(path)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot read version file: {e}")

@@ -38,16 +38,15 @@ def _select_scoring(task_type: str, y: np.ndarray) -> str:
     return "f1" if n_classes == 2 else "f1_weighted"
 
 
-def _make_cv_splitter(task_type: str, y: np.ndarray, n_splits: int):
+def _make_cv_splitter(task_type: str, y: np.ndarray, n_splits: int, random_state: int = 42):
     """Stratified for classification when feasible, plain KFold otherwise."""
     if task_type != "classification":
-        return KFold(n_splits=n_splits, shuffle=True, random_state=42)
-    # Ensure every split has at least 1 sample per class
+        return KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     _, counts = np.unique(y, return_counts=True)
     safe_splits = min(n_splits, int(counts.min()))
     if safe_splits < 2:
-        return KFold(n_splits=max(2, n_splits), shuffle=True, random_state=42)
-    return StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=42)
+        return KFold(n_splits=max(2, n_splits), shuffle=True, random_state=random_state)
+    return StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=random_state)
 
 
 def compute_learning_curve(
@@ -79,7 +78,7 @@ def compute_learning_curve(
         Number of cross-validation folds inside each checkpoint (default 3
         for speed).
     random_state:
-        Unused directly here (cv splitter uses fixed 42 for reproducibility).
+        Seed propagated to the internal CV splitter for reproducibility.
 
     Returns
     -------
@@ -106,7 +105,7 @@ def compute_learning_curve(
         return None
 
     scoring = _select_scoring(task_type, y_arr)
-    cv = _make_cv_splitter(task_type, y_arr, cv_splits)
+    cv = _make_cv_splitter(task_type, y_arr, cv_splits, random_state=random_state)
 
     # Use fractions so sklearn handles the per-fold train-size math automatically.
     # sklearn's learning_curve trains on `fraction * max_train_size` samples where

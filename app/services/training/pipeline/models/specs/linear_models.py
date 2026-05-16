@@ -64,10 +64,10 @@ def get_specs() -> list[ModelSpec]:
             supports_sample_weight=True,
             default_params={
                 "classification": {
-                    "solver": "saga",
+                    "solver": "lbfgs",
                     "C": 1.0,
-                    "l1_ratio": 0,
-                    "max_iter": 4000,
+                    "max_iter": 10000,
+                    "tol": 1e-3,
                     "class_weight": None,
                     "random_state": 42,
                 },
@@ -75,15 +75,15 @@ def get_specs() -> list[ModelSpec]:
             param_grid={
                 "classification": {
                     "C":        [0.01, 0.1, 1.0, 10.0],
-                    "solver":   ["liblinear", "saga"],
-                    "l1_ratio": [0, 1],
+                    "solver":   ["lbfgs", "liblinear"],
+                    "max_iter": [5000, 10000],
                 },
             },
             param_distributions={
                 "classification": {
                     "C":            loguniform(1e-3, 100),
-                    "l1_ratio":     [0, 1],
-                    "solver":       ["liblinear", "saga"],
+                    "solver":       ["lbfgs", "liblinear"],
+                    "max_iter":     [5000, 10000, 20000],
                     "class_weight": ["balanced", None],
                 },
             },
@@ -184,7 +184,8 @@ def get_specs() -> list[ModelSpec]:
                 "regression": {
                     "alpha": 1.0,
                     "l1_ratio": 0.5,
-                    "max_iter": 2000,
+                    "max_iter": 10000,
+                    "tol": 1e-3,
                 },
             },
             param_grid={
@@ -215,7 +216,8 @@ def get_specs() -> list[ModelSpec]:
             default_params={
                 "regression": {
                     "alpha": 1.0,
-                    "max_iter": 2000,
+                    "max_iter": 10000,
+                    "tol": 1e-3,
                 },
             },
             param_grid={

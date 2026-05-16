@@ -344,6 +344,7 @@ def normalize_model_hyperparams(
     model_name = MODEL_REGISTRY.normalize_name(str(model_key or "").strip().lower())
     schema = MODEL_HP_SCHEMA.get(model_name, {})
     source_raw = params if isinstance(params, dict) else {}
+    normalized_task = str(task_type or "").strip().lower()
     schema_key_lookup = {str(field).strip().lower(): str(field) for field in schema.keys()}
     source: dict[str, Any] = {}
     unknown_fields: list[str] = []
@@ -465,7 +466,6 @@ def normalize_model_hyperparams(
 
     # Fill param_grid from schema.grid_values for any HP the user didn't override.
     if use_grid_search:
-        normalized_task = str(task_type or "").strip().lower()
         for field, field_schema in schema.items():
             if field in source or field in param_grid:
                 continue
@@ -502,31 +502,27 @@ def normalize_model_hyperparams(
         param_grid.pop("gamma", None)
         param_distributions.pop("gamma", None)
 
-    if model_name == "decisiontree" and str(task_type or "").strip().lower() == "regression":
-        criterion_was_requested = "criterion" in source
-        if criterion_was_requested or "criterion" in param_grid or "criterion" in param_distributions:
-            _push_issue(
-                "warning",
-                "HP_TASK_INCOMPATIBLE",
-                "decisiontree.criterion is classification-only and was removed for regression.",
-            )
-        effective.pop("criterion", None)
-        estimator_params.pop("criterion", None)
-        param_grid.pop("criterion", None)
-        param_distributions.pop("criterion", None)
-
-    # class_weight is classification-only — strip it unconditionally in regression.
-    if "class_weight" in schema and str(task_type or "").strip().lower() == "regression":
-        if "class_weight" in source:
-            _push_issue(
-                "warning",
-                "HP_TASK_INCOMPATIBLE",
-                f"{model_name}.class_weight is classification-only and was removed for regression.",
-            )
-        effective.pop("class_weight", None)
-        estimator_params.pop("class_weight", None)
-        param_grid.pop("class_weight", None)
-        param_distributions.pop("class_weight", None)
+    # Generic task-compatibility filter: any schema field that declares
+    # `supported_in` must be stripped from the estimator/grid when the
+    # current task is not in that list. This catches e.g. svm.epsilon
+    # (regression-only) being injected into SVC(**params).
+    if normalized_task:
+        for field, field_schema in schema.items():
+            supported_in = field_schema.get("supported_in")
+            if not (isinstance(supported_in, list) and supported_in):
+                continue
+            if normalized_task in supported_in:
+                continue
+            if field in source:
+                _push_issue(
+                    "warning",
+                    "HP_TASK_INCOMPATIBLE",
+                    f"{model_name}.{field} is not supported for task '{normalized_task}' and was removed.",
+                )
+            effective.pop(field, None)
+            estimator_params.pop(field, None)
+            param_grid.pop(field, None)
+            param_distributions.pop(field, None)
 
     for key in list(estimator_params.keys()):
         if key in param_grid and isinstance(param_grid.get(key), list):

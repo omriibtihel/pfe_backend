@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from app.api.utils_shared.df import read_csv_bytes
 from app.models.training import TrainedModel
 from app.services.training.output.persistence import load_pipeline
 
@@ -29,9 +30,9 @@ def read_uploaded_dataframe(filename: str, content: bytes) -> pd.DataFrame:
     if not content:
         raise RuntimeError("Uploaded file is empty.")
 
-    buff = io.BytesIO(content)
     if name.endswith(".csv") or name.endswith(".txt"):
-        return pd.read_csv(buff)
+        return read_csv_bytes(content)
+    buff = io.BytesIO(content)
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(buff)
     if name.endswith(".json"):
@@ -390,6 +391,7 @@ def predict_with_trained_model(
     raw_df: pd.DataFrame,
     *,
     _preloaded_pipeline: Any = None,
+    _out_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run inference on raw_df using the fitted pipeline stored in trained_model.
@@ -466,6 +468,11 @@ def predict_with_trained_model(
     # categorical strings → pd.Categorical with XGBoost enable_categorical support).
     raw_df = _normalize_input_dtypes(raw_df, pipeline)
 
+    # Expose the post-alignment frame to callers that need it for downstream
+    # work (SHAP / LIME enrichment) so they don't repeat the work.
+    if _out_state is not None:
+        _out_state["aligned_df"] = raw_df
+
     y_pred, y_score = _run_inference(pipeline, raw_df, task_type, threshold, positive_class_index)
 
     rows = _build_rows(y_pred, y_score, display_df)
@@ -540,7 +547,14 @@ def predict_with_explanations(
                 pass
 
     # Core prediction — raises on failure (pkl missing, inference error, etc.)
-    result = predict_with_trained_model(trained_model, raw_df, _preloaded_pipeline=_shared_pipeline)
+    # Capture the post-alignment DataFrame so the enrichment step below can
+    # reuse it instead of redoing the (non-trivial) dtype normalisation.
+    state: Dict[str, Any] = {}
+    result = predict_with_trained_model(
+        trained_model, raw_df,
+        _preloaded_pipeline=_shared_pipeline,
+        _out_state=state,
+    )
 
     if _shared_pipeline is None:
         return result
@@ -569,13 +583,17 @@ def predict_with_explanations(
         _balancing_info = artifacts.get("balancing") or {}
         _artifact_positive_label: Optional[str] = _balancing_info.get("positive_label")
 
-        # Align inputs the same way predict_with_trained_model does
-        df_aligned = _normalize_input_dtypes(raw_df.copy(), pipeline)
-        if feature_names:
-            for col in feature_names:
-                if col not in df_aligned.columns:
-                    df_aligned[col] = np.nan
-            df_aligned = df_aligned[feature_names]
+        # Reuse the aligned DataFrame computed inside predict_with_trained_model.
+        # Fallback path keeps backward-compatibility if state was not populated
+        # (e.g. a future call site forgets to pass _out_state).
+        df_aligned = state.get("aligned_df")
+        if df_aligned is None:
+            df_aligned = _normalize_input_dtypes(raw_df.copy(), pipeline)
+            if feature_names:
+                for col in feature_names:
+                    if col not in df_aligned.columns:
+                        df_aligned[col] = np.nan
+                df_aligned = df_aligned[feature_names]
 
         want_shap = method in ("shap", "both")
         want_lime = method in ("lime", "both")
