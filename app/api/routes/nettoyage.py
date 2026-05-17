@@ -11,7 +11,11 @@ from pydantic import BaseModel
 
 from app.api.deps import ensure_project_owner, get_current_user, get_db
 from app.api.utils_shared.datasets import get_dataset_or_404
-from app.api.utils_shared.workspaces import create_fresh_workspace_for_dataset
+from app.api.utils_shared.workspaces import (
+    create_fresh_workspace_for_dataset,
+    delete_workspace_dataset,
+    find_active_dataset_workspace,
+)
 from app.crud import nettoyage as crud_nettoyage
 from app.schemas.nettoyage import OperationIn, OperationOut
 from app.services.nettoyage.df_utils import load_current_df, processed_path_for
@@ -103,10 +107,10 @@ def apply_operation(
         rebuild_processed(db, project_id, dataset_id)
     except IOError as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Cleaning could not be persisted to disk: {e}")
+        raise HTTPException(status_code=500, detail=f"Cleaning could not be persisted to disk: {e}") from e
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Step 2: commit DB only after the file is safely on disk.
     try:
@@ -117,7 +121,7 @@ def apply_operation(
         raise HTTPException(
             status_code=500,
             detail=f"Cleaning written to disk but DB record failed — file cleaned up: {e}",
-        )
+        ) from e
 
     db.refresh(op)
     return op
@@ -180,36 +184,36 @@ def undo_last(
     if not last:
         return {"ok": False, "reason": "no_operations"}
 
-    if last.op_type == "cleaning":
-        # Step 1: stage the deletion then rebuild the file WITHOUT this operation.
-        # If the disk write fails, rollback restores the record — no data loss.
+    # Capturer l'identité avant suppression : après `db.delete(last)` + commit,
+    # l'objet est détaché et accéder à `last.id` peut lever `DetachedInstanceError`.
+    last_type = last.op_type
+    last_id = last.id
+
+    if last_type == "cleaning":
+        # Transaction atomique : delete + rebuild (qui re-écrit le fichier sans
+        # l'op supprimée), PUIS commit. Si le rebuild échoue, le rollback
+        # restaure l'op — pas de perte de donnée et pas de divergence DB/fichier.
         db.delete(last)
         db.flush()
 
         try:
             rebuild_processed(db, project_id, dataset_id)
+            db.commit()
         except IOError as e:
             db.rollback()
             raise HTTPException(
                 status_code=500,
                 detail=f"Undo failed at disk write — operation record preserved: {e}",
-            )
-
-        # Step 2: commit only after the file is on disk and consistent.
-        try:
-            db.commit()
+            ) from e
         except Exception as e:
             db.rollback()
-            raise HTTPException(
-                status_code=500,
-                detail=f"Undo written to disk but DB cleanup failed: {e}",
-            )
+            raise HTTPException(status_code=500, detail=f"Undo failed: {e}") from e
     else:
-        # Schema operations have no file side-effect — direct delete is safe.
+        # Les ops schema n'ont pas d'effet fichier — suppression directe.
         db.delete(last)
         db.commit()
 
-    return {"ok": True, "undone_type": last.op_type, "undone_id": last.id}
+    return {"ok": True, "undone_type": last_type, "undone_id": last_id}
 
 
 @router.get("/datasets/{dataset_id}/nettoyage/preview")
@@ -294,6 +298,29 @@ def create_dataset_workspace(
     ensure_project_owner(db, project_id, current_user.id)
     ws = create_fresh_workspace_for_dataset(db, project_id, dataset_id, current_user.id)
     return {"workspace_dataset_id": ws.id}
+
+
+@router.delete("/datasets/{dataset_id}/nettoyage/workspace")
+def close_dataset_workspace(
+    project_id: int,
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Ferme explicitement le raw_workspace de ce dataset (cleanup côté client).
+
+    Idempotent : retourne `ok=True` même si aucun workspace n'est actif. Permet
+    au frontend d'appeler ça systématiquement en `unload` sans gérer le cas
+    "déjà fermé".
+    """
+    ensure_project_owner(db, project_id, current_user.id)
+    ws = find_active_dataset_workspace(db, project_id, dataset_id, current_user.id)
+    if not ws:
+        return {"ok": True, "closed": False}
+
+    delete_workspace_dataset(db, ws)
+    db.commit()
+    return {"ok": True, "closed": True}
 
 
 class SaveVersionBody(BaseModel):

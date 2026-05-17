@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import PROJECTS_PATH
@@ -15,6 +17,8 @@ from app.models.dataset import Dataset
 from app.models.dataset_version import DatasetVersion
 from app.models.processing_operation import ProcessingOperation
 from app.services.nettoyage.rebuild import rebuild_processed
+
+logger = logging.getLogger(__name__)
 
 
 def _workspace_dir(project_id: int) -> Path:
@@ -37,6 +41,61 @@ def _parse_ops_json(operations_json: str) -> list[dict]:
         return []
 
 
+def _safe_remove_workspace_files(ws_path: str | None, ws_id: int) -> None:
+    """Best-effort suppression du fichier source + processed associé.
+
+    Les erreurs sont *logguées* mais n'interrompent pas l'appelant — la
+    suppression est non-critique (TTL prendra le relais sinon).
+    """
+    if not ws_path:
+        return
+    try:
+        if os.path.exists(ws_path):
+            os.remove(ws_path)
+    except OSError as e:
+        logger.warning("Failed to remove workspace file %s: %s", ws_path, e)
+    try:
+        processed = Path(ws_path).parent / f"processed_dataset_{ws_id}.csv"
+        if processed.exists():
+            processed.unlink()
+    except OSError as e:
+        logger.warning("Failed to remove processed file for workspace %s: %s", ws_id, e)
+
+
+def delete_workspace_dataset(db: Session, ws: Dataset) -> None:
+    """Supprime un workspace dataset : ops associées + ligne DB + fichiers disque.
+
+    Capture le `file_path` et le `id` **avant** la suppression — accéder à
+    `ws.id` après `db.delete(ws) + db.commit()` peut lever `DetachedInstanceError`
+    selon la config de la session.
+    """
+    ws_path = ws.file_path
+    ws_id = ws.id
+
+    db.query(ProcessingOperation).filter(
+        ProcessingOperation.dataset_id == ws_id,
+    ).delete(synchronize_session=False)
+    db.delete(ws)
+    db.flush()
+
+    _safe_remove_workspace_files(ws_path, ws_id)
+
+
+def _delete_workspaces_bulk(db: Session, workspaces: list[Dataset]) -> None:
+    """Supprime un lot de workspaces (ops + DB + fichiers)."""
+    if not workspaces:
+        return
+    snapshots = [(ws.file_path, ws.id) for ws in workspaces]
+    for ws in workspaces:
+        db.query(ProcessingOperation).filter(
+            ProcessingOperation.dataset_id == ws.id,
+        ).delete(synchronize_session=False)
+        db.delete(ws)
+    db.flush()
+    for ws_path, ws_id in snapshots:
+        _safe_remove_workspace_files(ws_path, ws_id)
+
+
 def _cleanup_expired_workspaces(
     db: Session, project_id: int, version_id: int, user_id: int
 ) -> None:
@@ -53,28 +112,7 @@ def _cleanup_expired_workspaces(
         )
         .all()
     )
-
-    paths_to_delete = [(ws.file_path, ws.id) for ws in expired]
-
-    for ws in expired:
-        db.query(ProcessingOperation).filter(
-            ProcessingOperation.dataset_id == ws.id,
-        ).delete(synchronize_session=False)
-        db.delete(ws)
-
-    if expired:
-        db.flush()
-
-    for ws_path, ws_id in paths_to_delete:
-        try:
-            if ws_path and os.path.exists(ws_path):
-                os.remove(ws_path)
-            if ws_path:
-                processed = Path(ws_path).parent / f"processed_dataset_{ws_id}.csv"
-                if processed.exists():
-                    processed.unlink()
-        except Exception:
-            pass
+    _delete_workspaces_bulk(db, expired)
 
 
 def _purge_raw_workspaces(
@@ -91,28 +129,43 @@ def _purge_raw_workspaces(
         )
         .all()
     )
+    _delete_workspaces_bulk(db, existing)
 
-    paths_to_delete = [(ws.file_path, ws.id) for ws in existing]
 
-    for ws in existing:
-        db.query(ProcessingOperation).filter(
-            ProcessingOperation.dataset_id == ws.id,
-        ).delete(synchronize_session=False)
-        db.delete(ws)
+def find_active_version_workspace(
+    db: Session, project_id: int, version_id: int, user_id: int
+) -> Dataset | None:
+    """Retourne le workspace actif d'une version pour l'utilisateur, ou None."""
+    return (
+        db.query(Dataset)
+        .filter(
+            Dataset.project_id == project_id,
+            Dataset.kind == "workspace",
+            Dataset.workspace_owner_version_id == version_id,
+            Dataset.workspace_owner_user_id == user_id,
+            Dataset.is_workspace_active.is_(True),
+        )
+        .order_by(Dataset.id.desc())
+        .first()
+    )
 
-    if existing:
-        db.flush()
 
-    for ws_path, ws_id in paths_to_delete:
-        try:
-            if ws_path and os.path.exists(ws_path):
-                os.remove(ws_path)
-            if ws_path:
-                processed = Path(ws_path).parent / f"processed_dataset_{ws_id}.csv"
-                if processed.exists():
-                    processed.unlink()
-        except Exception:
-            pass
+def find_active_dataset_workspace(
+    db: Session, project_id: int, dataset_id: int, user_id: int
+) -> Dataset | None:
+    """Retourne le raw_workspace actif d'un dataset pour l'utilisateur, ou None."""
+    return (
+        db.query(Dataset)
+        .filter(
+            Dataset.project_id == project_id,
+            Dataset.kind == "raw_workspace",
+            Dataset.workspace_source_dataset_id == dataset_id,
+            Dataset.workspace_owner_user_id == user_id,
+            Dataset.is_workspace_active.is_(True),
+        )
+        .order_by(Dataset.id.desc())
+        .first()
+    )
 
 
 def create_fresh_workspace_for_dataset(
@@ -126,6 +179,10 @@ def create_fresh_workspace_for_dataset(
     Crée toujours un nouveau workspace propre pour le nettoyage d'un dataset brut.
     Les workspaces précédents sont supprimés — chaque session repart de zéro.
     Le dataset source (kind='source') n'est jamais touché.
+
+    Race-safe : si deux requêtes concurrentes appellent cette fonction, l'une
+    crée un workspace et l'autre re-fetch le gagnant (via l'index unique partiel
+    `uq_active_dataset_workspace_per_owner` de la migration b8f9a0c2d345).
     """
     _purge_raw_workspaces(db, project_id, dataset_id, user_id)
 
@@ -161,7 +218,17 @@ def create_fresh_workspace_for_dataset(
     )
 
     db.add(ws_dataset)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # Race : un autre thread a créé un workspace entre notre purge et notre
+        # INSERT. On rollback et on retourne le gagnant — l'utilisateur perçoit
+        # un workspace "frais" même s'il n'a pas été créé par cet appel précis.
+        db.rollback()
+        winner = find_active_dataset_workspace(db, project_id, dataset_id, user_id)
+        if winner is None:
+            raise
+        return winner
 
     _clone_file(raw.file_path, ws_dataset.file_path)
 
@@ -172,20 +239,11 @@ def create_fresh_workspace_for_dataset(
     return ws_dataset
 
 
-def get_or_create_workspace_for_version(
-    db: Session,
-    project_id: int,
-    version_id: int,
-    user_id: int,
-    ttl_hours: int = 12,
-) -> Dataset:
-    """
-    Retourne le workspace actif et non expiré pour (project_id, version_id, user_id).
-    Si aucun n'existe ou s'il est expiré, nettoie l'ancien et en crée un nouveau.
-    """
+def _find_unexpired_version_workspace(
+    db: Session, project_id: int, version_id: int, user_id: int
+) -> Dataset | None:
     now = datetime.utcnow()
-
-    ws = (
+    return (
         db.query(Dataset)
         .filter(
             Dataset.project_id == project_id,
@@ -198,10 +256,29 @@ def get_or_create_workspace_for_version(
         .order_by(Dataset.id.desc())
         .first()
     )
+
+
+def get_or_create_workspace_for_version(
+    db: Session,
+    project_id: int,
+    version_id: int,
+    user_id: int,
+    ttl_hours: int = 12,
+) -> Dataset:
+    """
+    Retourne le workspace actif et non expiré pour (project_id, version_id, user_id).
+    Si aucun n'existe ou s'il est expiré, nettoie l'ancien et en crée un nouveau.
+
+    Robuste aux conditions de course (cf. index `uq_active_version_workspace_per_owner`
+    de la migration b8f9a0c2d345) : si deux requêtes concurrentes tentent de créer
+    simultanément, l'une réussit et l'autre re-fetch le gagnant.
+    """
+    # 1) Fast path : un workspace actif existe déjà
+    ws = _find_unexpired_version_workspace(db, project_id, version_id, user_id)
     if ws:
         return ws
 
-    # Nettoyer les workspaces expirés avant d'en créer un nouveau
+    # 2) Cleanup des expirés avant création
     _cleanup_expired_workspaces(db, project_id, version_id, user_id)
 
     version = (
@@ -212,7 +289,8 @@ def get_or_create_workspace_for_version(
     if not version:
         raise ValueError("Version not found")
 
-    # dataset workspace
+    # 3) Tentative de création. En cas de race (l'index unique partiel rejette
+    #    le second INSERT), on rollback et on re-fetch le workspace gagnant.
     stored_name = f"ws_v{version_id}_u{user_id}_{uuid4().hex}"
     ws_path = str(_workspace_dir(project_id) / f"{stored_name}.csv")
 
@@ -231,12 +309,20 @@ def get_or_create_workspace_for_version(
     )
 
     db.add(ws_dataset)
-    db.flush()  # ws_dataset.id
+    try:
+        db.flush()  # déclenche l'INSERT et donc la violation d'unique si race
+    except IntegrityError:
+        db.rollback()
+        winner = _find_unexpired_version_workspace(db, project_id, version_id, user_id)
+        if winner is None:
+            # Ne devrait jamais arriver : l'INSERT concurrent a forcément
+            # produit un workspace visible une fois committé.
+            raise
+        return winner
 
-    # clone file
+    # 4) Clone du fichier + seed des ops historiques
     _clone_file(version.file_path, ws_dataset.file_path)
 
-    # seed ops (version.operations_json -> ProcessingOperation rows)
     ops = _parse_ops_json(version.operations_json)
     for item in ops:
         op_type = item.get("op_type") or item.get("type") or "other"
@@ -252,9 +338,7 @@ def get_or_create_workspace_for_version(
         db.add(op)
 
     db.flush()
-
-    # ✅ rebuild pour que preview/charts soient cohérents dès le début
-    rebuild_processed(db, project_id, ws_dataset.id)
+    rebuild_processed(db, project_id, ws_dataset.id)  # cohérence preview/charts
 
     db.commit()
     db.refresh(ws_dataset)

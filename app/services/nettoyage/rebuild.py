@@ -335,23 +335,6 @@ def compute_operation_effect(before: pd.DataFrame, after: pd.DataFrame, params: 
     return eff
 
 
-def _legacy_infer_action(description: str | None) -> str | None:
-    desc = (description or "").lower()
-    if any(k in desc for k in ["rename", "renomm"]):
-        return "rename_columns"
-    if any(k in desc for k in ["doubl", "duplicate"]):
-        return "drop_duplicates"
-    if any(k in desc for k in ["vide", "empty", "blank"]):
-        return "drop_empty_rows"
-    if any(k in desc for k in ["strip", "trim", "espaces"]):
-        return "strip_whitespace"
-    if any(k in desc for k in ["substitut", "replace"]):
-        return "substitute_values"
-    if any(k in desc for k in ["supprim", "drop"]):
-        return "drop_columns"
-    return None
-
-
 def _update_alias_map(alias: dict[str, str], applied_rename: dict[str, str]) -> None:
     if not applied_rename:
         return
@@ -381,8 +364,6 @@ def _apply_one(
     cols: list[str],
     params: dict,
     alias_map: dict[str, str],
-    *,
-    description: str | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     if op_type != "cleaning":
         raise ValueError(
@@ -391,7 +372,15 @@ def _apply_one(
         )
 
     params = params or {}
-    action = params.get("action") or _legacy_infer_action(description)
+    action = params.get("action")
+    if action is None:
+        # Invariante post-migration `a7e8d9c1f234` : toute op `cleaning` a un
+        # `params.action` explicite. Si on tombe ici, c'est une donnée corrompue
+        # (op insérée hors API) — on échoue franchement plutôt que de deviner.
+        raise ValueError(
+            "Cleaning: `params.action` is required. "
+            "Legacy ops should have been backfilled by migration a7e8d9c1f234."
+        )
     if action not in ALLOWED_CLEANING_ACTIONS:
         raise ValueError(f"Cleaning: action inconnue: {action}. Allowed={sorted(ALLOWED_CLEANING_ACTIONS)}")
 
@@ -501,7 +490,6 @@ def rebuild_processed(db: Session, project_id: int, dataset_id: int) -> None:
             cols=raw_cols,
             params=op.params or {},
             alias_map=alias_map,
-            description=getattr(op, "description", None),
         )
 
         try:

@@ -370,6 +370,23 @@ def _serialize_operation(op: Any) -> dict:
     }
 
 
+def _write_csv_atomic(df: pd.DataFrame, target: Path) -> int:
+    """Écrit `df` en CSV via temp + rename atomique. Renvoie la taille en octets."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.tmp")
+    try:
+        df.to_csv(tmp, index=False)
+        tmp.replace(target)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+    return target.stat().st_size
+
+
 def save_cleaned_as_version(
     db: Session,
     project_id: int,
@@ -378,34 +395,38 @@ def save_cleaned_as_version(
     df: pd.DataFrame,
     body_name: str,
 ) -> dict:
-    """Persist *df* as a new DatasetVersion, capturing the operation chain."""
-    ops = crud_nettoyage.list_operations(db, project_id, dataset_id)
-    ops_payload = [_serialize_operation(o) for o in ops]
+    """Persiste *df* comme nouvelle DatasetVersion + capture la chaîne d'opérations.
 
-    versions_dir = PROJECTS_PATH / str(project_id) / "dataset_versions"
-    versions_dir.mkdir(parents=True, exist_ok=True)
+    Si `src` est un raw_workspace, le workspace est supprimé après création de
+    la version (symétrique avec `commit_workspace` pour les versions). Tout
+    est fait dans une seule transaction : si le commit échoue, le fichier
+    orphelin est nettoyé et la DB reste cohérente.
+    """
+    # Import différé : workspaces.py importe rebuild qui importe processing_ops.
+    from app.api.utils_shared.workspaces import delete_workspace_dataset
+
+    ops = crud_nettoyage.list_operations(db, project_id, dataset_id)
+    operations_json = json.dumps(
+        [_serialize_operation(o) for o in ops], ensure_ascii=False, default=str,
+    )
 
     safe_stem = Path(src.original_name).stem or f"dataset_{dataset_id}"
     version_name = body_name.strip() if body_name and body_name.strip() else f"{safe_stem}_cleaned"
 
+    versions_dir = PROJECTS_PATH / str(project_id) / "dataset_versions"
     stored_name = f"{uuid4().hex}.csv"
     dst_path = versions_dir / stored_name
 
-    df.to_csv(dst_path, index=False)
-    size_bytes = dst_path.stat().st_size
+    # 1) Écriture atomique du fichier — AVANT toute mutation DB.
+    size_bytes = _write_csv_atomic(df, dst_path)
 
     target_value = getattr(src, "target_column", None)
     if target_value and target_value not in [str(c) for c in df.columns]:
         target_value = None
-    can_predict = bool(target_value)
-
-    operations_json = json.dumps(ops_payload, ensure_ascii=False, default=str)
 
     src_kind = getattr(src, "kind", "source")
-    if src_kind == "raw_workspace" and getattr(src, "workspace_source_dataset_id", None):
-        real_source_id = src.workspace_source_dataset_id
-    else:
-        real_source_id = src.id
+    is_workspace = src_kind == "raw_workspace" and getattr(src, "workspace_source_dataset_id", None)
+    real_source_id = src.workspace_source_dataset_id if is_workspace else src.id
 
     new_version = DatasetVersion(
         project_id=project_id,
@@ -416,14 +437,27 @@ def save_cleaned_as_version(
         content_type="text/csv",
         size_bytes=size_bytes,
         target_column=target_value,
-        can_predict=can_predict,
+        can_predict=bool(target_value),
         operations_json=operations_json,
     )
-
     db.add(new_version)
-    db.commit()
-    db.refresh(new_version)
 
+    # 2) Cleanup du workspace dans la MÊME transaction.
+    if is_workspace:
+        delete_workspace_dataset(db, src)
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        # Nettoyer le fichier orphelin pour éviter la fuite disque.
+        try:
+            dst_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    db.refresh(new_version)
     return {
         "version_id": new_version.id,
         "project_id": new_version.project_id,

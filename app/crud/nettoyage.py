@@ -81,37 +81,16 @@ def get_last_operation(
     )
 
 
-def pop_last_operation(
-    db: Session,
-    project_id: int,
-    dataset_id: int,
-    op_type: str | None = None,
-) -> Optional[ProcessingOperation]:
-    q = (
-        db.query(ProcessingOperation)
-        .filter(
-            ProcessingOperation.project_id == project_id,
-            ProcessingOperation.dataset_id == dataset_id,
-        )
-        .order_by(ProcessingOperation.created_at.desc())
-    )
-
-    if op_type:
-        q = q.filter(ProcessingOperation.op_type == op_type)
-
-    last = q.first()
-    if not last:
-        return None
-
-    db.delete(last)
-    db.commit()
-    return last
-
-
 def set_operation_result(db: Session, op_id: int, result: dict) -> None:
     """
     Store a JSON-safe '__result' payload inside op.params.
-    Useful for returning detailed summaries per operation.
+
+    NOTE: this function stages the update via `db.add()` but does NOT commit.
+    Commit ownership belongs to the calling route — see the apply/undo flows
+    in `app/api/routes/nettoyage.py` which need a single atomic transaction
+    spanning the operation record, the rebuild's per-op results, AND the
+    processed file on disk. A per-call commit here would split the transaction
+    and leave the DB ahead of the file if the disk write later fails.
     """
     op = db.query(ProcessingOperation).filter(ProcessingOperation.id == op_id).first()
     if not op:
@@ -122,7 +101,6 @@ def set_operation_result(db: Session, op_id: int, result: dict) -> None:
     op.params = p
 
     db.add(op)
-    db.commit()
 
 
 # -----------------------------
