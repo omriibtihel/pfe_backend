@@ -86,6 +86,69 @@ def _metric_to_scoring(metric_name: str, *, task_type: str, binary: bool) -> str
     return None
 
 
+# Scorers that take ``pos_label`` directly via ``make_scorer(**kwargs)``.
+_BINARY_PREDICT_SCORERS: Dict[str, str] = {
+    "f1":        "f1_score",
+    "precision": "precision_score",
+    "recall":    "recall_score",
+}
+
+# Scorers based on probability scores whose underlying metric function does
+# NOT accept a ``pos_label`` kwarg (``roc_auc_score`` / ``average_precision_score``).
+# For these we build a fully custom callable scorer that slices predict_proba
+# to the positive class column based on the estimator's ``classes_``.
+_BINARY_PROBA_SCORERS: Dict[str, str] = {
+    "roc_auc":           "roc_auc_score",
+    "average_precision": "average_precision_score",
+}
+
+
+def _build_scoring_for_labels(refit_metric: str, positive_label: Any) -> Any:
+    """Return a scorer compatible with the labels at hand.
+
+    sklearn's string scorers (``"f1"``, ``"roc_auc"`` …) default to
+    ``pos_label=1``.  When binary labels are non-numeric (e.g. ``['B','M']``)
+    they raise ``ValueError: pos_label=1 is not a valid label``.
+
+    Strategy:
+      * For ``f1`` / ``precision`` / ``recall`` — ``make_scorer(pos_label=…)``
+        works because the underlying metric accepts the kwarg.
+      * For ``roc_auc`` / ``average_precision`` — the underlying metric does
+        NOT accept ``pos_label``; we build a custom callable scorer that
+        selects the right ``predict_proba`` column from ``estimator.classes_``
+        and binarises ``y_true`` to ``(y_true == positive_label)``.
+
+    Returns the original scoring string when no override is needed.
+    """
+    if positive_label is None:
+        return refit_metric
+
+    name = str(refit_metric or "").strip()
+    from sklearn import metrics as _sk_metrics
+
+    if name in _BINARY_PREDICT_SCORERS:
+        from sklearn.metrics import make_scorer
+        metric_fn = getattr(_sk_metrics, _BINARY_PREDICT_SCORERS[name])
+        return make_scorer(metric_fn, response_method="predict", pos_label=positive_label)
+
+    if name in _BINARY_PROBA_SCORERS:
+        metric_fn = getattr(_sk_metrics, _BINARY_PROBA_SCORERS[name])
+        pos = positive_label
+
+        def _proba_scorer(estimator, X, y_true):
+            proba = estimator.predict_proba(X)
+            classes = np.asarray(getattr(estimator, "classes_", None))
+            idx_arr = np.flatnonzero(classes == pos) if classes is not None else np.array([])
+            col = int(idx_arr[0]) if idx_arr.size else (1 if proba.shape[1] >= 2 else 0)
+            y_score = proba[:, col]
+            y_true_bin = (np.asarray(y_true) == pos).astype(int)
+            return float(metric_fn(y_true_bin, y_score))
+
+        return _proba_scorer
+
+    return refit_metric
+
+
 def _choose_refit_metric(task_type: str, y_train: np.ndarray, requested_metrics: Sequence[str]) -> str:
     binary = is_binary(y_train)
     if task_type == "classification":

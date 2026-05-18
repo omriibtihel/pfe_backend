@@ -47,7 +47,11 @@ from app.services.training.config.schema import (
 from app.services.training.output.audit import build_and_persist_audit
 from app.services.training.output.reporter import Reporter, build_training_schema
 from app.services.training.pipeline.confidence import compute_bootstrap_cis
-from app.services.training.pipeline.cv_utils import _build_cv_splitter, _choose_refit_metric
+from app.services.training.pipeline.cv_utils import (
+    _build_cv_splitter,
+    _build_scoring_for_labels,
+    _choose_refit_metric,
+)
 from app.services.training.pipeline.evaluator import Evaluator
 from app.services.training.pipeline.models import build_model, get_model_capabilities
 from app.services.training.pipeline.trainer import Trainer
@@ -335,6 +339,10 @@ def _run_kfold_cv(
     use_nested_cv = bool(cfg.use_grid_search) and bool(nested_param_grid)
     inner_k = int(getattr(cfg, "inner_cv_folds", 3))
     inner_scoring = _choose_refit_metric(cfg.task_type, y_cv, list(cfg.metrics))
+    # When labels are non-numeric (e.g. ['B','M']) the default sklearn string
+    # scorer uses ``pos_label=1`` and fails inside each fold's inner GridSearch.
+    # Rebuild the scorer with the resolved positive label.
+    inner_scoring = _build_scoring_for_labels(inner_scoring, resolved_positive_label)
     if use_nested_cv:
         _log_event(
             "training.cv.nested_cv_enabled",
@@ -862,6 +870,7 @@ def _run_kfold_cv(
         resampler=_final_resampler_for_gs,
         n_samples=int(len(y_final_f)),
         imbalanced=_final_is_imbalanced,
+        positive_label=resolved_positive_label,
     )
 
     final_fitted_model = final_fit_result.fitted_pipeline.named_steps.get("model")
@@ -1566,6 +1575,7 @@ def _run_loo(
         resampler=_loo_resampler_for_gs,
         n_samples=int(len(y_final_f)),
         imbalanced=False,
+        positive_label=resolved_positive_label,
     )
 
     final_fitted_model = final_fit_result.fitted_pipeline.named_steps.get("model")

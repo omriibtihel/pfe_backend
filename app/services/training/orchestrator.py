@@ -738,6 +738,7 @@ def _run_holdout(
         resampler=resampler_for_gs,
         n_samples=int(len(y_f)),
         imbalanced=_is_imbalanced,
+        positive_label=resolved_positive_label,
     )
 
     fitted_model = fit_result.fitted_pipeline.named_steps.get("model")

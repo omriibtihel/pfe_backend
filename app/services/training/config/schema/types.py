@@ -572,11 +572,30 @@ MODEL_HP_SCHEMA: dict[str, dict[str, dict[str, Any]]] = {
         },
         "max_iter": {
             "type": "int",
-            "default": 500,
+            "default": 1000,
             "min": 50,
             "max": 5000,
-            "grid_values": [500, 1000],
-            "help": "Nombre maximal d'itérations d'optimisation.",
+            "grid_values": [500, 1000, 2000],
+            "help": "Nombre maximal d'itérations d'optimisation. Avec early_stopping activé, l'entraînement s'arrête généralement bien avant.",
+        },
+        "early_stopping": {
+            "type": "bool",
+            "default": True,
+            "help": "Active l'arrêt anticipé sur un jeu de validation interne — évite l'overfitting et stoppe quand le score plateau.",
+        },
+        "n_iter_no_change": {
+            "type": "int",
+            "default": 20,
+            "min": 5,
+            "max": 200,
+            "help": "Nombre d'itérations consécutives sans amélioration avant d'arrêter (utilisé si early_stopping=True).",
+        },
+        "validation_fraction": {
+            "type": "float",
+            "default": 0.1,
+            "gt": 0.0,
+            "lt": 1.0,
+            "help": "Fraction du jeu d'entraînement réservée à la validation interne pour l'early stopping.",
         },
     },
     "elasticnet": {

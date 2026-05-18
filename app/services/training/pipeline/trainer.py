@@ -8,6 +8,14 @@ from typing import Any, Dict
 import numpy as np
 import pandas as pd
 from sklearn.exceptions import FitFailedWarning
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    make_scorer,
+)
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 
 # HalvingRandomSearchCV is experimental in sklearn 1.x — the enable import
@@ -30,6 +38,7 @@ from app.services.training.utils import log_event
 from app.services.training.pipeline.cv_utils import (
     _adapt_resampler_for_cv,
     _build_cv_splitter,
+    _build_scoring_for_labels,
     _choose_refit_metric,
     _extract_resampler_smote_k,
     _extract_search_artifacts,
@@ -37,6 +46,44 @@ from app.services.training.pipeline.cv_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_numeric_label(value: Any) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return True
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return True
+    return False
+
+
+# Binary scorer strings whose default ``pos_label=1`` fails on non-numeric labels.
+# We rebuild them via ``make_scorer`` with the resolved positive label so
+# GridSearch / RandomSearch / Halving can score on string targets (e.g. 'B'/'M').
+_BINARY_SCORERS_NEEDING_POS_LABEL: Dict[str, tuple[Any, Dict[str, Any], bool]] = {
+    "f1":                {"fn": f1_score,                "kwargs": {"average": "binary"}, "needs_proba": False},
+    "precision":         {"fn": precision_score,         "kwargs": {"average": "binary", "zero_division": 0}, "needs_proba": False},
+    "recall":            {"fn": recall_score,            "kwargs": {"average": "binary", "zero_division": 0}, "needs_proba": False},
+    "roc_auc":           {"fn": roc_auc_score,           "kwargs": {},                    "needs_proba": True},
+    "average_precision": {"fn": average_precision_score, "kwargs": {},                    "needs_proba": True},
+}
+
+
+def _maybe_build_pos_label_scorer(scoring: str, positive_label: Any) -> Any:
+    """Return a callable scorer when the binary scoring string needs a non-default ``pos_label``.
+
+    Returns the original scoring string otherwise (sklearn resolves it normally).
+    """
+    if positive_label is None or _is_numeric_label(positive_label):
+        return scoring
+    spec = _BINARY_SCORERS_NEEDING_POS_LABEL.get(str(scoring or "").strip())
+    if spec is None:
+        return scoring
+    metric_fn = spec["fn"]
+    kwargs = dict(spec["kwargs"])
+    kwargs["pos_label"] = positive_label
+    if spec["needs_proba"]:
+        return make_scorer(metric_fn, response_method="predict_proba", **kwargs)
+    return make_scorer(metric_fn, **kwargs)
 
 
 def _build_random_distributions(
@@ -188,6 +235,7 @@ class Trainer:
         resampler: Any | None = None,
         n_samples: int | None = None,
         imbalanced: bool = False,
+        positive_label: Any | None = None,
     ) -> TrainerFitResult:
         fit_params: Dict[str, Any] = {}
         if fit_sample_weight is not None:
@@ -232,6 +280,11 @@ class Trainer:
             refit_metric = refit_metric_override.strip()
         else:
             refit_metric = _choose_refit_metric(task_type, y_train, getattr(cfg, "metrics", []) or [])
+
+        # Rebuild the binary scorer with the resolved pos_label when labels are
+        # non-numeric (e.g. ['B','M']).  sklearn's string scorers default to
+        # pos_label=1 and fail with "pos_label=1 is not a valid label".
+        scoring_for_search = _maybe_build_pos_label_scorer(refit_metric, positive_label)
 
         # Use inner_cv_folds for the GS inner loop when available (avoids
         # conflating outer-CV folds with hyperparameter search folds).
@@ -342,7 +395,7 @@ class Trainer:
                     resource="n_samples",
                     max_resources="auto",
                     cv=cv_splitter,
-                    scoring=refit_metric,
+                    scoring=scoring_for_search,
                     refit=True,
                     n_jobs=-1,
                     random_state=int(getattr(cfg, "random_state", 42)),
@@ -410,7 +463,7 @@ class Trainer:
                 estimator=search_estimator,
                 param_distributions=param_distributions,
                 n_iter=n_iter,
-                scoring=refit_metric,
+                scoring=scoring_for_search,
                 refit=True,
                 cv=cv_splitter,
                 n_jobs=-1,
@@ -491,7 +544,7 @@ class Trainer:
         gs = GridSearchCV(
             estimator=search_estimator,
             param_grid=param_grid,
-            scoring=refit_metric,
+            scoring=scoring_for_search,
             refit=True,
             cv=cv_splitter,
             n_jobs=-1,
