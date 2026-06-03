@@ -77,6 +77,7 @@ MetricType = Literal[
     "mae",
     "mse",
     "rmse",
+    "mape",
     "r2",
 ]
 

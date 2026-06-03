@@ -486,6 +486,7 @@ def _build_metrics_summary(mget: callable, task_type: str) -> MetricsSummary:
         rmse=mget("rmse") if is_regression else None,
         mae=mget("mae") if is_regression else None,
         mse=mget("mse") if is_regression else None,
+        mape=mget("mape") if is_regression else None,
     )
 
 

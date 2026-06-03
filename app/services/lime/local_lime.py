@@ -35,6 +35,7 @@ import pandas as pd
 
 from app.services.shap._utils import (
     extract_model_from_pipeline,
+    get_positive_class_index,
     to_json_safe,
 )
 from app.services.shap.global_shap import (
@@ -88,6 +89,7 @@ def compute_local_lime(
     feature_names: Optional[List[str]] = None,
     num_samples: int = 1000,
     random_state: int = 42,
+    positive_label: Optional[Any] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Compute LIME values for a single row.
@@ -189,10 +191,12 @@ def compute_local_lime(
         }
 
         if mode == "classification":
-            # For binary: explain the positive class (index 1) by default.
+            # For binary: explain the agreed positive class (same orientation as
+            # SHAP via get_positive_class_index) so LIME and SHAP panels never
+            # show opposite directions — not blindly index 1.
             # For multiclass: explain the predicted class.
             if class_names is not None and len(class_names) == 2:
-                target_label = 1
+                target_label = get_positive_class_index(fitted_pipe, positive_label)
             else:
                 # Predicted class index for the row
                 proba = predict_fn(X_row_prep)

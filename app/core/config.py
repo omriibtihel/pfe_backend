@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     ENV: str = "dev"
     SECRET_KEY: str = "super-secret-key"
 
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 480  # 8 h — une session de travail
 
     DATABASE_URL: str = "postgresql+psycopg2://medicalvision:medicalvision@localhost:5432/medicalvision"
 

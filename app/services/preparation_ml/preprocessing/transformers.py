@@ -129,6 +129,36 @@ class SqrtTransformer(BaseEstimator, TransformerMixin):
         return np.asarray(X, dtype=float) ** 2
 
 
+def _denullify_for_sklearn(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace pandas nullable / extension dtypes with numpy-backed dtypes.
+
+    scikit-learn casts feature blocks to float via ``float(x)`` inside
+    ``check_array``. ``float(np.nan)`` is fine but ``float(pd.NA)`` raises
+    ``TypeError: float() argument must be a string or a real number, not
+    'NAType'``. Pandas >= 3.0 reads CSV/Excel text columns as the nullable
+    ``StringDtype`` (carrying ``pd.NA``), and :meth:`ColumnAligner._coerce_dtype`
+    emits nullable ``boolean`` / ``string`` columns — both feed ``pd.NA`` into
+    the preprocessing ColumnTransformer and crash every fold.
+
+    This converts each column back to the numpy model the rest of the pipeline
+    was written against:
+      - nullable boolean / Int64 / Float64 → ``float64`` (``pd.NA`` → ``np.nan``)
+      - StringDtype / other extension dtypes → ``object`` with ``np.nan``
+      - plain ``object`` columns still holding ``pd.NA`` → ``np.nan``
+    """
+    for col in df.columns:
+        s = df[col]
+        dtype = s.dtype
+        if pd.api.types.is_extension_array_dtype(dtype):
+            if pd.api.types.is_bool_dtype(dtype) or pd.api.types.is_numeric_dtype(dtype):
+                df[col] = s.astype("float64")
+            else:
+                df[col] = s.astype(object).where(s.notna(), np.nan)
+        elif dtype == object and s.isna().any():
+            df[col] = s.where(s.notna(), np.nan)
+    return df
+
+
 class ColumnAligner(BaseEstimator, TransformerMixin):
     """
     Align raw inference/train data to the training feature schema.
@@ -167,6 +197,10 @@ class ColumnAligner(BaseEstimator, TransformerMixin):
             if col not in aligned.columns:
                 continue
             self._coerce_dtype(aligned, col, dtype_str)
+
+        # Strip pandas nullable / extension dtypes (pd.NA) before sklearn —
+        # otherwise the downstream ColumnTransformer crashes on float(pd.NA).
+        aligned = _denullify_for_sklearn(aligned)
 
         return aligned
 

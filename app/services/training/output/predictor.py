@@ -353,7 +353,15 @@ def _detect_drift(raw_df: pd.DataFrame, training_schema: dict) -> List[Dict[str,
             train_std = stats.get("std")
             if train_mean is None or train_std is None or train_std == 0:
                 continue
-            cur_mean = float(series.astype(float).mean())
+            # Coerce rather than astype(float): _normalize_input_dtypes turns a
+            # column whose values don't parse as numeric into a pd.Categorical,
+            # and ``Categorical.astype(float)`` raises "Cannot cast object dtype
+            # to float64". Drift detection is advisory and must never break the
+            # prediction, so we coerce and skip when nothing numeric remains.
+            numeric_series = pd.to_numeric(series, errors="coerce").dropna()
+            if len(numeric_series) == 0:
+                continue
+            cur_mean = float(numeric_series.mean())
             shift = abs(cur_mean - train_mean) / train_std
             if shift > 3.0:
                 warnings.append({
@@ -478,7 +486,12 @@ def predict_with_trained_model(
     rows = _build_rows(y_pred, y_score, display_df)
     summary = _build_summary(y_pred, y_score, task_type)
 
-    drift_warnings = _detect_drift(raw_df, training_schema)
+    # Drift detection is advisory — it must never fail a successful inference.
+    try:
+        drift_warnings = _detect_drift(raw_df, training_schema)
+    except Exception as drift_exc:
+        logger.warning("predict.drift_detection_failed: %s", drift_exc)
+        drift_warnings = []
     if drift_warnings:
         logger.warning(
             "predict.drift_detected: model_id=%s, warnings=%d",
@@ -636,6 +649,7 @@ def predict_with_explanations(
                         task_type=task_type,
                         background=background,
                         feature_names=feature_names if feature_names else None,
+                        positive_label=_artifact_positive_label,
                     )
                     if lime_items is not None:
                         row_result["lime"] = lime_items

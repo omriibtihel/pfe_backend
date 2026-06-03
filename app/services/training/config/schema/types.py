@@ -85,7 +85,7 @@ CLASSIFICATION_METRICS = [
     "f1_pos",
     "confusion_matrix",
 ]
-REGRESSION_METRICS = ["mae", "mse", "rmse", "r2"]
+REGRESSION_METRICS = ["mae", "mse", "rmse", "mape", "r2"]
 BALANCING_STRATEGIES = [
     "none",
     "class_weight",

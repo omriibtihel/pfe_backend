@@ -185,11 +185,9 @@ def get_positive_class_index(pipeline_or_estimator: Any, positive_label: Any) ->
     if positive_label is None:
         return 1
 
-    named = getattr(pipeline_or_estimator, "named_steps", None)
-    if named is not None:
-        estimator = named.get("model") or list(named.values())[-1]
-    else:
-        estimator = pipeline_or_estimator
+    # Reuse the pipeline/FLAML unwrapping so AutoML models expose classes_
+    # (named_steps["model"] alone is the FLAML wrapper, which lacks classes_).
+    estimator = extract_model_from_pipeline(pipeline_or_estimator)
 
     classes_ = getattr(estimator, "classes_", None)
     if classes_ is None or len(classes_) != 2:

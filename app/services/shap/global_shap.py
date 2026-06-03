@@ -248,7 +248,13 @@ def _transform_except_model(pipeline: Any, X: pd.DataFrame) -> np.ndarray:
 
 def _get_preprocessed_feature_names(pipeline: Any, original_names: List[str]) -> List[str]:
     """
-    Try to retrieve feature names after preprocessing (OHE expands features).
+    Try to retrieve feature names in the space the estimator actually sees.
+
+    OHE expands features (handled by ``prep.get_feature_names_out()``), and the
+    ``select`` step (VarianceThreshold) may then drop some of them. Because
+    ``_transform_except_model`` applies ``select`` too, we must mirror that here
+    or the returned names won't line up with the transformed matrix — which
+    silently falls back to ``f_0, f_1 …`` for every explainer.
 
     Returns original_names unchanged if the pipeline does not expose
     get_feature_names_out().
@@ -259,10 +265,22 @@ def _get_preprocessed_feature_names(pipeline: Any, original_names: List[str]) ->
 
     # Look for a "prep" step with get_feature_names_out
     prep = named.get("prep")
-    if prep is not None and hasattr(prep, "get_feature_names_out"):
+    if prep is None or not hasattr(prep, "get_feature_names_out"):
+        return original_names
+    try:
+        names = [str(n) for n in prep.get_feature_names_out()]
+    except Exception:
+        return original_names
+
+    # Apply the post-prep feature-selection mask so names match the model's
+    # input space (and the output of _transform_except_model).
+    select = named.get("select")
+    if select is not None and hasattr(select, "get_support"):
         try:
-            return [str(n) for n in prep.get_feature_names_out()]
+            mask = select.get_support()
+            if len(mask) == len(names):
+                names = [n for n, keep in zip(names, mask) if bool(keep)]
         except Exception:
             pass
 
-    return original_names
+    return names

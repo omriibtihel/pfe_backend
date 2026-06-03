@@ -110,6 +110,7 @@ class MetricsSummary(BaseModel):
     rmse: Optional[float] = None
     mae: Optional[float] = None
     mse: Optional[float] = None
+    mape: Optional[float] = None
 
 
 class SplitSummary(BaseModel):

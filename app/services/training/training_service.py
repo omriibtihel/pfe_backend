@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _meta_learner = MetaLearner(PROJECTS_PATH)
 
-_LOWER_IS_BETTER_METRICS: frozenset[str] = frozenset({"rmse", "mae", "mse", "log_loss", "brier_score"})
+_LOWER_IS_BETTER_METRICS: frozenset[str] = frozenset({"rmse", "mae", "mse", "mape", "log_loss", "brier_score"})
 
 
 def _now():
@@ -300,6 +300,7 @@ _PRIMARY_SCORE_ALIASES: Dict[str, tuple[str, ...]] = {
     "rmse":              ("rmse",),
     "mae":               ("mae",),
     "mse":               ("mse",),
+    "mape":              ("mape",),
     "mcc":               ("mcc",),
 }
 
@@ -347,7 +348,7 @@ def _extract_primary_score(
                 return key, float(val), "fallback"
             except Exception:
                 pass
-    for key in ("rmse", "mae", "mse"):
+    for key in ("rmse", "mae", "mse", "mape"):
         val = metrics_json.get("test", {}).get(key) or metrics_json.get(key)
         if val is not None:
             try:

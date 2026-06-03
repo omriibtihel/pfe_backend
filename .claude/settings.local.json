@@ -80,11 +80,32 @@
       "Bash(./.venv/Scripts/python.exe -m alembic current)",
       "Bash(./.venv/Scripts/python.exe -m alembic upgrade head)",
       "Bash(./.venv/Scripts/python.exe -m pytest tests/reporting/test_prompt_builder.py::test_prompt_contains_schema_and_few_shot -v)",
-      "Bash(./.venv/Scripts/python.exe -m pytest tests/reporting/test_prompt_builder.py::test_prompt_length_is_bounded_with_many_features -v)"
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/reporting/test_prompt_builder.py::test_prompt_length_is_bounded_with_many_features -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_column_aligner_nullable_dtypes.py -v)",
+      "Bash(cp app/services/preparation_ml/preprocessing/transformers.py /tmp/transformers_bak.py)",
+      "Bash(.venv/Scripts/python -)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_column_aligner_nullable_dtypes.py -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/ -q)",
+      "Bash(grep -qE \"passed|failed|error\" /tmp/none)",
+      "Bash(break)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_predictor.py -k \"drift\" -v)",
+      "Bash(tasklist)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_predictor.py tests/training/test_column_aligner_nullable_dtypes.py tests/training/test_validation_and_preprocessing_none.py tests/training/test_preprocessing_schema_power_transform.py -p no:cacheprovider -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_counterfactual.py tests/training/test_shap.py tests/test_explainability.py -p no:cacheprovider -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_explainability_bugfixes.py -p no:cacheprovider -v)",
+      "Bash(cp app/services/counterfactual/local_counterfactual.py /tmp/cf_bak.py)",
+      "Bash(cp app/services/shap/global_shap.py /tmp/gs_bak.py)",
+      "Bash(cp app/services/shap/_utils.py /tmp/ut_bak.py)",
+      "Bash(cp app/services/lime/local_lime.py /tmp/lime_bak.py)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_explainability_bugfixes.py -p no:cacheprovider -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_explainability_bugfixes.py::test_get_positive_class_index_unwraps_flaml tests/training/test_explainability_bugfixes.py::test_lime_orientation_follows_positive_label -p no:cacheprovider -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_counterfactual.py tests/training/test_shap.py tests/test_explainability.py tests/training/test_explainability_bugfixes.py -p no:cacheprovider -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/training/test_predictor.py tests/training/test_predictor_automl.py -p no:cacheprovider -q)"
     ],
     "additionalDirectories": [
       "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\types",
-      "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\services"
+      "C:\\Users\\ibtih\\OneDrive\\Bureau\\pfe\\medicalvision-frontend\\src\\services",
+      "\\tmp"
     ]
   }
 }

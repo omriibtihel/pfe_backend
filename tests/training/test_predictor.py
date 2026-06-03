@@ -764,3 +764,41 @@ class TestTrainPredictPreprocessingParity:
         manual_scores = reloaded.named_steps["model"].decision_function(x)
         pipeline_scores = reloaded.decision_function(X_sample)
         np.testing.assert_allclose(manual_scores, pipeline_scores, rtol=1e-10)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Drift detection robustness (regression: "Cannot cast object dtype to float64")
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# _normalize_input_dtypes turns a column whose values don't parse as numeric into
+# a pd.Categorical. When the training stats marked that column "numeric",
+# _detect_drift used to call series.astype(float) on the Categorical, which raises
+# ValueError("Cannot cast object dtype to float64") and failed the whole
+# prediction even though pipeline.predict() had already succeeded.
+
+from app.services.training.output.predictor import _detect_drift, _normalize_input_dtypes
+
+
+def test_detect_drift_does_not_crash_on_non_numeric_values_in_numeric_column():
+    schema = {"column_stats": {"age": {"type": "numeric", "mean": 50.0, "std": 10.0}}}
+    # Mixed/non-numeric content for a column the model expects to be numeric.
+    raw = pd.DataFrame({"age": pd.Categorical(["n/a", "unknown", "??", "n/a"])})
+    # Must not raise, and produces no mean-shift signal (nothing numeric remains).
+    assert _detect_drift(raw, schema) == []
+
+
+def test_detect_drift_coerces_numeric_strings_and_flags_shift():
+    schema = {"column_stats": {"age": {"type": "numeric", "mean": 50.0, "std": 5.0}}}
+    # Values arrive as strings (pd.Categorical of numeric strings) far from train mean.
+    raw = pd.DataFrame({"age": pd.Categorical(["90", "92", "95", "absent"])})
+    warnings = _detect_drift(raw, schema)
+    assert any(w["type"] == "mean_shift" and w["severity"] == "critical" for w in warnings)
+
+
+def test_detect_drift_after_normalize_input_dtypes_pipeline():
+    """Mirror the real predict flow: normalize input dtypes, then detect drift."""
+    schema = {"column_stats": {"score": {"type": "numeric", "mean": 0.0, "std": 1.0}}}
+    raw = pd.DataFrame({"score": pd.Series(["bad", "missing", "n/a"], dtype="string")})
+    normalized = _normalize_input_dtypes(raw, pipeline=None)
+    # Should not raise regardless of how normalization typed the column.
+    assert _detect_drift(normalized, schema) == []

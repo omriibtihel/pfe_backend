@@ -418,6 +418,11 @@ def _format_items(
         orig_prep = r["orig_prep"]
         sugg_prep = r["sugg_prep"]
 
+        # prep feature names are prefixed by the ColumnTransformer ("num__Glucose")
+        # while inv_scale_map is keyed by the original column ("Glucose"); look up
+        # both so inverse-scaling actually applies (prefixed names never matched).
+        scale_params = inv_scale_map.get(pname) or inv_scale_map.get(_strip_ct_prefix(pname))
+
         # Snap OHE features to {0, 1} before inverse-scaling or display.
         if ohe_features and pname in ohe_features:
             snapped = float(round(max(0.0, min(1.0, sugg_prep))))
@@ -426,10 +431,9 @@ def _format_items(
             orig_prep = float(round(max(0.0, min(1.0, orig_prep))))
             sugg_prep = snapped
             orig_val, sugg_val = orig_prep, sugg_prep
-        elif pname in inv_scale_map:
-            params = inv_scale_map[pname]
-            orig_val = _apply_inverse_scale(orig_prep, params)
-            sugg_val = _apply_inverse_scale(sugg_prep, params)
+        elif scale_params is not None:
+            orig_val = _apply_inverse_scale(orig_prep, scale_params)
+            sugg_val = _apply_inverse_scale(sugg_prep, scale_params)
         else:
             orig_val = orig_prep
             sugg_val = sugg_prep
@@ -640,33 +644,26 @@ def compute_counterfactual(
                         sugg_prep = float(best_cf[pname])
                         if abs(sugg_prep - orig_prep) < 1e-8:
                             continue
-                        if pname in inv_scale_map:
-                            params = inv_scale_map[pname]
-                            orig_val = _apply_inverse_scale(orig_prep, params)
-                            sugg_val = _apply_inverse_scale(sugg_prep, params)
-                        else:
-                            orig_val, sugg_val = orig_prep, sugg_prep
-                        delta = sugg_val - orig_val
                         raw_items.append({
                             "col": pname, "col_idx": i,
                             "orig_prep": orig_prep, "sugg_prep": sugg_prep,
-                            "delta_abs": abs(delta),
-                        })
-                        raw_items[-1].update({
-                            "feature":         _strip_ct_prefix(str(pname)),
-                            "original_value":  to_json_safe(orig_val),
-                            "suggested_value": to_json_safe(sugg_val),
-                            "delta":           to_json_safe(delta),
+                            "delta_abs": abs(sugg_prep - orig_prep),
                         })
                     if raw_items:
-                        raw_items.sort(key=lambda d: abs(float(d["delta"] or 0.0)), reverse=True)
-                        dice_items = [{
-                            "feature":         d["feature"],
-                            "original_value":  d["original_value"],
-                            "suggested_value": d["suggested_value"],
-                            "delta":           d["delta"],
-                        } for d in raw_items]
-                        logger.info("counterfactual: DiCE found %d changed features", len(dice_items))
+                        # Same formatting path as the fallbacks: prefix-aware
+                        # inverse-scaling + OHE snapping, so DiCE results are also
+                        # shown in original clinical units.
+                        formatted = _format_items(
+                            raw_items, inv_scale_map, ohe_features=ohe_prep_features
+                        )
+                        # Guard: OHE snapping can filter everything out — only
+                        # accept DiCE when a real change survives, else fall back.
+                        if formatted:
+                            dice_items = formatted
+                            logger.info(
+                                "counterfactual: DiCE found %d changed features",
+                                len(dice_items),
+                            )
                 else:
                     logger.info("counterfactual: DiCE found no valid flip — using binary search")
 

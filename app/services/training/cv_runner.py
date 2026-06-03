@@ -53,6 +53,7 @@ from app.services.training.pipeline.cv_utils import (
     _choose_refit_metric,
 )
 from app.services.training.pipeline.evaluator import Evaluator
+from app.services.training.pipeline.residuals import compute_residuals
 from app.services.training.pipeline.models import build_model, get_model_capabilities
 from app.services.training.pipeline.trainer import Trainer
 
@@ -1044,6 +1045,50 @@ def _run_kfold_cv(
         resolved_positive_label=resolved_positive_label,
         curves=_cv_curves,
     )
+
+    # ── Residual analysis (regression only) ───────────────────────────────────
+    # Source priority: independent holdout test (when ≥20 samples), else pooled
+    # out-of-fold predictions (statistically valid CV estimate of residuals).
+    if cfg.task_type == "regression":
+        artifact_warnings_list = list(artifacts.get("artifact_warnings") or [])
+        _ra_y_true: Optional[np.ndarray] = None
+        _ra_y_pred: Optional[np.ndarray] = None
+        _ra_source: Optional[str] = None
+        if (
+            holdout_test_eval is not None
+            and y_test_holdout is not None
+            and len(np.asarray(y_test_holdout)) >= 20
+        ):
+            _ra_y_true = np.asarray(y_test_holdout)
+            _ra_y_pred = np.asarray(holdout_test_eval.predictions)
+            _ra_source = "holdout_test"
+        elif oof_y_true_reg and oof_y_pred_reg:
+            try:
+                _ra_y_true = np.concatenate(oof_y_true_reg)
+                _ra_y_pred = np.concatenate(oof_y_pred_reg)
+                _ra_source = "cv_oof"
+            except Exception:
+                _ra_y_true = None
+                _ra_y_pred = None
+
+        if _ra_y_true is not None and _ra_y_pred is not None and len(_ra_y_true) >= 20:
+            try:
+                _ra_result = compute_residuals(
+                    _ra_y_true,
+                    _ra_y_pred,
+                    task_type=cfg.task_type,
+                )
+                if _ra_result is not None:
+                    _ra_result["source"] = _ra_source
+                    artifacts["residual_analysis"] = _ra_result
+            except Exception as e:
+                artifact_warnings_list.append({
+                    "artifact": "residual_analysis",
+                    "error": type(e).__name__,
+                    "detail": str(e),
+                })
+        if artifact_warnings_list:
+            artifacts["artifact_warnings"] = artifact_warnings_list
 
     hyperparams_artifacts: Dict[str, Any] = {
         "requested": dict(requested_hyperparams_raw),
