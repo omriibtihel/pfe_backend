@@ -16,7 +16,12 @@ router = APIRouter()
 
 
 def _ops_to_tags(operations_json: str | None) -> list[str]:
-    """Convertit operations_json (Text) en liste de tags (type/description)."""
+    """Convertit operations_json (Text) en liste de tags décrivant chaque opération.
+
+    Préfère l'action détaillée (params.action / method / strategy) au type générique
+    ("cleaning"), afin que les cartes de version affichent ce qui a réellement été fait
+    (ex: "drop_columns", "drop_duplicates") plutôt qu'un libellé fourre-tout.
+    """
     if not operations_json:
         return []
     try:
@@ -26,13 +31,17 @@ def _ops_to_tags(operations_json: str | None) -> list[str]:
         tags: list[str] = []
         for o in data:
             if isinstance(o, dict):
-                t = o.get("type") or o.get("op_type") or o.get("opType")
-                if t:
-                    tags.append(str(t))
-                else:
-                    d = o.get("description")
-                    if d:
-                        tags.append(str(d))
+                params = o.get("params") if isinstance(o.get("params"), dict) else {}
+                detail = (
+                    params.get("action")
+                    or params.get("method")
+                    or params.get("strategy")
+                    or o.get("action")
+                    or o.get("type") or o.get("op_type") or o.get("opType")
+                    or o.get("description")
+                )
+                if detail:
+                    tags.append(str(detail))
             else:
                 tags.append(str(o))
         return tags

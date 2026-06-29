@@ -226,6 +226,170 @@ def _rejection_html(full_name: str, reason: str | None) -> str:
 
 
 # ──────────────────────────────────────────────
+# Account-reactivation template
+# ──────────────────────────────────────────────
+
+def _reactivation_html(full_name: str) -> str:
+    content = f"""
+      <!-- Icon -->
+      <div style="text-align:center;margin-bottom:28px;">
+        <div style="display:inline-block;background:linear-gradient(135deg,#10b981,#22c55e);border-radius:50%;width:64px;height:64px;line-height:64px;font-size:28px;text-align:center;">
+          ↻
+        </div>
+      </div>
+
+      <!-- Title -->
+      <h1 style="margin:0 0 8px;color:#ffffff;font-size:24px;font-weight:700;text-align:center;letter-spacing:-0.5px;">
+        Compte réactivé
+      </h1>
+      <p style="margin:0 0 28px;color:rgba(255,255,255,0.5);font-size:14px;text-align:center;">
+        Votre accès à la plateforme a été rétabli
+      </p>
+
+      <!-- Divider -->
+      <div style="height:1px;background:linear-gradient(90deg,transparent,rgba(34,197,94,0.4),transparent);margin-bottom:28px;"></div>
+
+      <!-- Body text -->
+      <p style="margin:0 0 16px;color:rgba(255,255,255,0.85);font-size:15px;line-height:1.7;">
+        Bonjour <strong style="color:#ffffff;">{full_name}</strong>,
+      </p>
+      <p style="margin:0 0 16px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
+        Bonne nouvelle ! Après réexamen de votre dossier, un administrateur a
+        <strong style="color:#22c55e;">réactivé votre compte</strong> sur la plateforme
+        <strong style="color:#8b5cf6;">MedIQ</strong>.
+      </p>
+      <p style="margin:0 0 28px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
+        Vous pouvez dès à présent vous reconnecter et reprendre l'utilisation de la plateforme
+        avec l'ensemble de ses fonctionnalités.
+      </p>
+
+      <!-- Info box -->
+      <div style="background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);border-radius:10px;padding:16px 20px;margin-bottom:28px;">
+        <p style="margin:0;color:rgba(255,255,255,0.65);font-size:13px;line-height:1.7;">
+          💡 Connectez-vous avec vos identifiants habituels. Si vous avez oublié votre mot de passe,
+          utilisez l'option « Mot de passe oublié » sur la page de connexion.
+        </p>
+      </div>
+
+      <p style="margin:0;color:rgba(255,255,255,0.45);font-size:13px;text-align:center;line-height:1.7;">
+        Ravis de vous retrouver parmi nous sur MedIQ.
+      </p>
+    """
+    return _base_template(content)
+
+
+# ──────────────────────────────────────────────
+# Account-deletion template
+# ──────────────────────────────────────────────
+
+def _deletion_html(full_name: str) -> str:
+    content = f"""
+      <!-- Icon -->
+      <div style="text-align:center;margin-bottom:28px;">
+        <div style="display:inline-block;background:rgba(239,68,68,0.15);border:2px solid rgba(239,68,68,0.35);border-radius:50%;width:64px;height:64px;line-height:60px;font-size:28px;text-align:center;">
+          🗑️
+        </div>
+      </div>
+
+      <!-- Title -->
+      <h1 style="margin:0 0 8px;color:#ffffff;font-size:24px;font-weight:700;text-align:center;letter-spacing:-0.5px;">
+        Compte supprimé
+      </h1>
+      <p style="margin:0 0 28px;color:rgba(255,255,255,0.5);font-size:14px;text-align:center;">
+        Votre accès à la plateforme a été clôturé
+      </p>
+
+      <!-- Divider -->
+      <div style="height:1px;background:linear-gradient(90deg,transparent,rgba(239,68,68,0.4),transparent);margin-bottom:28px;"></div>
+
+      <!-- Body text -->
+      <p style="margin:0 0 16px;color:rgba(255,255,255,0.85);font-size:15px;line-height:1.7;">
+        Bonjour <strong style="color:#ffffff;">{full_name}</strong>,
+      </p>
+      <p style="margin:0 0 16px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
+        Nous vous informons que votre compte sur la plateforme
+        <strong style="color:#8b5cf6;">MedIQ</strong> a été supprimé par un administrateur.
+      </p>
+      <p style="margin:0 0 28px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
+        L'ensemble de vos projets et données associés ont été définitivement effacés.
+        Cette action est irréversible.
+      </p>
+
+      <!-- Info box -->
+      <div style="background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.2);border-radius:10px;padding:16px 20px;margin-bottom:28px;">
+        <p style="margin:0;color:rgba(255,255,255,0.65);font-size:13px;line-height:1.7;">
+          💡 Si vous pensez que cette suppression est une erreur, vous pouvez contacter
+          l'équipe d'administration ou soumettre une nouvelle demande d'inscription.
+        </p>
+      </div>
+
+      <p style="margin:0;color:rgba(255,255,255,0.45);font-size:13px;text-align:center;line-height:1.7;">
+        Nous vous remercions de l'intérêt que vous avez porté à MedIQ.
+      </p>
+    """
+    return _base_template(content)
+
+
+# ──────────────────────────────────────────────
+# Password-reset template
+# ──────────────────────────────────────────────
+
+def _password_reset_html(full_name: str, reset_url: str) -> str:
+    minutes = settings.RESET_TOKEN_EXPIRE_MINUTES
+    content = f"""
+      <!-- Icon -->
+      <div style="text-align:center;margin-bottom:28px;">
+        <div style="display:inline-block;background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:50%;width:64px;height:64px;line-height:64px;font-size:28px;text-align:center;">
+          🔒
+        </div>
+      </div>
+
+      <!-- Title -->
+      <h1 style="margin:0 0 8px;color:#ffffff;font-size:24px;font-weight:700;text-align:center;letter-spacing:-0.5px;">
+        Réinitialisation du mot de passe
+      </h1>
+      <p style="margin:0 0 28px;color:rgba(255,255,255,0.5);font-size:14px;text-align:center;">
+        Une demande a été effectuée pour votre compte
+      </p>
+
+      <!-- Divider -->
+      <div style="height:1px;background:linear-gradient(90deg,transparent,rgba(99,102,241,0.5),transparent);margin-bottom:28px;"></div>
+
+      <!-- Body text -->
+      <p style="margin:0 0 16px;color:rgba(255,255,255,0.85);font-size:15px;line-height:1.7;">
+        Bonjour <strong style="color:#ffffff;">{full_name}</strong>,
+      </p>
+      <p style="margin:0 0 32px;color:rgba(255,255,255,0.7);font-size:15px;line-height:1.7;">
+        Vous avez demandé à réinitialiser votre mot de passe sur
+        <strong style="color:#8b5cf6;">MedIQ</strong>. Cliquez sur le bouton ci-dessous
+        pour en définir un nouveau. Ce lien est valable <strong style="color:#ffffff;">{minutes} minutes</strong>
+        et ne peut être utilisé qu'une seule fois.
+      </p>
+
+      <!-- CTA Button -->
+      <div style="text-align:center;">
+        <a href="{reset_url}"
+           style="display:inline-block;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 36px;border-radius:10px;letter-spacing:0.2px;">
+          Réinitialiser mon mot de passe →
+        </a>
+      </div>
+
+      <!-- Info box -->
+      <div style="background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.2);border-radius:10px;padding:16px 20px;margin-top:32px;">
+        <p style="margin:0;color:rgba(255,255,255,0.65);font-size:13px;line-height:1.7;">
+          💡 Si vous n'êtes pas à l'origine de cette demande, ignorez simplement cet e-mail —
+          votre mot de passe restera inchangé.
+        </p>
+      </div>
+
+      <p style="margin:24px 0 0;color:rgba(255,255,255,0.35);font-size:12px;text-align:center;word-break:break-all;">
+        Lien direct : {reset_url}
+      </p>
+    """
+    return _base_template(content)
+
+
+# ──────────────────────────────────────────────
 # Core send function
 # ──────────────────────────────────────────────
 
@@ -265,4 +429,22 @@ def send_approval_email(to_email: str, full_name: str) -> None:
 def send_rejection_email(to_email: str, full_name: str, reason: str | None = None) -> None:
     subject = "ℹ️ Décision concernant votre demande MedIQ"
     html = _rejection_html(full_name, reason)
+    _send_email(to_email, subject, html)
+
+
+def send_reactivation_email(to_email: str, full_name: str) -> None:
+    subject = "↻ Votre compte MedIQ a été réactivé"
+    html = _reactivation_html(full_name)
+    _send_email(to_email, subject, html)
+
+
+def send_deletion_email(to_email: str, full_name: str) -> None:
+    subject = "🗑️ Votre compte MedIQ a été supprimé"
+    html = _deletion_html(full_name)
+    _send_email(to_email, subject, html)
+
+
+def send_password_reset_email(to_email: str, full_name: str, reset_url: str) -> None:
+    subject = "🔒 Réinitialisation de votre mot de passe MedIQ"
+    html = _password_reset_html(full_name, reset_url)
     _send_email(to_email, subject, html)

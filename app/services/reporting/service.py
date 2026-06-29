@@ -319,12 +319,25 @@ def _compute_risk_level(context: ReportContext) -> str:
     if context.task_type != "classification":
         return "unknown"
 
-    raw = context.class_context.raw_label
-    pos = context.class_context.positive_class
-    is_positive = bool(
-        pos
-        and raw.lower().rstrip("0").rstrip(".") == pos.lower().rstrip("0").rstrip(".")
-    )
+    # Positivity is derived from the score vs the alert threshold — the SAME
+    # signal that labels the result "préoccupant / rassurant" in the chart.
+    # This guarantees the risk badge can never contradict the displayed score
+    # (e.g. a 100 % concerning result must not show "Risque faible"). The
+    # fragile label-string comparison is only a fallback when no score exists.
+    if context.score is not None:
+        threshold = (
+            float(context.threshold_value)
+            if context.threshold_value is not None
+            else 0.5
+        )
+        is_positive = float(context.score) >= threshold
+    else:
+        raw = context.class_context.raw_label
+        pos = context.class_context.positive_class
+        is_positive = bool(
+            pos
+            and raw.lower().rstrip("0").rstrip(".") == pos.lower().rstrip("0").rstrip(".")
+        )
 
     high_conf = context.confidence_text in ("élevée", "high")
     low_conf = context.confidence_text in ("faible", "low")

@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "super-secret-key"
 
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480  # 8 h — une session de travail
+    RESET_TOKEN_EXPIRE_MINUTES: int = 30  # lien de réinitialisation de mot de passe
 
     DATABASE_URL: str = "postgresql+psycopg2://medicalvision:medicalvision@localhost:5432/medicalvision"
 

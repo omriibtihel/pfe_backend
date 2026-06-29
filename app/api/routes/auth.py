@@ -1,13 +1,28 @@
 import os
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user
 from app.models.user import User, AccountStatus
-from app.schemas.auth import LoginRequest, AuthResponse
-from app.core.security import hash_password, verify_password, create_access_token
+from app.schemas.auth import (
+    LoginRequest,
+    AuthResponse,
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
+    MessageResponse,
+)
+from app.core.security import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    create_password_reset_token,
+    get_reset_token_subject,
+    verify_password_reset_token,
+)
+from app.core.email import send_password_reset_email
+from app.core.config import settings
 from fastapi.security import OAuth2PasswordRequestForm
 
 PROFILES_DIR = os.path.join("storage", "profiles")
@@ -108,6 +123,65 @@ def login(
         status=user.status.value,
         user_id=user.id
     )
+
+
+# -------------------------
+# PASSWORD RESET
+# -------------------------
+@router.post("/forgot-password", response_model=MessageResponse)
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    # Generic response regardless of outcome — never reveal whether an account
+    # exists for this email (anti-enumeration).
+    generic = MessageResponse(
+        message="Si un compte est associé à cet email, un lien de réinitialisation a été envoyé."
+    )
+
+    user = db.query(User).filter(User.email == payload.email).first()
+    if user:
+        token = create_password_reset_token(user.id, user.password_hash)
+        reset_url = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+        background_tasks.add_task(
+            send_password_reset_email, user.email, user.full_name, reset_url
+        )
+
+    return generic
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+def reset_password(
+    payload: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    invalid = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Lien de réinitialisation invalide ou expiré.",
+    )
+
+    # Step 1: read the (unverified) subject just to locate the user.
+    sub = get_reset_token_subject(payload.token)
+    if not sub:
+        raise invalid
+
+    try:
+        user = db.query(User).filter(User.id == int(sub)).first()
+    except (TypeError, ValueError):
+        raise invalid
+    if not user:
+        raise invalid
+
+    # Step 2: fully verify the token against the user's current password hash.
+    verified_id = verify_password_reset_token(payload.token, user.password_hash)
+    if verified_id != user.id:
+        raise invalid
+
+    user.password_hash = hash_password(payload.new_password)
+    db.commit()
+
+    return MessageResponse(message="Mot de passe mis à jour avec succès.")
 
 
 # -------------------------

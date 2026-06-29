@@ -779,9 +779,15 @@ class ReportContextBuilder:
 
             current_value = _format_value(orig, unit=unit)
             suggested_value = _format_value(sugg, unit=unit)
-            sign = "+" if delta > 0 else "−"
-            magnitude_text = f"{sign}{_format_value(abs(delta), unit=unit)}"
             direction: Direction = "increase" if delta > 0 else "decrease"
+            # Plain-language change phrase rather than a bare signed number
+            # (a reader can't interpret "−209.07 µU/mL"). Localised; no Unicode
+            # sign so it renders identically on screen and in the PDF.
+            amount = _format_value(abs(delta), unit=unit)
+            if lang == "fr":
+                magnitude_text = f"augmenter de {amount}" if delta > 0 else f"réduire de {amount}"
+            else:
+                magnitude_text = f"increase by {amount}" if delta > 0 else f"decrease by {amount}"
 
             out.append(
                 CounterfactualChange(

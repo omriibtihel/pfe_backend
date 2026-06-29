@@ -149,6 +149,17 @@ def read_df(
         df = pd.read_excel(path, nrows=nrows, usecols=usecols)
         return _whitespace_only_to_na(df)
 
+    # SPSS .sav files — read via pandas.read_spss (backed by pyreadstat).
+    # read_spss has no nrows/usecols args, so we slice after loading.
+    if path.suffix.lower() == ".sav":
+        df = pd.read_spss(str(path))
+        if usecols is not None:
+            wanted = set(usecols)
+            df = df[[c for c in df.columns if c in wanted]]
+        if nrows is not None:
+            df = df.head(nrows)
+        return _whitespace_only_to_na(df)
+
     with open(path, "rb") as f:
         head_bytes = f.read(_SNIFF_BYTES)
 

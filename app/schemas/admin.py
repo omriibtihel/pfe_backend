@@ -8,6 +8,12 @@ class UserListItem(BaseModel):
     email: EmailStr
     role: UserRole
     status: AccountStatus
+    phone: str | None = None
+    address: str | None = None
+    date_of_birth: str | None = None
+    specialty: str | None = None
+    hospital: str | None = None
+    profile_photo: str | None = None
 
     class Config:
         from_attributes = True
@@ -28,6 +34,11 @@ class RejectUserResponse(BaseModel):
     user_id: int
     new_status: AccountStatus
     reason: str | None = None
+
+
+class DeleteUserResponse(BaseModel):
+    message: str
+    user_id: int
 
 
 class AdminStats(BaseModel):

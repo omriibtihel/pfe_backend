@@ -32,6 +32,18 @@ def read_uploaded_dataframe(filename: str, content: bytes) -> pd.DataFrame:
 
     if name.endswith(".csv") or name.endswith(".txt"):
         return read_csv_bytes(content)
+    # SPSS .sav — pandas.read_spss requires a file path, so spill to a temp file.
+    if name.endswith(".sav"):
+        import os
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".sav", delete=False)
+        try:
+            tmp.write(content)
+            tmp.close()
+            return pd.read_spss(tmp.name)
+        finally:
+            os.unlink(tmp.name)
     buff = io.BytesIO(content)
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(buff)
@@ -39,7 +51,7 @@ def read_uploaded_dataframe(filename: str, content: bytes) -> pd.DataFrame:
         return pd.read_json(buff)
     if name.endswith(".parquet"):
         return pd.read_parquet(buff)
-    raise RuntimeError("Unsupported file type. Use CSV, Excel, JSON or Parquet.")
+    raise RuntimeError("Unsupported file type. Use CSV, Excel, SPSS (.sav), JSON or Parquet.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

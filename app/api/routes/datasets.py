@@ -21,7 +21,7 @@ from app.schemas.dataset import DatasetOut, DatasetPreviewOut, DatasetTargetIn, 
 
 router = APIRouter()
 
-ALLOWED_EXTS = {".csv", ".xlsx", ".xls"}
+ALLOWED_EXTS = {".csv", ".xlsx", ".xls", ".sav"}
 MAX_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 
 _filename_safe_re = re.compile(r"[^a-zA-Z0-9._-]+")
